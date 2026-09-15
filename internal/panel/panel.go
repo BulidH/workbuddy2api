@@ -48,11 +48,28 @@ type Deps struct {
 	// Restart 触发进程退出（依赖 docker restart 策略拉起）。
 	Restart func()
 
+	// RunCheckin 立即执行一轮全量签到 + 余额查询，返回 scheduler.CheckinOutcome 列表。
+	//
+	// 存在的理由：定时签到只在 schedule.checkin_hours（默认 9/21 点）触发，
+	// 且调度器**启动时不跑**。于是新加的账号在下一个整点到来前积分恒为 0，
+	// 用户会以为「积分功能坏了」。面板提供手动入口当场查一次。
+	RunCheckin func() ([]CheckinOutcome, error)
+
 	// Logs 进程日志环形缓冲（可为 nil）。
 	Logs *Ring
 
 	// HTTPClient 出站客户端（OAuth 用）；nil 时用默认。
 	HTTPClient *http.Client
+}
+
+// CheckinOutcome 面板侧的单账号签到回执（刻意与 scheduler.CheckinOutcome 解耦，
+// 避免 panel 包反向依赖 scheduler；字段名保持一致以便直接透传给前端）。
+type CheckinOutcome struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Status   string `json:"status"`
+	Credits  *int64 `json:"credits,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 // Panel 面板 HTTP 处理器。
@@ -87,6 +104,7 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("PUT /panel/api/config", p.handleConfigPut)
 	p.mux.HandleFunc("POST /panel/api/accounts/delete", p.handleAccountDelete)
 	p.mux.HandleFunc("POST /panel/api/reload", p.handleReload)
+	p.mux.HandleFunc("POST /panel/api/checkin", p.handleCheckin)
 	p.mux.HandleFunc("POST /panel/api/restart", p.handleRestart)
 
 	// ── OAuth 加号 ────────────────────────────────────────

@@ -238,7 +238,11 @@ function accountsTable(list, { compact = false } = {}) {
   return `<div class="card">
     <div class="card-head">
       <h3>账号池 <span class="sub" style="font-weight:400">（${list.length} 个）</span></h3>
-      <button class="btn primary sm" data-add>+ 添加账号</button>
+      <div class="row-flex">
+        <button class="btn sm" data-checkin
+          title="立即执行签到 + 余额查询。定时任务默认只在 9/21 点跑，新账号在此之前积分会显示 0">查询余额 / 签到</button>
+        <button class="btn primary sm" data-add>+ 添加账号</button>
+      </div>
     </div>
     <div class="table-wrap"><table class="tbl">
       <thead><tr>
@@ -253,6 +257,45 @@ function accountsTable(list, { compact = false } = {}) {
 function bindAccountActions() {
   $$('[data-del]').forEach(b => b.onclick = () => confirmDelete(b.dataset.del, b.dataset.nick));
   $$('[data-add]').forEach(b => b.onclick = addAccountFlow);
+  $$('[data-checkin]').forEach(b => b.onclick = runCheckin);
+}
+
+// runCheckin 手动触发一轮签到 + 余额查询。
+// 必要性：定时任务只在 schedule.checkin_hours（默认 9/21 点）触发，且调度器启动时不跑，
+// 新加的账号在下一个整点前积分一直是 0，看起来像功能坏了。
+async function runCheckin() {
+  const btns = $$('[data-checkin]');
+  btns.forEach(b => { b.disabled = true; b.textContent = '查询中…'; });
+  try {
+    const r = await api('/checkin', { method: 'POST' });
+    const s = r.summary || {};
+    const outs = r.outcomes || [];
+    const balance = outs.filter(o => o.credits !== null && o.credits !== undefined)
+      .map(o => `${o.nickname || o.uid.slice(0, 8)} = ${o.credits}`).join('，');
+    toast(`签到完成：成功 ${s.ok || 0} · 已签到 ${s.already || 0} · 失败 ${s.fail || 0} · 跳过 ${s.skipped || 0}`
+      + (balance ? `；余额：${balance}` : '；未取到余额'), s.fail ? 'warn' : 'ok', 9000);
+
+    // 有失败时把逐账号原因列出来（比 toast 更能说明问题）
+    const bad = outs.filter(o => o.status === 'fail' || o.status === 'skipped');
+    if (bad.length) {
+      modal('签到明细', `
+        <div class="alert warn">以下账号未能取到余额，明细如下：</div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>账号</th><th>结果</th><th>原因</th></tr></thead>
+          <tbody>${bad.map(o => `<tr>
+            <td>${esc(o.nickname || o.uid.slice(0, 12))}</td>
+            <td><span class="tag ${o.status === 'fail' ? 'err' : 'gray'}">${esc(o.status)}</span></td>
+            <td style="font-size:12px;color:var(--text-dim)">${esc(o.detail || '—')}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>`, `<button class="btn primary" data-close>知道了</button>`);
+      $$('[data-close]').forEach(b => b.onclick = () => { closeModal(); render(); });
+      return;
+    }
+    await render();
+  } catch (e) {
+    toast(e.message, 'err', 8000);
+    btns.forEach(b => { b.disabled = false; b.textContent = '查询余额 / 签到'; });
+  }
 }
 
 function confirmDelete(uid, nick) {

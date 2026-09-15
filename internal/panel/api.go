@@ -15,10 +15,7 @@ import (
 
 // handleOverview 概览：健康态 + 账号池计数 + 运行环境。
 func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
-	status := map[string]any{}
-	if p.deps.StatusJSON != nil {
-		status = p.deps.StatusJSON()
-	}
+	status := p.statusMap()
 
 	// 健康判定与 /healthz 同口径：healthy>0 即视为可服务。
 	total := intOf(status["total"])
@@ -85,17 +82,35 @@ type accountView struct {
 	File      string `json:"file,omitempty"`
 }
 
+// statusMap 取 /status 载荷并规整为通用 JSON 结构（map[string]any / []any / float64）。
+//
+// 为什么必须规整：StatusJSON() 里的 accounts 是 pool.List() 返回的 []pool.Status ——
+// **具体类型切片**。对 map[string]any 里的这种值做 `.([]any)` 断言必然失败，
+// 于是面板只能拿 auth 文件兜底，导致积分/成功数/最近成功/冷却/禁用全部显示为 0 或空。
+// 走一次 JSON 往返可以把任意具体类型统一成通用结构，比逐个断言健壮。
+func (p *Panel) statusMap() map[string]any {
+	if p.deps.StatusJSON == nil {
+		return map[string]any{}
+	}
+	raw, err := json.Marshal(p.deps.StatusJSON())
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
 // handleAccounts 账号列表：池状态与 auths 目录凭证合并（并集）。
 func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
-	status := map[string]any{}
-	if p.deps.StatusJSON != nil {
-		status = p.deps.StatusJSON()
-	}
+	status := p.statusMap()
 
 	byUID := map[string]*accountView{}
 	order := []string{}
 
-	// 1) 池内账号
+	// 1) 池内账号（statusMap 已规整，此处断言必定成功）
 	if list, ok := status["accounts"].([]any); ok {
 		for _, it := range list {
 			m, ok := it.(map[string]any)
@@ -232,6 +247,48 @@ func (p *Panel) handleReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	okJSON(w, map[string]any{"ok": true, "accounts": n})
+}
+
+// handleCheckin 立即执行一轮全量签到 + 余额查询。
+//
+// 用途：定时签到只在配置的整点跑（默认 9/21 点）、且调度器启动时不跑，
+// 新加的账号在下一个整点前积分一直显示 0。此入口让用户当场查一次余额。
+func (p *Panel) handleCheckin(w http.ResponseWriter, r *http.Request) {
+	if p.deps.RunCheckin == nil {
+		errJSON(w, http.StatusServiceUnavailable, "签到入口不可用")
+		return
+	}
+	outcomes, err := p.deps.RunCheckin()
+	if err != nil {
+		// 与定时任务撞车（ErrBusy）不是故障，提示稍后重试即可
+		errJSON(w, http.StatusConflict, "签到未执行："+err.Error())
+		return
+	}
+	okN, alreadyN, failN, skipN := 0, 0, 0, 0
+	var credited int
+	for _, o := range outcomes {
+		switch o.Status {
+		case "ok":
+			okN++
+		case "already":
+			alreadyN++
+		case "skipped":
+			skipN++
+		default:
+			failN++
+		}
+		if o.Credits != nil {
+			credited++
+		}
+	}
+	okJSON(w, map[string]any{
+		"ok":       true,
+		"outcomes": outcomes,
+		"summary": map[string]int{
+			"total": len(outcomes), "ok": okN, "already": alreadyN,
+			"fail": failN, "skipped": skipN, "credits_read": credited,
+		},
+	})
 }
 
 // handleRestart 触发进程退出（依赖 docker restart 策略拉起，用于 listen 等装配期配置）。

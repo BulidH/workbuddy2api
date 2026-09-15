@@ -212,6 +212,25 @@ func main() {
 				p.Flush()
 				os.Exit(0)
 			},
+			// 手动签到 / 查余额：定时任务只在 checkin_hours 整点触发且启动时不跑，
+			// 新加的账号在下一个整点前积分恒为 0，故开放这个当场触发的入口。
+			RunCheckin: func() ([]panel.CheckinOutcome, error) {
+				res, err := sch.CheckinAll()
+				if err != nil {
+					return nil, err
+				}
+				out := make([]panel.CheckinOutcome, 0, len(res))
+				for _, o := range res {
+					out = append(out, panel.CheckinOutcome{
+						UID:      o.UID,
+						Nickname: o.Nickname,
+						Status:   string(o.Status),
+						Credits:  o.Credits,
+						Detail:   o.Detail,
+					})
+				}
+				return out, nil
+			},
 			Logs: logRing,
 		})
 		log.Printf("内置管理面板已启用：http://<host>%s/panel/", cfg.Listen)
