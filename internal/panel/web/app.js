@@ -372,7 +372,8 @@ function addAccountFlow() {
           ${r.countries.map(c => `<div class="radio-card ${c.ios2 === det ? 'sel' : ''}" data-ios2="${esc(c.ios2)}"
              data-en="${esc(c.en_name)}" data-code="${esc(c.code)}">
              <strong>${esc(c.ios2)}</strong><small>${esc(c.en_name)}</small></div>`).join('')}
-        </div>`,
+        </div>
+        <div id="regionMsg"></div>`,
         `<button class="btn primary" id="doRegion">提交并完成</button>`);
       let sel = r.countries.find(c => c.ios2 === det) || r.countries[0];
       $$('#ctry .radio-card').forEach(el => el.onclick = () => {
@@ -381,13 +382,23 @@ function addAccountFlow() {
         sel = { ios2: el.dataset.ios2, en_name: el.dataset.en, code: el.dataset.code };
       });
       $('#doRegion').onclick = async () => {
+        // 后端要串行打 3 个上游请求（提交地区 → 重新激活 → 领 trial），
+        // 最坏情况要等几十秒。没有加载反馈用户会以为按钮坏了，故必须禁用 + 改文案。
+        const btn = $('#doRegion');
+        btn.disabled = true; btn.textContent = '提交中…';
+        $('#regionMsg').innerHTML = '';
         try {
           const rr = await api('/login/region', { method: 'POST',
             body: { uid: r.uid, ios2: sel.ios2, en_name: sel.en_name, code: sel.code } });
           closeModal();
-          toast(rr.ok ? `账号已就绪：${rr.msg}` : rr.msg, rr.ok ? 'ok' : 'warn');
+          toast(rr.msg || '地区已完善', 'ok');
           render();
-        } catch (e) { toast(e.message, 'err'); }
+        } catch (e) {
+          // 错误就地显示在弹窗里（toast 在右下角，被弹窗挡着容易漏看）
+          const msg = (e.payload && e.payload.msg) || e.message;
+          $('#regionMsg').innerHTML = `<div class="alert err" style="margin-top:14px;margin-bottom:0">${esc(msg)}</div>`;
+          btn.disabled = false; btn.textContent = '重新提交';
+        }
       };
       return;
     }
