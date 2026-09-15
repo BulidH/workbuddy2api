@@ -53,7 +53,18 @@ type Deps struct {
 	// 存在的理由：定时签到只在 schedule.checkin_hours（默认 9/21 点）触发，
 	// 且调度器**启动时不跑**。于是新加的账号在下一个整点到来前积分恒为 0，
 	// 用户会以为「积分功能坏了」。面板提供手动入口当场查一次。
+	//
+	// 注意：realm=global 账号会被上游 D4 门控跳过（见 scheduler.go），
+	// 故它只能补齐国内版积分；国际版请用 QueryBalances。
 	RunCheckin func() ([]CheckinOutcome, error)
+
+	// QueryBalances 对所有账号执行**只读**余额查询，返回逐账号结果。
+	//
+	// 为什么单独做一个入口，而不是直接放宽 D4 门控：上游刻意让 global 账号
+	// 不参与签到任务、不对该域发起任何**自动**调用以免触发风控。这里保留那个
+	// 门控不动，只把「查余额」做成用户显式点击才发生的一次只读请求
+	// （get-user-resource，与国内版同一接口，上游本就实现了 global 路径）。
+	QueryBalances func() ([]BalanceOutcome, error)
 
 	// Logs 进程日志环形缓冲（可为 nil）。
 	Logs *Ring
@@ -70,6 +81,15 @@ type CheckinOutcome struct {
 	Status   string `json:"status"`
 	Credits  *int64 `json:"credits,omitempty"`
 	Detail   string `json:"detail,omitempty"`
+}
+
+// BalanceOutcome 单账号只读余额查询结果。
+type BalanceOutcome struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Realm    string `json:"realm"`
+	Credits  *int64 `json:"credits,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // Panel 面板 HTTP 处理器。
@@ -105,6 +125,7 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("POST /panel/api/accounts/delete", p.handleAccountDelete)
 	p.mux.HandleFunc("POST /panel/api/reload", p.handleReload)
 	p.mux.HandleFunc("POST /panel/api/checkin", p.handleCheckin)
+	p.mux.HandleFunc("POST /panel/api/balance", p.handleBalance)
 	p.mux.HandleFunc("POST /panel/api/restart", p.handleRestart)
 
 	// ── OAuth 加号 ────────────────────────────────────────

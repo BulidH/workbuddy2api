@@ -239,8 +239,10 @@ function accountsTable(list, { compact = false } = {}) {
     <div class="card-head">
       <h3>账号池 <span class="sub" style="font-weight:400">（${list.length} 个）</span></h3>
       <div class="row-flex">
+        <button class="btn sm" data-balance
+          title="只读查询所有账号余额（含国际版）。不发签到请求，不触发任何自动调用">查询余额</button>
         <button class="btn sm" data-checkin
-          title="立即执行签到 + 余额查询。定时任务默认只在 9/21 点跑，新账号在此之前积分会显示 0">查询余额 / 签到</button>
+          title="执行签到流程（上游只对国内版生效，国际版会被 D4 门控跳过）">签到</button>
         <button class="btn primary sm" data-add>+ 添加账号</button>
       </div>
     </div>
@@ -258,6 +260,42 @@ function bindAccountActions() {
   $$('[data-del]').forEach(b => b.onclick = () => confirmDelete(b.dataset.del, b.dataset.nick));
   $$('[data-add]').forEach(b => b.onclick = addAccountFlow);
   $$('[data-checkin]').forEach(b => b.onclick = runCheckin);
+  $$('[data-balance]').forEach(b => b.onclick = runBalance);
+}
+
+// runBalance 只读查询所有账号余额（含国际版）。
+// 与「签到」的分工：上游 D4 门控让 global 账号不参与签到任务、不对该域发起任何
+// 自动调用以免触发风控；这里保持门控不动，只做用户显式点击触发的一次只读查询。
+async function runBalance() {
+  const btns = $$('[data-balance]');
+  btns.forEach(b => { b.disabled = true; b.textContent = '查询中…'; });
+  try {
+    const r = await api('/balance', { method: 'POST' });
+    const outs = r.outcomes || [];
+    const got = outs.filter(o => o.credits !== null && o.credits !== undefined);
+    const fail = outs.filter(o => o.error);
+    const detail = got.map(o => `${o.nickname || o.uid.slice(0, 8)} = ${o.credits}`).join('，');
+    toast(`余额查询完成：成功 ${got.length} · 失败 ${fail.length}` + (detail ? `；${detail}` : ''),
+      fail.length ? 'warn' : 'ok', 9000);
+    if (fail.length) {
+      modal('余额查询明细', `
+        <div class="alert warn">以下账号未能取到余额：</div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr><th>账号</th><th>域</th><th>原因</th></tr></thead>
+          <tbody>${fail.map(o => `<tr>
+            <td>${esc(o.nickname || o.uid.slice(0, 12))}</td>
+            <td><span class="tag ${o.realm === 'global' ? 'info' : 'purple'}">${esc(o.realm)}</span></td>
+            <td style="font-size:12px;color:var(--text-dim)">${esc(o.error)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>`, `<button class="btn primary" data-close>知道了</button>`);
+      $$('[data-close]').forEach(b => b.onclick = () => { closeModal(); render(); });
+      return;
+    }
+    await render();
+  } catch (e) {
+    toast(e.message, 'err', 8000);
+    btns.forEach(b => { b.disabled = false; b.textContent = '查询余额'; });
+  }
 }
 
 // runCheckin 手动触发一轮签到 + 余额查询。

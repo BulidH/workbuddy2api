@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -228,6 +229,46 @@ func main() {
 						Credits:  o.Credits,
 						Detail:   o.Detail,
 					})
+				}
+				return out, nil
+			},
+			// 只读余额查询（含国际版）：上游 D4 门控刻意让 global 账号不参与签到任务、
+			// 不对该域发起任何自动调用以免触发风控。这里保持门控不动，只把「查余额」
+			// 做成用户显式点击才发生的一次 get-user-resource 只读请求。
+			QueryBalances: func() ([]panel.BalanceOutcome, error) {
+				var out []panel.BalanceOutcome
+				for i, st := range p.List() {
+					if st.Disabled {
+						continue
+					}
+					// 账号间错开一点：实测连续快速请求 workbuddy.ai 的 billing 接口会
+					// 偶发超时/500（每次失败的账号都不同，重试即好）。串行 + 小间隔
+					// 比并发轰炸更稳，也避免看起来像在扫接口。
+					if i > 0 {
+						time.Sleep(400 * time.Millisecond)
+					}
+					a := p.AuthByUID(st.UID)
+					if a == nil {
+						out = append(out, panel.BalanceOutcome{
+							UID: st.UID, Nickname: st.Nickname, Realm: st.Realm,
+							Error: "无有效凭证",
+						})
+						continue
+					}
+					oc := panel.BalanceOutcome{UID: st.UID, Nickname: st.Nickname, Realm: a.Realm()}
+					remain, buckets, err := up.UserResourceDetailed(a, cfg.ExpiringSoonDur)
+					if err != nil {
+						oc.Error = err.Error()
+						log.Printf("[panel] balance %s: %v", logfmt.UID8(st.UID), err)
+						out = append(out, oc)
+						continue
+					}
+					// 与签到路径同口径：余额恢复解冻冷却账号 + 写入总量/快过架子集
+					p.ReenableIfCredits(st.UID, remain)
+					p.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+					r := remain
+					oc.Credits = &r
+					out = append(out, oc)
 				}
 				return out, nil
 			},

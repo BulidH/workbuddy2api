@@ -291,6 +291,39 @@ func (p *Panel) handleCheckin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBalance 对所有账号执行一次只读余额查询（含国际版）。
+//
+// 与 handleCheckin 的分工：checkin 走上游定时任务语义（global 被 D4 门控跳过）；
+// 本接口只调 get-user-resource 这一个只读接口，两个域都能拿到余额。
+func (p *Panel) handleBalance(w http.ResponseWriter, r *http.Request) {
+	if p.deps.QueryBalances == nil {
+		errJSON(w, http.StatusServiceUnavailable, "余额查询入口不可用")
+		return
+	}
+	outcomes, err := p.deps.QueryBalances()
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "余额查询失败："+err.Error())
+		return
+	}
+	okN, failN := 0, 0
+	byRealm := map[string]int{}
+	for _, o := range outcomes {
+		if o.Error != "" {
+			failN++
+			continue
+		}
+		okN++
+		byRealm[o.Realm]++
+	}
+	okJSON(w, map[string]any{
+		"ok":       true,
+		"outcomes": outcomes,
+		"summary": map[string]any{
+			"total": len(outcomes), "ok": okN, "fail": failN, "by_realm": byRealm,
+		},
+	})
+}
+
 // handleRestart 触发进程退出（依赖 docker restart 策略拉起，用于 listen 等装配期配置）。
 func (p *Panel) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if p.deps.Restart == nil {
