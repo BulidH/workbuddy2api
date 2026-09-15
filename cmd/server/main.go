@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -19,6 +21,10 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// buildVersion 由构建时注入：-ldflags "-X main.buildVersion=$(git rev-parse --short HEAD)"。
+// 缺省 "dev"；面板页脚展示，便于确认线上跑的是哪个提交。
+var buildVersion = "dev"
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -171,7 +177,47 @@ func main() {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
 
-	h := server.NewHandler(server.Config{
+	// ── 内置 Web 管理面板 ─────────────────────────────────────────────
+	// 日志环形缓冲：标准 log 输出 tee 一份给面板；聊天表格日志走 os.Stdout（不经 log），
+	// 由 server.SetChatLogSink 旁路投喂。
+	logRing := panel.NewRing(1000)
+	log.SetOutput(io.MultiWriter(os.Stderr, logRing))
+	server.SetChatLogSink(func(line string) { logRing.Add("chat", line) })
+
+	// 面板要复用 handler 的 StatusPayload/ModelList，而 handler 又要拿到面板实例——
+	// 用前向声明的 h 打破循环：闭包在请求期才求值，届时 h 必已赋值。
+	var h *server.Handler
+	var panelHandler http.Handler
+	if cfg.Panel.Enabled {
+		panelHandler = panel.New(panel.Deps{
+			ConfigPath:     *cfgPath,
+			AuthDir:        cfg.AuthDir,
+			StateFile:      cfg.StateFile,
+			GatewayVer:     buildVersion,
+			WebDir:         cfg.Panel.Dir,
+			StatusJSON:     func() map[string]any { return h.StatusPayload() },
+			ModelList:      func() map[string]any { return h.ModelList() },
+			ValidateConfig: ValidateRaw,
+			// 重扫 auths 目录并对齐账号池 —— 加/删账号免重启的关键。
+			ReloadAuths: func() (int, error) {
+				auths, err := auth.LoadDir(cfg.AuthDir)
+				if err != nil {
+					return 0, err
+				}
+				p.SyncToDir(auths)
+				return len(auths), nil
+			},
+			Restart: func() {
+				log.Printf("[panel] 收到重启请求，进程退出（容器 restart 策略将自动拉起）")
+				p.Flush()
+				os.Exit(0)
+			},
+			Logs: logRing,
+		})
+		log.Printf("内置管理面板已启用：http://<host>%s/panel/", cfg.Listen)
+	}
+
+	h = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
@@ -184,6 +230,7 @@ func main() {
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		Panel:         panelHandler,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

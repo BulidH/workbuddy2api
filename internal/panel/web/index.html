@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy2API 控制台</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐱</text></svg>">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-logo">🐱</span>
+      <div class="brand-text">
+        <strong>WorkBuddy2API</strong>
+        <small>管理控制台</small>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <a class="nav-item" data-route="overview"><span class="ico">▤</span>概览</a>
+      <a class="nav-item" data-route="accounts"><span class="ico">☰</span>账号管理<span class="badge-count" id="navAccCount"></span></a>
+      <a class="nav-item" data-route="config"><span class="ico">⚙</span>网关配置</a>
+      <a class="nav-item" data-route="models"><span class="ico">◇</span>模型列表</a>
+      <a class="nav-item" data-route="logs"><span class="ico">≡</span>运行日志</a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="health-pill" id="healthPill"><i class="dot"></i><span>连接中…</span></div>
+      <button class="btn ghost sm" id="themeBtn" type="button">切换主题</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1 id="pageTitle">概览</h1>
+        <p class="muted" id="pageSub"></p>
+      </div>
+      <div class="topbar-actions">
+        <label class="auto-refresh">
+          <input type="checkbox" id="autoRefresh" checked>
+          <span>自动刷新 <em id="tickInfo"></em></span>
+        </label>
+        <button class="btn" id="refreshBtn" type="button">刷新</button>
+        <button class="btn warn" id="restartBtn" type="button">重启网关</button>
+      </div>
+    </header>
+
+    <div class="content" id="view"><div class="loading">加载中…</div></div>
+  </main>
+</div>
+
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

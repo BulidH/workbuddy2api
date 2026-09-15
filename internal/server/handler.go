@@ -49,6 +49,10 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Panel 内置 Web 管理面板（可选）。nil = 不注册 /panel/* 路由（零回归）。
+	// 由 cmd/server 装配后注入，面板自身不感知 pool/upstream 细节。
+	Panel http.Handler
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -91,6 +95,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// 内置管理面板：挂在 /panel/ 下，与 OpenAI 兼容面完全隔离。
+	// ServeMux 会自动把 "/panel" 重定向到 "/panel/"。
+	if cfg.Panel != nil {
+		h.mux.Handle("/panel/", cfg.Panel)
+	}
 	return h
 }
 
@@ -136,6 +145,14 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.StatusPayload())
+}
+
+// StatusPayload 构造 /status 载荷。
+//
+// 导出给内置面板复用（cmd/server 注入为 panel.Deps.StatusJSON）：面板与 API 走同一份
+// 实现，避免两处各算一遍导致的语义漂移。
+func (h *Handler) StatusPayload() map[string]any {
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if h.cfg.StickyCount != nil {
@@ -147,7 +164,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -160,7 +177,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
-	})
+	}
 }
 
 // countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
@@ -206,10 +223,15 @@ const (
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, h.ModelList())
+}
+
+// ModelList 构造 /v1/models 载荷。导出给内置面板复用（同 StatusPayload 的理由）。
+func (h *Handler) ModelList() map[string]any {
+	return map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
-	})
+	}
 }
 
 // globalModels 国际版（global realm）模型名名单（PLAN §7.2 附录 21 名）。

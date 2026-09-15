@@ -19,6 +19,26 @@ var chatSeq atomic.Int64
 // 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
 var chatLogEnabled = true
 
+// chatLogSink 聊天日志的可选旁路接收器：非 nil 时每条表格日志额外投喂一份。
+// 内置面板的「日志」页据此展示请求流水（该日志走 os.Stdout，不经标准 log，
+// 无法用 log.SetOutput 截获，故单独留一个 hook）。由 cmd/server 注入。
+var chatLogSink atomic.Value // func(string)
+
+// SetChatLogSink 注册聊天日志旁路（传 nil 取消）。
+func SetChatLogSink(fn func(string)) {
+	if fn == nil {
+		fn = func(string) {}
+	}
+	chatLogSink.Store(fn)
+}
+
+// emitChatLogSink 投喂旁路（未注册时静默跳过）。
+func emitChatLogSink(line string) {
+	if v, ok := chatLogSink.Load().(func(string)); ok && v != nil {
+		v(line)
+	}
+}
+
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
 	start  time.Time
@@ -211,7 +231,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	line := fmt.Sprintf("| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -223,4 +243,6 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		tokpsField,
 		total.Seconds(),
 	)
+	fmt.Fprintln(os.Stdout, line)
+	emitChatLogSink(line)
 }

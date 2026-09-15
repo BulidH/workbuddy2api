@@ -131,6 +131,15 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Panel 内置 Web 管理面板（/panel/）。缺省启用；显式 enabled=false 关闭。
+	// 面板无鉴权，仅供本机/内网运维使用——公网暴露前务必自行加反代鉴权。
+	Panel struct {
+		Enabled bool `json:"enabled"`
+		// Dir 前端资源目录；非空且存在时从磁盘读（改完刷新即可，免重新编译）。
+		// 空 = 用 go:embed 进二进制的内嵌资源（自包含部署）。
+		Dir string `json:"dir"`
+	} `json:"panel"`
+
 	// 解析后
 	SoftRateDur         time.Duration `json:"-"`
 	SoftRateMaxDur      time.Duration `json:"-"`
@@ -178,7 +187,20 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	c.Panel.Enabled = true // 内置面板缺省开（本机部署）；Dir 空 = 用内嵌资源
 	return c
+}
+
+// ValidateRaw 用真实配置语义校验一份 config JSON（dry-run，不落盘、不影响运行态）。
+//
+// 供内置面板的配置保存接口收口：类型不符、非法 duration、非法 prompt.mode、
+// max_body_mb<=0 等都会在此被拦下，避免写进一份网关启动时才会报错的配置。
+func ValidateRaw(raw []byte) error {
+	c := Default()
+	if err := json.Unmarshal(raw, c); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	return c.normalize()
 }
 
 // Load 从文件读，再用 WB2A_* env 覆盖。
