@@ -20,7 +20,14 @@ async function api(path, { method = 'GET', body } = {}) {
   let data = {};
   try { data = await res.json(); } catch { /* 非 JSON 响应 */ }
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    // 服务端的失败载荷有两种形态：{error}（真错误）与 {msg}（如登录轮询的
+    // {ok:false,pending:true,msg:"尚未完成登录"}）。两者都要取，否则会把
+    // 有用的提示吞掉、兜底显示成无意义的 "HTTP 200"。
+    // 整个载荷挂到 error.payload 上，调用方据此区分「尚未完成」与「真失败」。
+    const err = new Error(data.error || data.msg || `HTTP ${res.status}`);
+    err.payload = data;
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -283,7 +290,12 @@ function addAccountFlow() {
   let state = null;
   let pollTimer = null;
 
-  const renderStep1 = () => modal('添加账号 · 第 1 步', `
+  // 绑定必须写在 modal() **之后**：modal 负责把 HTML 注入 DOM，在那之前
+  // $('#next1') 仍是 null，赋值 onclick 会抛 TypeError 并中断整个函数，
+  // 结果是弹窗根本打不开（点「添加账号」毫无反应）。
+  // 放进 renderStep1 内部还能保证每次重渲染（切换版本）后重新绑定。
+  const renderStep1 = () => {
+    modal('添加账号 · 第 1 步', `
     <p class="muted" style="margin-top:0">选择要登录的账号版本，随后在浏览器完成登录。</p>
     <div class="radio-row">
       <div class="radio-card ${realm === 'global' ? 'sel' : ''}" data-r="global">
@@ -294,15 +306,16 @@ function addAccountFlow() {
     <div class="alert warn" style="margin-top:16px">
       浏览器若已登录其他账号，点开链接会直接授权该账号。建议使用<b>无痕窗口</b>登录新账号。
     </div>`,
-    `<button class="btn" data-close>取消</button><button class="btn primary" id="next1">生成授权链接</button>`);
+      `<button class="btn" data-close>取消</button><button class="btn primary" id="next1">生成授权链接</button>`);
 
-  $$('[data-r]').forEach(c => c.onclick = () => { realm = c.dataset.r; renderStep1(); });
-  $('#next1').onclick = async () => {
-    try {
-      const r = await api('/login/start', { method: 'POST', body: { realm } });
-      state = r.state;
-      renderStep2(r.url);
-    } catch (e) { toast(e.message, 'err'); }
+    $$('[data-r]').forEach(c => c.onclick = () => { realm = c.dataset.r; renderStep1(); });
+    $('#next1').onclick = async () => {
+      try {
+        const r = await api('/login/start', { method: 'POST', body: { realm } });
+        state = r.state;
+        renderStep2(r.url);
+      } catch (e) { toast(e.message, 'err'); }
+    };
   };
   renderStep1();
 
@@ -331,7 +344,12 @@ function addAccountFlow() {
         }
         renderStep3(r);
       } catch (e) {
-        $('#loginMsg').innerHTML = `<div class="alert err">${esc(e.message)}</div>`;
+        // pending（用户还没点完登录）不是错误，用黄色提示而非红色报错，
+        // 并显示后端给的真实原因（如 "11217:login ing..."）。
+        const p = e.payload || {};
+        const pending = !!p.pending;
+        $('#loginMsg').innerHTML =
+          `<div class="alert ${pending ? 'warn' : 'err'}">${esc(p.msg || e.message)}</div>`;
         btn.disabled = false; btn.textContent = '再试一次';
       }
     };
