@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
+# GOPROXY：默认走国内镜像（proxy.golang.org 在境内不可达，构建会 i/o timeout）。
+# 可用 --build-arg GOPROXY=... 覆盖。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+# 版本号注入二进制（面板页脚展示，便于确认线上跑的是哪个提交）。
+ARG BUILD_VERSION=dev
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \

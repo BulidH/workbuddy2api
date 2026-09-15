@@ -1,6 +1,11 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      args:
+        # 面板页脚展示的版本号；构建时覆盖即可：
+        #   WB2A_VERSION=$(git rev-parse --short HEAD) docker compose up -d --build
+        BUILD_VERSION: ${WB2A_VERSION:-local}
     container_name: workbuddy2api
     restart: unless-stopped
     environment:
@@ -13,4 +18,10 @@ services:
       # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      # 注意：不能加 :ro —— 内置管理面板要在线改写 config.json。
+      # 单文件 bind mount 会让 rename 报 EXDEV，面板已内置原地覆盖写的降级路径。
+      - ./config.json:/app/config.json
+      # 面板前端资源以只读方式挂进容器，配合 config.json 的 panel.dir="/app/web"
+      # 实现「改完刷新即生效」，调整样式无需重新构建镜像。
+      # 目录不存在时面板自动回落到 go:embed 的内嵌资源，不会启动失败。
+      - ./internal/panel/web:/app/web:ro
