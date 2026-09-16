@@ -41,6 +41,13 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 边缘 WAF 按出口 IP 拦截（403 + HTML 拦截页）：与账号无关，不罚账号且不换号。
+		// 关键是要判在通用 4xx 与限流文案之前——拦截页是整张 HTML，可能顺带含
+		// "too many" 之类措辞，误判成账号级限流就会白白冷却所有好号。
+		{403, `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><title>WAF Block Page</title>`, ErrWAFBlocked},
+		{403, `<title>waf block page</title>`, ErrWAFBlocked}, // 大小写不敏感
+		{403, `WAF Block Page ... too many requests ...`, ErrWAFBlocked},   // 优先于限流文案
+		{403, `WAF Block Page ... insufficient credits ...`, ErrWAFBlocked}, // 优先于余额文案
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。

@@ -635,6 +635,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			if kind == upstream.ErrWAFBlocked {
+				// 边缘 WAF 按出口 IP 拦截：**立即返回，不轮转**。
+				// 依据：实测同一秒内全部账号一起 403，说明拦的是本机出口 IP 而非账号，
+				// 换号必然同样被拦。继续轮换的代价是把上游请求量放大 MaxRotate 倍
+				// （一次客户端请求 → 3 次被拦请求），可能让风控评级更差、解封更慢。
+				// 不罚账号（applyErrorPolicy 该分支无冷却/熔断），风控解除后池子照常可用。
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				fail(acct.UID)
+				log.Printf("WARN: [server] upstream WAF blocked this egress IP (account-independent); " +
+					"skip rotation and fail fast")
+				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_waf_blocked",
+					"上游风控按出口 IP 拦截了本网关，与账号无关；换号重试无效。请稍后重试，"+
+						"或更换网关的出口 IP。")
+				st.status = http.StatusServiceUnavailable
+				return
+			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)
@@ -787,6 +803,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+	case upstream.ErrWAFBlocked:
+		// 边缘 WAF 按出口 IP 拦截：与账号无关，不罚账号（无冷却/熔断/NoteError）。
+		// 处罚毫无意义——被拦的是这台机器的 IP，所有账号会一起中招；冷却只会让
+		// 风控解除后池子还是空的。轮换同样无意义，由 chatCompletions 立即返回。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

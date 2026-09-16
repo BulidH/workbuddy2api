@@ -33,6 +33,7 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrWAFBlocked                    // 边缘 WAF 按出口 IP 拦截（403 + "WAF Block Page"）→ 与账号无关，不罚账号且**不换号**
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -54,6 +55,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrAccountFault:
 		return "account_fault"
+	case ErrWAFBlocked:
+		return "waf_blocked"
 	case ErrClient:
 		return "client"
 	default:
@@ -155,6 +158,20 @@ var softRateRule = errorRule{kind: ErrSoftRate, mode: matchFold, patterns: []str
 }}
 
 var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns: []string{"Offline user session not found", "12153"}}
+
+// wafBlockedRule 边缘 WAF 拦截页特征（大小写不敏感子串匹配）。
+//
+// 定位：上游边缘 WAF 按**出口 IP** 拦截时返回 403 + 一张 HTML 拦截页
+// （标题固定 "WAF Block Page"）。关键特征是**与账号无关**——实测同一出口 IP 下
+// 3 个账号在同一秒内全部 403。因此换号重试纯属徒劳，还会把上游请求量放大数倍
+// （MaxRotate=3 → 一次客户端请求触发 3 次被拦请求），可能进一步加重风控评级。
+//
+// 故单列 ErrWAFBlocked：不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），
+// 且 chat 轮转循环遇之立即返回、不再换号。
+var wafBlockedRule = errorRule{kind: ErrWAFBlocked, mode: matchFold, patterns: []string{
+	"WAF Block Page",
+	"waf-block-page",
+}}
 
 // contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
@@ -319,10 +336,17 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 //  5. status==429 —— body 无文案时的兜底识别。
 //  6. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
 func Classify(status int, body string) ErrKind {
+	lower := strings.ToLower(body)
+	// WAF 拦截页**最先判**：它是 IP 级风控的确证，且 body 是整张 HTML，可能顺带
+	// 命中余额/限流/审核等任意关键词。若按常规顺序走，一张含 "insufficient credits"
+	// 字样的拦截页会被判成 ErrHardCredit，把好号冷却到次日 04:00 —— 惩罚的是账号，
+	// 但真正被拦的是这台机器的出口 IP，罚了也没用、还让风控解除后池子空着。
+	if wafBlockedRule.hit(body, lower) {
+		return ErrWAFBlocked
+	}
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
-	lower := strings.ToLower(body)
 	if hardRule.hit(body, lower) {
 		return ErrHardCredit
 	}
