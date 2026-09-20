@@ -897,9 +897,9 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
-// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
-// （现状不变）。
-func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
+// TestChat6004WithoutResetFallsBackToModelCooldown 6004 无时间文案 → 退回模型级有界退避
+// （不再退化为账号级冷却，保留切模型豁免）。
+func TestChat6004WithoutResetFallsBackToModelCooldown(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
@@ -922,12 +922,19 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
+	// 6004 无时间时仍走模型级冷却（CooldownSoftForModel），保留切模型豁免。
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("bad should have glm-5.3 model limit: %+v", st)
 	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	// 同模型请求不应选中 bad（仍冷却）；不同模型应豁免。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForRealm(nil, "glm-5.3", "")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad, got %+v", same)
+	}
+	diff := p.PickExcludingForRealm(nil, "hy3-x", "")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should bypass bad, got %+v", diff)
 	}
 }
 

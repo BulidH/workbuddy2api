@@ -771,23 +771,30 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
-		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
-		// softStreak 指数堆加。
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」或
+		// 「reset at … UTC+8」，无论业务 code 是 6004 还是 11140 rate-limiting 等形态，
+		// 都精确冷却到该墙钟、绝不 softStreak 指数堆加。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
-		//     豁免（既有 issue #31 语义）。
+		//     豁免（既有 issue #31 语义）。**无论 ParseRateReset 是否成功**，6004 都
+		//     走模型级冷却——解析成功则对齐上游墙钟，解析失败则退化为模型级有界退避，
+		//     绝不退化成账号级冷却（否则切模型无法绕过，丢失 6004 豁免语义）。
 		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
 		//     （普通账号级限流不该因切模型绕过）。
-		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			if upstream.IsModelRateLimit(body) {
+		if upstream.IsModelRateLimit(body) {
+			if resetAt, ok := upstream.ParseRateReset(body); ok {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
-				return
+			} else {
+				// 6004 但无解析时间：模型级有界退避（不写账号级 until，保留切模型豁免）。
+				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "6004 model rate limit")
 			}
+			return
+		}
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		// 非 6004 且无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、
+		// 封顶 soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
 		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")

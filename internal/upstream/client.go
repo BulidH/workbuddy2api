@@ -311,8 +311,10 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetRe = `将在 (.+?) 重置`
+// softRateResetRe 匹配中英文两种上游重置时间文案，捕获中间的时间串。
+//   - 中文：将在 2026-09-21 10:20:25 重置
+//   - 英文：reset at 2026-09-21 10:20:25 UTC+8
+const softRateResetRe = `(?:将在|reset at) (.+?)(?:重置|UTC\+8)`
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
@@ -325,7 +327,7 @@ func IsModelRateLimit(body string) bool {
 	return re.MatchString(body)
 }
 
-// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」/「reset at … UTC+8」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
 // 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
