@@ -390,6 +390,43 @@ func (p *Pool) List() []Status {
 	}
 	return out
 }
+// modelCostViewsLocked 构造成本账本视图（须在 p.mu 持锁下调用）。
+//
+// 只输出**仍然有效**的观测（未过期）：过期观测在 pick 的 costTier 里同样返回
+// ok=false，展示出来会与真实选号行为不符。
+func (p *Pool) modelCostViewsLocked(e *entry, now time.Time) []ModelCostView {
+	if len(e.modelCost) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelCost))
+	for m := range e.modelCost {
+		models = append(models, m)
+	}
+	sort.Strings(models) // map 遍历无序，排序保证 /status 输出稳定
+	rows := make([]ModelCostView, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCost[m]
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			continue
+		}
+		tier := 2
+		if mc.CostPer1k <= 0 {
+			tier = 0
+		}
+		rows = append(rows, ModelCostView{
+			Model:     m,
+			CostPer1k: mc.CostPer1k,
+			LastSeen:  mc.LastSeen,
+			Samples:   mc.Samples,
+			Tier:      tier,
+		})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return rows
+}
+
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
@@ -419,6 +456,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
 	}
+	st.ModelCosts = p.modelCostViewsLocked(e, now)
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
 		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)

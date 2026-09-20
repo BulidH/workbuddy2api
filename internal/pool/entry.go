@@ -51,6 +51,25 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+
+	// ModelCosts 实测成本账本（运行态，不持久化；重启即清空）。
+	//
+	// 为什么透出给运维：选号时按此账本**分层硬过滤**（只保留最优层：免费 > 无观测 >
+	// 已实测收费）。一旦有账号被实测为免费，其余账号会被整体排除且再也拿不到新观测
+	// ——形成"某些账号长期一次都选不中"的闭环。此前这个决策依据完全不可见，
+	// 只能看到"号没被用"，看不到"为什么"。
+	ModelCosts []ModelCostView `json:"model_costs,omitempty"`
+}
+
+// ModelCostView 单个 (账号, 模型) 的成本观测（选号分层的依据）。
+type ModelCostView struct {
+	Model     string    `json:"model"`
+	CostPer1k float64   `json:"cost_per_1k"` // 实测每千 token 扣费；0 = 免费
+	LastSeen  time.Time `json:"last_seen"`
+	Samples   int       `json:"samples"`
+	// Tier 该观测对应的成本层：0=免观测免费 / 1=无观测 / 2=已实测收费。
+	// 选号只保留候选中**最小的 tier**，其余整体排除。
+	Tier int `json:"tier"`
 }
 
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
