@@ -93,6 +93,19 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		return 2, mc.CostPer1k
 	}
+	// 成本分层过滤口径（本次修正）：
+	//   只在存在更优候选时排除「已实测收费」(tier2)；tier0（免费）与 tier1（无观测）
+	//   **必须一起保留**。
+	//
+	//   原实现是 `ti == bestTier`（只留最优层），后果是第一个被实测为免费的号会把
+	//   其余号**永久**锁死：被排除 → 选不中 → 拿不到观测 → 永远停在 tier1。实测复现：
+	//   重启后连发 18 个请求全部命中同一个号，其余 6 个（含 1000+ 次成功的老号）为 0，
+	//   多账号池实际塌缩成单账号（配额闲置 + 单点故障）。
+	//   上游作者注释里本就写明要避免「未知号永远轮不到，也就永远学不到」——硬过滤
+	//   把同一个死锁往前推了一层：从「已知收费压过未知」变成「已知免费压过未知」。
+	//
+	//   修正后：免费号靠 freeTierBonus 权重加成体现优先级（优先但**不独占**），
+	//   未知号仍能靠加权抽签被探索到，从而学出自己的成本层。
 	bestTier := 2
 	for _, e := range cands {
 		if ti, _ := costTier(e); ti < bestTier {
@@ -101,9 +114,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	ws := make([]weighted, 0, len(cands))
 	for _, e := range cands {
-		if ti, _ := costTier(e); ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now)})
+		ti, _ := costTier(e)
+		if ti == 2 && bestTier < 2 {
+			continue // 已实测收费，且存在免费/无观测候选 → 排除
 		}
+		w := p.weightOf(e, maxCredits, now)
+		if ti == 0 {
+			w += p.freeTierBonus // 已实测免费：权重加成
+		}
+		ws = append(ws, weighted{e: e, w: w})
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，

@@ -68,22 +68,87 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	}
 }
 
-// TestModelCostFreeBeatsUnknown 已确认免费的号压过未观测的号。
-func TestModelCostFreeBeatsUnknown(t *testing.T) {
+// TestModelCostFreeTierNotStarvingUnknown 核心回归守卫：无观测的号**不得被饿死**。
+//
+// 场景刻意沿用原 TestModelCostFreeBeatsUnknown 的极端设置（1 积分 vs 100 万积分），
+// 因为那正是旧实现暴露问题的场景：硬过滤只留最优层，未知号一次都选不中。
+// 这里**不再断言「未知号一次都不中」**（那与「能被选中」数学互斥），只断言它拿到
+// 有意义份额——有份额才拿得到观测，才学得出自己的成本层。
+func TestModelCostFreeTierNotStarvingUnknown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.SetRandomSource(func(n int64) int64 { return 0 })
+	seed := uint64(20260920)
+	p.SetRandomSource(func(n int64) int64 {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		if n <= 0 {
+			return 0
+		}
+		return int64(seed>>33) % n
+	})
 	p.Add(&auth.Auth{UID: "knownfree"})
 	p.Add(&auth.Auth{UID: "unknown"})
 	p.SetCredits("knownfree", 1)
 	p.SetCredits("unknown", 1_000_000)
 	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
 
-	for i := 0; i < 50; i++ {
+	const N = 2000
+	counts := map[string]int{}
+	for i := 0; i < N; i++ {
 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
-		if a == nil || a.UID != "knownfree" {
-			t.Fatalf("选中 %v, want knownfree（已确认免费 > 未知）", a)
+		if a == nil {
+			t.Fatal("pick 返回 nil")
 		}
+		counts[a.UID]++
+	}
+	unk := counts["unknown"]
+	t.Logf("knownfree=%d unknown=%d (N=%d)", counts["knownfree"], unk, N)
+	if unk < N/20 {
+		t.Errorf("未知号被饿死：unknown=%d/%d（应 ≥5%%）——旧实现此处恒为 0，正是本用例要守住的回归点", unk, N)
+	}
+}
+
+// TestModelCostFreeTierPreferredWhenCreditsComparable 积分接近时，已确认免费的号被优先。
+//
+// 为什么单独一个用例：积分项（=余额占比×10）与「免费优先」是两个正交目标，极端
+// 积分差场景下后者会让位于前者（优先消耗积分为 1 的号并不合理）。真实部署中各号
+// 积分量级接近，本用例断言那个场景下免费号确实更受青睐。
+func TestModelCostFreeTierPreferredWhenCreditsComparable(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	seed := uint64(777)
+	p.SetRandomSource(func(n int64) int64 {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		if n <= 0 {
+			return 0
+		}
+		return int64(seed>>33) % n
+	})
+	p.Add(&auth.Auth{UID: "knownfree"})
+	p.Add(&auth.Auth{UID: "unknown"})
+	p.SetCredits("knownfree", 300)
+	p.SetCredits("unknown", 300)
+	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
+
+	const N = 2000
+	counts := map[string]int{}
+	for i := 0; i < N; i++ {
+		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
+		if a == nil {
+			t.Fatal("pick 返回 nil")
+		}
+		counts[a.UID]++
+	}
+	free, unk := counts["knownfree"], counts["unknown"]
+	t.Logf("knownfree=%d unknown=%d (N=%d)", free, unk, N)
+	if free <= unk {
+		t.Errorf("积分相当时免费号应被优先：knownfree=%d unknown=%d", free, unk)
+	}
+	// 但不得接近独占——独占就是旧问题换了个方向重演。
+	if free > N*95/100 {
+		t.Errorf("免费号过度独占：knownfree=%d/%d（应 ≤95%%）", free, N)
+	}
+	if unk < N/20 {
+		t.Errorf("未知号份额过低：unknown=%d/%d", unk, N)
 	}
 }
 

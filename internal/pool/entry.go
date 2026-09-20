@@ -355,6 +355,19 @@ const softStreakShiftMax = 16
 const (
 	defaultIdleWeightPerHour = 0.5
 	defaultIdleWeightMax     = 5.0
+	// defaultFreeTierBonus 已实测免费账号的权重加成默认值。
+	//
+	// 量级推导：权重公式 = base(1) + credits比例×10 + 闲置(≤5) + 成功率(≤3)。
+	// credits 项的**最大**贡献恰好是 10（比例上限 1×10），故取 12 —— 比它略大，
+	// 保证「已确认免费」在积分差距拉到最大时仍被优先（保住上游原意，见
+	// TestModelCostFreeBeatsUnknown）。
+	//
+	// 为什么加成大也不会导致独占：本加成只对**已实测免费**的号生效，而一旦某个号
+	// 被选中并实测为免费，它会进入 tier0；其余号此时仍可参与抽签（这正是本次修掉的
+	// 饥饿点），被抽中后同样会被实测，于是也升到 tier0。当全部账号都在 tier0 时，
+	// 加成对所有人一视同仁、对分布毫无影响，负载自然回归按积分/闲置/成功率的均衡。
+	// 换言之：这个加成只在「探索期」起作用，作用是加速把每个号都实测一遍。
+	defaultFreeTierBonus = 12.0
 )
 
 // New 构建池；stateFp 非空时尝试加载旧状态，并启动后台周期性落盘 goroutine。

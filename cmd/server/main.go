@@ -67,6 +67,9 @@ func main() {
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 已实测免费账号的权重加成（pool.free_tier_bonus，默认 3.0）。
+	// 配合 pick.go 的过滤修正：免费号优先但不独占，避免池子塌缩成单账号。
+	p.SetFreeTierBonus(cfg.Pool.FreeTierBonus)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router

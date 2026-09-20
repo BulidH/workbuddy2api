@@ -27,6 +27,14 @@ type Pool struct {
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// freeTierBonus 已实测「免费」账号的权重加成（SetFreeTierBonus 注入）。
+	//
+	// 为什么需要加成而不是硬过滤：原实现把所有候选按成本分层后**只保留最优层**，
+	// 于是第一个被实测为免费的号会把其余号永久锁死——它们选不中 → 拿不到观测 →
+	// 永远停在「无观测」层，池子塌缩成单账号（实测重启后 18 个请求全部命中同一个号）。
+	// 现改为：硬过滤只排除「已实测收费」，免费与无观测一起参与加权抽签；
+	// 免费号靠本加成体现优先级，未知号仍有被探索到的机会。
+	freeTierBonus float64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
@@ -55,6 +63,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		freeTierBonus:      defaultFreeTierBonus,
 	}
 	if stateFp != "" {
 		p.load()
@@ -86,6 +95,17 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	if d > 0 {
 		p.softRateMax = d
 	}
+}
+
+// SetFreeTierBonus 注入「已实测免费」账号的权重加成（main 从 config 解析后调用）。
+// 负值保留默认；显式 0 合法（= 取消加成，免费号与未知号完全平等竞争）。
+func (p *Pool) SetFreeTierBonus(v float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v < 0 {
+		return
+	}
+	p.freeTierBonus = v
 }
 
 // SetWeights 注入三因子加权的闲置补偿参数。非正值保留原值（用默认）。

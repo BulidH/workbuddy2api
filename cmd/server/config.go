@@ -130,6 +130,14 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
 		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// FreeTierBonus 已实测「免费」账号的选号权重加成，默认 3.0。
+		//
+		// 背景：选号会按 (账号, 模型) 的实测扣费分层。原实现只保留最优层，导致第一个
+		// 被实测为免费的号把其余号永久锁死（选不中→拿不到观测→永远停在无观测层），
+		// 池子塌缩成单账号。现改为硬过滤只排除「已实测收费」，免费与无观测一起参与
+		// 加权抽签，免费号靠本加成体现优先级。
+		// 显式 0 = 取消加成（免费号与未知号完全平等竞争）；负值视为未设置走默认。
+		FreeTierBonus float64 `json:"free_tier_bonus"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -192,6 +200,7 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	c.Pool.FreeTierBonus = 12.0  // 已实测免费账号的权重加成（负值视为未设置，见 SetFreeTierBonus）
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"

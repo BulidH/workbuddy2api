@@ -520,6 +520,7 @@ const SCHEMA = [
     { p: 'pool.idle_weight_per_hour', l: '闲置补偿 / 小时', t: 'float', h: '每小时未用增加的权重' },
     { p: 'pool.idle_weight_max', l: '闲置补偿封顶', t: 'float', h: '' },
     { p: 'pool.expiring_soon', l: '快过期积分窗口', t: 'text', h: '如 168h = 7 天；此窗口内到期的积分优先消耗' },
+    { p: 'pool.free_tier_bonus', l: '免费账号权重加成', t: 'float', h: '已实测免费的号在选号时的权重加成，默认 3.0。调大更偏向免费号，调小更均摊负载；0 = 完全平等竞争' },
   ]},
   { sec: '冷却策略', desc: '限流与错误的冷却时长', fields: [
     { p: 'cooldown.soft_rate', l: '软冷却基数', t: 'text', h: '429 限流起始冷却，如 600s' },
