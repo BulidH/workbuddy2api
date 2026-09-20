@@ -288,6 +288,9 @@ func main() {
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// 单请求最多换号次数（server.max_rotate，默认 3）——号多时调大可避免
+		// 「只试了前几个就报全部账号不可用」。
+		MaxRotate: cfg.Server.MaxRotate,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Panel:         panelHandler,

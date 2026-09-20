@@ -48,6 +48,12 @@ func TestClassify(t *testing.T) {
 		{403, `<title>waf block page</title>`, ErrWAFBlocked}, // 大小写不敏感
 		{403, `WAF Block Page ... too many requests ...`, ErrWAFBlocked},   // 优先于限流文案
 		{403, `WAF Block Page ... insufficient credits ...`, ErrWAFBlocked}, // 优先于余额文案
+		// 上下文超长（400 + 11115）：客户端侧问题，任何账号都会返回同一个 400。
+		// 曾落到 ErrClient 而被白轮换 MaxRotate 个号（实测一次请求耗 29s，客户端
+		// 等到自己断连），最终回一句语义完全错误的 503「全部账号不可用」。
+		{400, `{"code":11115,"msg":"prompt is too long: 1049931 tokens > 1048576 maximum","extError":{"code":"context_length_exceeded"}}`, ErrContextTooLong},
+		{400, `context_length_exceeded`, ErrContextTooLong},
+		{400, `Prompt is too long`, ErrContextTooLong}, // 大小写不敏感
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
@@ -639,5 +645,26 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	})
 	if c.chatHTTP() != c.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
+	}
+}
+
+func TestContextTooLongClientMessage(t *testing.T) {
+	// 实测报文：必须把 token 数字透出来（用户据此判断超了多少），
+	// 且绝不能带出 requestId 等内部字段。
+	body := `{"code":11115,"msg":"prompt is too long: 1049931 tokens > 1048576 maximum","requestId":"62667d3c7eba0ce0c90ad0fd517f6d2c","extError":{"code":"context_length_exceeded"}}`
+	got := ContextTooLongClientMessage(body)
+	if !strings.Contains(got, "1049931") || !strings.Contains(got, "1048576") {
+		t.Errorf("应透出 token 数字，实际: %q", got)
+	}
+	if strings.Contains(got, "62667d3c") || strings.Contains(got, "requestId") {
+		t.Errorf("不应泄露 requestId，实际: %q", got)
+	}
+	// 拿不到原文时回落固定文案，绝不整段透传 body
+	fallback := ContextTooLongClientMessage(`{"code":1,"msg":"something else"}`)
+	if !strings.Contains(fallback, "上下文") {
+		t.Errorf("应回落固定文案，实际: %q", fallback)
+	}
+	if strings.Contains(fallback, "something else") {
+		t.Errorf("回落文案不应包含上游原文，实际: %q", fallback)
 	}
 }

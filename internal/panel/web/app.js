@@ -510,6 +510,7 @@ const SCHEMA = [
     { p: 'listen', l: '监听地址', t: 'text', h: '如 :7863；修改后需重启' },
     { p: 'api_key', l: 'API 密钥', t: 'secret', h: '客户端 Bearer Token；留空 = 不鉴权（公网务必设置）' },
     { p: 'server.max_body_mb', l: '请求体上限 (MB)', t: 'int', h: '超过直接返回 413，不再静默截断' },
+    { p: 'server.max_rotate', l: '单请求最多换号次数', t: 'int', h: '默认 3。号多时可调大，避免「只试了前几个就报全部账号不可用」；代价是最坏延迟随之增长' },
   ]},
   { sec: '账号池调度', desc: '选号权重、熔断与并发', fields: [
     { p: 'pool.max_in_flight', l: '单号最大在途', t: 'int', h: '0 = 不限；占满的号不参与选号' },

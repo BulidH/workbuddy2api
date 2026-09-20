@@ -26,6 +26,13 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认并记录。
 		MaxBodyMB int `json:"max_body_mb"`
+		// MaxRotate 单个客户端请求最多尝试几个账号，默认 3。
+		//
+		// 为什么要可配：账号池很大时 3 次轮换可能在一个请求内就耗尽 —— 实测 6 个可用号、
+		// 前 3 个恰好都失败（各自卡到超时），第 4 个以后根本没被调用，客户端却收到
+		// 「所有账号不可用」的 503。调大的代价是最坏情况延迟线性增长（每次尝试都要等
+		// 上游超时），故默认仍为 3；号多且上游超时频发时可按需调高。
+		MaxRotate int `json:"max_rotate"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -161,6 +168,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	c.Server.MaxRotate = 3 // 单请求最多换号次数（与原 handler 内兜底值一致，零行为变更）
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -306,6 +314,10 @@ func (c *Config) normalize() error {
 	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
+	// max_rotate：0/负数视为未设置 → 回落默认 3（与 server.NewHandler 内兜底同值）。
+	if c.Server.MaxRotate <= 0 {
+		c.Server.MaxRotate = 3
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

@@ -651,6 +651,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusServiceUnavailable
 				return
 			}
+			if kind == upstream.ErrContextTooLong {
+				// 上下文超长（400 + 11115）：**客户端侧问题，立即返回，不轮转**。
+				// 依据：prompt 长度与账号无关，任何账号都会返回同一个 400。
+				// 修复前它落到 ErrClient → 白轮换 MaxRotate 个号（实测一次请求耗 29s，
+				// 客户端等到自己断连），最终回一句语义完全错误的 503「全部账号不可用」，
+				// 让人误以为账号池空了。改为 400 + 上游的 token 数字，直指问题本身。
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded",
+					upstream.ContextTooLongClientMessage(string(respBody)))
+				st.status = http.StatusBadRequest
+				return
+			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)
@@ -807,6 +820,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 边缘 WAF 按出口 IP 拦截：与账号无关，不罚账号（无冷却/熔断/NoteError）。
 		// 处罚毫无意义——被拦的是这台机器的 IP，所有账号会一起中招；冷却只会让
 		// 风控解除后池子还是空的。轮换同样无意义，由 chatCompletions 立即返回。
+	case upstream.ErrContextTooLong:
+		// 上下文超长：客户端侧问题，与账号无关，不罚账号（无冷却/熔断/NoteError）。
+		// 轮换同样无意义（任何账号都会返回同一个 400），由 chatCompletions 立即返回。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

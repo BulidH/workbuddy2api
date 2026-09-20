@@ -34,6 +34,7 @@ const (
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrWAFBlocked                    // 边缘 WAF 按出口 IP 拦截（403 + "WAF Block Page"）→ 与账号无关，不罚账号且**不换号**
+	ErrContextTooLong                // 上下文超长（400 + 11115 prompt is too long）→ 客户端侧问题，不罚账号且**不换号**
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -57,6 +58,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrWAFBlocked:
 		return "waf_blocked"
+	case ErrContextTooLong:
+		return "context_too_long"
 	case ErrClient:
 		return "client"
 	default:
@@ -191,6 +194,28 @@ const contentBlockedClientMsg = "触发网站风控违禁词，无法调用模�
 
 const contentBlockedFallbackKeyword = "违禁词"
 
+// ContextTooLongClientMessage 从上游 11115 报文里提取可安全展示的上下文超长说明。
+//
+// 上游原文形如 "prompt is too long: 1049931 tokens > 1048576 maximum"，其中的 token
+// 数字对调用方定位问题至关重要，且不含任何账号/UID/内部错误码语义，故按白名单透传。
+// 提取失败时回落到固定文案（绝不整段透传 body——里面可能带 requestId 等内部信息）。
+func ContextTooLongClientMessage(body string) string {
+	// 在 msg 字段里找 "prompt is too long"，截到该 JSON 字符串结束（未转义的引号）为止。
+	idx := strings.Index(strings.ToLower(body), "prompt is too long")
+	if idx < 0 {
+		return "上下文超出模型上限，请缩短对话历史或减少附加上下文后重试。"
+	}
+	rest := body[idx:]
+	if end := strings.IndexAny(rest, `"`); end > 0 {
+		rest = rest[:end]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "上下文超出模型上限，请缩短对话历史或减少附加上下文后重试。"
+	}
+	return "上下文超出模型上限，换账号无效：" + rest + "。请缩短对话历史或新开会话后重试。"
+}
+
 // contentBlockedKeywords 审核分类词，按优先级扫描上游文案（大小写不敏感）。
 // 只收录可直接展示给调用方的分类标签，不收录错误码（如 11128）。
 var contentBlockedKeywords = []string{
@@ -231,6 +256,22 @@ func contentBlockedKeyword(body string) string {
 var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []string{
 	"Unmarshal chat params failed",
 	`"code":11101`,
+}}
+
+// contextTooLongRule 上下文超长（客户端侧问题，换账号无用）。
+//
+// 实测报文：HTTP 400 + {"code":11115,"msg":"prompt is too long: 1049931 tokens >
+// 1048576 maximum","extError":{"code":"context_length_exceeded",...}}
+//
+// 为什么单列而不并入 ErrBadParams：ErrBadParams 的语义是「仍要轮转」（不同账号可能
+// 有不同模型权限，值得换号再试）。但 prompt 超长与账号完全无关——**任何账号都会返回
+// 同一个 400**。实测一次失败请求因此白轮换 3 个号、耗时 29 秒，客户端等到自己断连
+// （context canceled），最后拿到语义完全错误的 503 "all accounts are temporarily
+// unavailable"，用户以为账号池空了，实际是客户端上下文太长。
+var contextTooLongRule = errorRule{kind: ErrContextTooLong, mode: matchFold, patterns: []string{
+	"prompt is too long",
+	"context_length_exceeded",
+	`"code":11115`,
 }}
 
 // alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
@@ -378,6 +419,9 @@ func Classify(status int, body string) ErrKind {
 	if status >= 400 {
 		if contentBlockedRule.hit(body, lower) {
 			return ErrContentBlocked
+		}
+		if contextTooLongRule.hit(body, lower) {
+			return ErrContextTooLong
 		}
 		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
