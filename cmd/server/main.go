@@ -275,6 +275,54 @@ func main() {
 				}
 				return out, nil
 			},
+			// 用量统计：逐账号拉「积分消耗明细」（get-user-request-usage，与官网同源）。
+			// 与 QueryBalances 同为只读 + 用户显式触发；区别是数据量大（每号一轮上游
+			// 请求，分页时更多），故 panel 侧带 TTL 缓存，这里只管拉。
+			// 沿用余额查询的串行 + 间隔策略：上游 billing 域连续快打会偶发超时/500。
+			QueryUsage: func(since time.Time) ([]panel.UsageRecord, []panel.UsageError, error) {
+				var recs []panel.UsageRecord
+				var errs []panel.UsageError
+				now := time.Now()
+				first := true
+				for _, st := range p.List() {
+					if st.Disabled {
+						continue
+					}
+					a := p.AuthByUID(st.UID)
+					if a == nil {
+						errs = append(errs, panel.UsageError{
+							UID: st.UID, Nickname: st.Nickname, Realm: st.Realm,
+							Error: "无有效凭证",
+						})
+						continue
+					}
+					if !first {
+						time.Sleep(400 * time.Millisecond)
+					}
+					first = false
+					// 明细按天查询，end 用今天（含当日实时数据）。
+					us, err := up.UsageRecords(a, since, now)
+					if err != nil {
+						errs = append(errs, panel.UsageError{
+							UID: st.UID, Nickname: st.Nickname, Realm: a.Realm(),
+							Error: err.Error(),
+						})
+						log.Printf("[panel] usage %s: %v", logfmt.UID8(st.UID), err)
+						continue
+					}
+					for _, u := range us {
+						t, perr := time.ParseInLocation("2006-01-02 15:04:05", u.RequestTime, panel.UsageLoc())
+						if perr != nil {
+							continue // 时间解析失败的行无法分桶，丢弃
+						}
+						recs = append(recs, panel.UsageRecord{
+							UID: st.UID, Nickname: st.Nickname, Realm: a.Realm(),
+							Time: t, Credit: u.Credit, Model: u.Model,
+						})
+					}
+				}
+				return recs, errs, nil
+			},
 			Logs: logRing,
 		})
 		log.Printf("内置管理面板已启用：http://<host>%s/panel/", cfg.Listen)

@@ -549,6 +549,7 @@ func New() *Client {
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 		UsageBaseCN:          "https://www.workbuddy.cn",
+		UsageBaseGlobal:      defaultGlobalBase,
 	}
 }
 
@@ -1335,15 +1336,31 @@ type UsageRec struct {
 	Model       string
 }
 
+// usageBase 按 realm 返回积分消耗明细（get-user-request-usage）所在主机。
+// CN 与 global 是两个独立部署，凭证互不通用：拿 global 的 token 打 CN 主机会被
+// 边缘（APISIX）直接 401 拦下，反之亦然。故必须按账号 realm 选主机。
+func (c *Client) usageBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		if c.UsageBaseGlobal != "" {
+			return c.UsageBaseGlobal
+		}
+		return defaultGlobalBase
+	}
+	return c.UsageBaseCN
+}
+
 // UsageRecords 拉取账号在 [begin, end] 内的按请求积分消耗明细
 // （POST /billing/meter/get-user-request-usage，官网「积分消耗明细」同源；
-// 注意在 UsageBaseCN 主机、无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。
-// 带分页与上限保护：单账号/区间最多 maxUsagePages×pageSize 条，超出截断（趋势聚合仍成样）。
+// 无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。主机按 realm 选（见 usageBase）。
+// 带分页与上限保护：单账号/区间最多 maxUsagePage×pageSize 条，超出截断（趋势聚合仍成样）。
+//
+// 免费请求（credit=0）同样计入明细，故本接口也是「调用量」的权威来源，而非只反映扣费。
 func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, error) {
 	const (
 		pageSize     = 100
-		maxUsagePage = 10 // 1000 条/账号/区间封顶；响应含提示词快照，控制带宽
+		maxUsagePage = 20 // 2000 条/账号/区间封顶；响应含提示词快照，控制带宽
 	)
+	base := c.usageBase(a)
 	var out []UsageRec
 	total := 0
 	for page := 1; page <= maxUsagePage; page++ {
@@ -1359,7 +1376,7 @@ func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, e
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			c.UsageBaseCN+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
+			base+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
 		if err != nil {
 			cancel()
 			return nil, err

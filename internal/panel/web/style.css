@@ -376,3 +376,51 @@ html[data-theme="light"] .logbox { background: #10141b; }
 
 .row-flex { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 .spacer { flex: 1; }
+
+/* ── 用量统计页 ─────────────────────────────────────── */
+/* 纯 CSS 柱状图：每个 .ubar 是一根柱，高度按数值百分比撑开。
+   用 flex 让柱子自动等分宽度，无需 JS 计算布局。 */
+.ubars {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 120px; padding: 8px 0 16px; overflow-x: auto;
+}
+.ubars.sm { height: 64px; }
+.ubar {
+  flex: 1 1 0; min-width: 10px; height: 100%;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  position: relative;
+}
+.ubar-fill {
+  background: var(--accent); border-radius: 3px 3px 0 0;
+  transition: height .3s; min-height: 0;
+}
+.ubar-fill.ok   { background: var(--ok); }
+.ubar-fill.warn { background: var(--warn); }
+.ubar-tick {
+  font-size: 9px; color: var(--text-mute); text-align: center;
+  margin-top: 3px; white-space: nowrap;
+  font-family: var(--mono);
+  /* 柱子只有 ~10px 宽，而 "13:00" 远宽于柱子：若让它参与布局会被裁成 "13:0"。
+     故绝对定位到柱下方并水平居中，允许溢出（不裁剪）。 */
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: -14px;
+}
+/* 首尾两根柱的居中标签会溢出容器被裁掉半个，改为向内对齐。 */
+.ubar:first-child .ubar-tick { left: 0; transform: none; }
+.ubar:last-child .ubar-tick { left: auto; right: 0; transform: none; }
+/* 24 小时图有 24 根柱，逐根标会重叠：只显示每 3 小时一档的刻度。 */
+.ubars.wide .ubar-tick { visibility: hidden; }
+.ubars.wide .ubar:nth-child(3n+1) .ubar-tick { visibility: visible; }
+.ubars.sm .ubar-tick { display: none; }
+
+/* 账号行下钻 */
+.usage-row:hover { background: var(--surface-2); }
+.usage-detail > td { background: var(--surface-2); padding: 14px 16px; }
+.usage-detail-body { display: flex; gap: 24px; flex-wrap: wrap; }
+.usage-detail-col { flex: 1 1 240px; min-width: 200px; }
+.usage-detail-col h4 {
+  margin: 0 0 8px; font-size: 12px; color: var(--text-dim);
+  text-transform: none; letter-spacing: .3px;
+}
+.mini-tbl { font-size: 12px; }
+.mini-tbl th, .mini-tbl td { padding: 4px 8px; }

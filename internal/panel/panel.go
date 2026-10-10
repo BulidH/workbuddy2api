@@ -66,6 +66,14 @@ type Deps struct {
 	// （get-user-resource，与国内版同一接口，上游本就实现了 global 路径）。
 	QueryBalances func() ([]BalanceOutcome, error)
 
+	// QueryUsage 拉取 since 之后各账号的积分消耗明细（按请求），供「用量统计」页聚合。
+	//
+	// 与 QueryBalances 同样是**只读**且用户显式触发；但调用量更大——每个账号一轮
+	// 上游请求（分页时更多），故 panel 侧带 TTL 缓存（见 usage.go）。
+	// 明细含 credit=0 的免费请求，故同时是调用量的权威来源。
+	// 返回的 errs 是逐账号失败明细（部分成功仍要展示），err 是整体失败。
+	QueryUsage func(since time.Time) ([]UsageRecord, []UsageError, error)
+
 	// Logs 进程日志环形缓冲（可为 nil）。
 	Logs *Ring
 
@@ -99,6 +107,8 @@ type Panel struct {
 
 	mu     sync.Mutex
 	states map[string]loginState // OAuth state → realm（服务端暂存，poll 时校验）
+
+	usage usageCache // 用量统计明细聚合缓存（见 usage.go）
 }
 
 type loginState struct {
@@ -119,6 +129,7 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("GET /panel/api/config", p.handleConfigGet)
 	p.mux.HandleFunc("GET /panel/api/models", p.handleModels)
 	p.mux.HandleFunc("GET /panel/api/logs", p.handleLogs)
+	p.mux.HandleFunc("GET /panel/api/usage", p.handleUsage)
 
 	// ── 写操作 ────────────────────────────────────────────
 	p.mux.HandleFunc("PUT /panel/api/config", p.handleConfigPut)

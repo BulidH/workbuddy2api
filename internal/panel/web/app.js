@@ -83,6 +83,7 @@ const ROUTES = {
   accounts: { title: '账号管理', sub: '账号池详情、添加与移除', render: viewAccounts },
   config: { title: '网关配置', sub: '在线编辑 config.json（保存后需重启生效）', render: viewConfig },
   models: { title: '模型列表', sub: '网关对外暴露的全部模型', render: viewModels },
+  usage: { title: '用量统计', sub: '按账号 / 小时 / 天 / 模型统计积分消耗与调用量', render: viewUsage },
   logs: { title: '运行日志', sub: '网关进程日志与请求流水', render: viewLogs },
 };
 
@@ -703,6 +704,249 @@ async function viewModels() {
     <div class="table-wrap"><table class="tbl">
       <thead><tr><th>模型 ID</th><th>上下文</th><th>推理档位</th><th>默认档位</th></tr></thead>
       <tbody>${rows}</tbody></table></div></div>`;
+}
+
+/* ── 用量统计页 ─────────────────────────────────────── */
+// 数据源：上游「积分消耗明细」（get-user-request-usage，与官网同源）。
+// 免费请求（credit=0）也逐条记录，故本页同时反映调用量与扣费。
+// 拉取要对每个账号各打一轮上游请求，故后端带 TTL 缓存；「强制刷新」绕过缓存。
+let usageData = null;
+
+async function viewUsage(force = false) {
+  $('#view').innerHTML = `<div class="loading">${force ? '正在重新拉取上游明细…' : '加载中…'}</div>`;
+  let r;
+  try {
+    // 同时取账号池：上游明细只返回「有调用记录」的账号，窗口内零调用的号不会出现。
+    // 需求是「每个账号」，故用账号池补齐零记录行（消耗 0、调用 0）。
+    const [ur, ar] = await Promise.all([api('/usage' + (force ? '?refresh=1' : '')), api('/accounts')]);
+    r = ur;
+    r.__accounts = ar.accounts || [];
+  } catch (e) {
+    $('#view').innerHTML = `<div class="alert err">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  usageData = r.data || {};
+  const d = usageData;
+
+  // 用账号池补齐零记录账号，保证「每个账号」都有一行。
+  const seen = new Set((d.accounts || []).map(a => a.uid));
+  const merged = [...(d.accounts || [])];
+  for (const a of (r.__accounts || [])) {
+    if (!seen.has(a.uid)) {
+      merged.push({ uid: a.uid, nickname: a.nickname, realm: a.realm,
+                    calls: 0, credit: 0, calls_today: 0, credit_today: 0, free_calls: 0 });
+    }
+  }
+  d.accounts = merged.sort((a, b) =>
+    (b.credit - a.credit) || (b.calls - a.calls));
+
+  const ageS = Math.round((r.cache_age_ms || 0) / 1000);
+  const ageTxt = r.cached
+    ? `缓存于 ${ageS < 60 ? ageS + ' 秒' : Math.floor(ageS / 60) + ' 分钟'}前`
+    : '刚刚拉取';
+  const ttlMin = Math.round((r.ttl_ms || 0) / 60000);
+
+  const freeCalls = (d.accounts || []).reduce((s, a) => s + (a.free_calls || 0), 0);
+  const freePct = d.total_calls ? Math.round((freeCalls / d.total_calls) * 100) : 0;
+
+  const card = (label, value, foot, cls = '') =>
+    `<div class="card stat ${cls}"><div class="stat-label">${label}</div>
+     <div class="stat-value">${value}</div><div class="stat-foot">${foot}</div></div>`;
+
+  const errBox = (d.errors || []).length ? `
+    <div class="alert warn" style="margin-bottom:16px">
+      <b>${d.errors.length} 个账号的明细拉取失败</b>（其余账号数据正常）：
+      <div style="margin-top:6px;font-size:12px">
+        ${d.errors.map(e => `${esc(e.nickname || e.uid.slice(0, 8))}（${esc(e.realm)}）: ${esc(e.error)}`).join('<br>')}
+      </div>
+    </div>` : '';
+
+  $('#view').innerHTML = `
+    <div class="alert info">
+      数据源为上游「积分消耗明细」，含 <b>credit=0 的免费请求</b>，故同时反映调用量与扣费。
+      ${esc(ageTxt)}（缓存 ${ttlMin} 分钟，点「强制刷新」立即重拉）。
+    </div>
+    ${errBox}
+
+    <div class="grid cols-4">
+      ${card('总调用', d.total_calls || 0, `近 ${d.windows?.days || 7} 天`, '')}
+      ${card('总消耗', (d.total_credit || 0).toFixed(2), '积分（credit）', (d.total_credit > 0) ? 'warn' : 'ok')}
+      ${card('免费调用', freeCalls, `占 ${freePct}%（credit=0）`, 'ok')}
+      ${card('有消耗账号', (d.accounts || []).filter(a => a.credit > 0).length,
+             `共 ${(d.accounts || []).length} 个账号`, '')}
+    </div>
+
+    <div class="row-flex" style="margin:16px 0;gap:8px">
+      <button class="btn sm" id="usageForce">强制刷新</button>
+      <span class="muted" style="font-size:12px;align-self:center">
+        时间口径 UTC+8；免费模型（如 deepseek-v4.1-flash）调用量再大，消耗也是 0。
+      </span>
+    </div>
+
+    <div class="grid cols-2">
+      ${chartCard('近 24 小时调用量', d.hourly, 'calls')}
+      ${chartCard('近 7 天调用量', d.daily, 'calls')}
+    </div>
+
+    <div style="height:16px"></div>
+    <div class="grid cols-2">
+      ${chartCard('近 24 小时消耗', d.hourly, 'credit')}
+      ${chartCard('近 7 天消耗', d.daily, 'credit')}
+    </div>
+
+    <div style="height:16px"></div>
+    ${modelTable(d.models || [])}
+
+    <div style="height:16px"></div>
+    ${usageAccountTable(d.accounts || [], d.detail || {})}
+  `;
+
+  $('#usageForce').onclick = () => viewUsage(true);
+  bindUsageRows();
+}
+
+// chartCard 用纯 CSS 柱状图渲染一组时间桶（无需引入图表库）。
+function chartCard(title, buckets, metric) {
+  const list = buckets || [];
+  const vals = list.map(b => metric === 'credit' ? (b.credit || 0) : (b.calls || 0));
+  const max = Math.max(1, ...vals);
+  const sum = vals.reduce((a, b) => a + b, 0);
+  const unit = metric === 'credit' ? '积分' : '次';
+
+  const bars = list.map((b, i) => {
+    const v = vals[i];
+    const h = Math.round((v / max) * 100);
+    const fmt = metric === 'credit' ? v.toFixed(2) : v;
+    const cls = v > 0 ? (metric === 'credit' ? 'warn' : 'ok') : '';
+    return `<div class="ubar" title="${esc(b.label)}：${fmt} ${unit}">
+        <div class="ubar-fill ${cls}" style="height:${v > 0 ? Math.max(2, h) : 0}%"></div>
+        <div class="ubar-tick">${esc((b.label || '').split(' ').pop())}</div>
+      </div>`;
+  }).join('');
+
+  // 24 根柱逐根标会重叠，加 wide 让 CSS 只显示每 3 小时一档刻度。
+  const wide = list.length > 12 ? ' wide' : '';
+
+  return `<div class="card">
+    <div class="card-head"><h3>${esc(title)}</h3>
+      <span class="sub">合计 ${metric === 'credit' ? sum.toFixed(2) : sum} ${unit}</span></div>
+    <div class="card-body"><div class="ubars${wide}">${bars}</div></div>
+  </div>`;
+}
+
+// modelTable 按模型汇总（跨全部账号）。
+function modelTable(rows) {
+  if (!rows.length) {
+    return `<div class="card"><div class="card-head"><h3>按模型</h3></div>
+      <div class="empty">窗口内没有调用记录。</div></div>`;
+  }
+  const max = Math.max(1, ...rows.map(r => r.credit || 0));
+  return `<div class="card">
+    <div class="card-head"><h3>按模型 <span class="sub" style="font-weight:400">（${rows.length} 个）</span></h3>
+      <span class="sub">消耗降序</span></div>
+    <div class="table-wrap"><table class="tbl">
+      <thead><tr><th>模型</th><th class="num">调用</th><th class="num">消耗</th>
+        <th class="num">单次均价</th><th>占比</th></tr></thead>
+      <tbody>${rows.map(r => {
+        const avg = r.calls ? (r.credit / r.calls) : 0;
+        const pct = Math.round(((r.credit || 0) / max) * 100);
+        return `<tr>
+          <td class="mono">${esc(r.model)}</td>
+          <td class="num">${r.calls}</td>
+          <td class="num">${(r.credit || 0).toFixed(2)}</td>
+          <td class="num">${avg ? avg.toFixed(3) : '0'}${r.credit === 0 ? ' <span class="tag ok">免费</span>' : ''}</td>
+          <td class="num"><div class="bar ${r.credit > 0 ? 'warn' : ''}"><i style="width:${pct}%"></i></div></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div></div>`;
+}
+
+// usageAccountTable 按账号汇总，行可点击展开该账号的小时/天/模型细分。
+function usageAccountTable(rows, detail) {
+  if (!rows.length) {
+    return `<div class="card"><div class="card-head"><h3>按账号</h3></div>
+      <div class="empty">窗口内没有调用记录。</div></div>`;
+  }
+  const max = Math.max(1, ...rows.map(r => r.credit || 0));
+  const body = rows.map(a => {
+    const realm = a.realm === 'global'
+      ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>';
+    const pct = Math.round(((a.credit || 0) / max) * 100);
+    return `<tr class="usage-row" data-uid="${esc(a.uid)}" style="cursor:pointer">
+        <td>${realm}</td>
+        <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
+            <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div></td>
+        <td class="num">${a.calls}</td>
+        <td class="num">${(a.credit || 0).toFixed(2)}
+          <div class="bar ${a.credit > 0 ? 'warn' : 'ok'}" style="margin-top:5px"><i style="width:${pct}%"></i></div></td>
+        <td class="num">${(a.credit_today || 0).toFixed(2)} <span class="muted" style="font-size:11px">/ ${a.calls_today || 0} 次</span></td>
+        <td class="num">${a.free_calls || 0}</td>
+        <td class="num"><button class="btn xs ghost" data-toggle="${esc(a.uid)}">展开 ▾</button></td>
+      </tr>
+      <tr class="usage-detail" id="ud_${esc(a.uid)}" hidden><td colspan="7">
+        ${accountDetailHTML(detail[a.uid])}
+      </td></tr>`;
+  }).join('');
+
+  return `<div class="card">
+    <div class="card-head"><h3>按账号 <span class="sub" style="font-weight:400">（${rows.length} 个）</span></h3>
+      <span class="sub">点击行展开该账号细分</span></div>
+    <div class="table-wrap"><table class="tbl">
+      <thead><tr><th>域</th><th>账号</th><th class="num">调用</th><th class="num">消耗</th>
+        <th class="num">今日消耗/次数</th><th class="num">免费调用</th><th></th></tr></thead>
+      <tbody>${body}</tbody>
+    </table></div></div>`;
+}
+
+// accountDetailHTML 单账号下钻：模型分布 + 小时/天折线（用迷你柱表示）。
+function accountDetailHTML(det) {
+  if (!det) return '<div class="muted" style="padding:8px">无细分数据</div>';
+  const models = (det.models || []).filter(m => m.calls > 0);
+  const hourly = det.hourly || [];
+  const daily = det.daily || [];
+
+  const mini = (list, metric) => {
+    const vals = list.map(b => metric === 'credit' ? (b.credit || 0) : (b.calls || 0));
+    const max = Math.max(1, ...vals);
+    return list.map((b, i) => {
+      const v = vals[i];
+      const h = Math.round((v / max) * 100);
+      const fmt = metric === 'credit' ? v.toFixed(2) : v;
+      return `<div class="ubar sm" title="${esc(b.label)}：${fmt}">
+        <div class="ubar-fill" style="height:${v > 0 ? Math.max(2, h) : 0}%"></div>
+        <div class="ubar-tick">${esc((b.label || '').split(' ').pop())}</div></div>`;
+    }).join('');
+  };
+
+  return `<div class="usage-detail-body">
+    <div class="usage-detail-col">
+      <h4>模型分布</h4>
+      ${models.length ? `<table class="tbl mini-tbl">
+        <thead><tr><th>模型</th><th class="num">调用</th><th class="num">消耗</th></tr></thead>
+        <tbody>${models.map(m => `<tr><td class="mono">${esc(m.model)}</td>
+          <td class="num">${m.calls}</td><td class="num">${(m.credit || 0).toFixed(2)}</td></tr>`).join('')}</tbody>
+      </table>` : '<div class="muted">无记录</div>'}
+    </div>
+    <div class="usage-detail-col">
+      <h4>近 24 小时调用</h4><div class="ubars sm">${mini(hourly, 'calls')}</div>
+      <h4 style="margin-top:12px">近 7 天调用</h4><div class="ubars sm">${mini(daily, 'calls')}</div>
+    </div>
+  </div>`;
+}
+
+function bindUsageRows() {
+  $$('[data-toggle]').forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    const uid = b.dataset.toggle;
+    const row = $(`#ud_${CSS.escape(uid)}`);
+    if (!row) return;
+    row.hidden = !row.hidden;
+    b.textContent = row.hidden ? '展开 ▾' : '收起 ▴';
+  });
+  $$('.usage-row').forEach(tr => tr.onclick = () => {
+    const btn = $(`[data-toggle="${CSS.escape(tr.dataset.uid)}"]`);
+    if (btn) btn.click();
+  });
 }
 
 /* ── 日志页 ─────────────────────────────────────────── */
