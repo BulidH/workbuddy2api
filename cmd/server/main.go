@@ -350,6 +350,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 启动补跑签到（schedule.checkin_on_startup，缺省 true）。
+	// 调度器只在整点触发且启动时不跑，nextFire 对已过时点直接 +24h——容器在签到时点
+	// 未运行时当天那次就被整体跳过。签到幂等，补跑安全。
+	if cfg.Schedule.CheckinOnStartup {
+		sch.RunStartupCatchUp(scheduler.StartupCatchUpDelay)
+		log.Printf("已安排启动补跑签到（%s 后执行一次，可用 schedule.checkin_on_startup=false 关闭）",
+			scheduler.StartupCatchUpDelay)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

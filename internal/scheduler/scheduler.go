@@ -64,6 +64,21 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// lastCheckinAt/lastCheckinSummary 最近一次签到的时刻与汇总（运行态，重启清零）。
+	//
+	// 为什么需要：此前「自动签到到底跑了没有」只能翻容器日志，而日志随容器重启丢失，
+	// 用户无从确认，容易误判成"没签到"。面板据此直接展示，配合启动补跑形成闭环。
+	// 由 checkinMu 保护（只在 CheckinAll 持锁期间写，读侧加同一把锁）。
+	lastCheckinAt      time.Time
+	lastCheckinSummary string
+}
+
+// LastCheckin 返回最近一次签到的时刻与汇总文本（零值 = 本进程内尚未执行过）。
+func (s *Scheduler) LastCheckin() (time.Time, string) {
+	s.checkinMu.Lock()
+	defer s.checkinMu.Unlock()
+	return s.lastCheckinAt, s.lastCheckinSummary
 }
 
 // New 构建。
@@ -243,6 +258,32 @@ func (s *Scheduler) RunCheckinNow() {
 	}
 }
 
+// StartupCatchUpDelay 启动补跑的默认延迟：等 HTTP 服务与首轮探活稳定后再打上游。
+const StartupCatchUpDelay = 30 * time.Second
+
+// RunStartupCatchUp 启动补跑：延迟 delay 后异步执行一次全量签到。
+//
+// 为什么需要：调度器只在 nextFire 算出的整点触发，**启动时不跑**；而 nextFire 对
+// 已过去的时点是直接 +24h 排到明天，没有任何补偿。于是容器若在签到时点（如 9:00）
+// 未运行——重启、停机、改配置——当天那次签到就被整体跳过，用户看到的现象就是
+// 「自动签到好像没生效」。签到本身幂等（当天重复签到上游返回 already），
+// 补跑只多一轮余额查询，代价可忽略。
+//
+// 显式关闭签到排程（schedule.checkin_enabled=false）时不补跑。
+func (s *Scheduler) RunStartupCatchUp(delay time.Duration) {
+	if s.cfg.CheckinDisabled {
+		return
+	}
+	if delay <= 0 {
+		delay = StartupCatchUpDelay
+	}
+	go func() {
+		time.Sleep(delay)
+		log.Printf("启动补跑签到（容器在签到时点可能未运行，签到幂等可安全补跑）")
+		s.RunCheckinNow()
+	}()
+}
+
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 // 同一时刻只允许一次签到在跑，重复调用返回 ErrBusy（防止手动触发与定时撞车重复打上游）。
@@ -346,8 +387,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		}
 		out = append(out, oc)
 	}
-	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
+	summary := fmt.Sprintf("total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(statuses), okN, alreadyN, failN, skipN)
+	s.lastCheckinAt = time.Now()
+	s.lastCheckinSummary = summary
+	log.Printf("checkin done: %s", summary)
 	return out, nil
 }
 

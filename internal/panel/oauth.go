@@ -222,7 +222,32 @@ func (p *Panel) handleLoginPoll(w http.ResponseWriter, r *http.Request) {
 		"msg":      "账号已添加并加入账号池",
 	}
 
-	// 4) global 域：注册激活（新号需先完善地区，否则聊天报 14017）
+	// 4) 国内版：新号加入后立刻补一次签到 + 查余额。
+	//
+	// 为什么放在这里：定时签到只在 schedule.checkin_hours（默认 10 点）触发，新号若在
+	// 那之后加入，要等到次日才会被签到、积分也一直显示 0。国内版有签到体系，加入即签
+	// 最符合预期。签到幂等（当天已签到上游返回 already），重复触发无副作用。
+	if realm != "global" && p.deps.RunCheckin != nil {
+		if outcomes, err := p.deps.RunCheckin(); err != nil {
+			resp["checkin"] = "签到未执行：" + err.Error()
+		} else {
+			for _, o := range outcomes {
+				if o.UID != acct.UID {
+					continue
+				}
+				line := string(o.Status)
+				if o.Credits != nil {
+					line += fmt.Sprintf("，余额 %d", *o.Credits)
+				}
+				if o.Detail != "" {
+					line += "（" + o.Detail + "）"
+				}
+				resp["checkin"] = line
+			}
+		}
+	}
+
+	// 5) global 域：注册激活（新号需先完善地区，否则聊天报 14017）
 	if realm == "global" {
 		okReg, needsRegion, regMsg := p.activateRegion(tok.AccessToken, acct.UID)
 		switch {

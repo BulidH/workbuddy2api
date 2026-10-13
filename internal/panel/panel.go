@@ -74,6 +74,12 @@ type Deps struct {
 	// 返回的 errs 是逐账号失败明细（部分成功仍要展示），err 是整体失败。
 	QueryUsage func(since time.Time) ([]UsageRecord, []UsageError, error)
 
+	// LastCheckin 返回最近一次签到的时刻与汇总（零值 = 本进程内尚未执行过）。
+	//
+	// 用于回答「自动签到到底跑了没有」——此前只能翻容器日志，而日志随重启丢失，
+	// 用户无从确认，容易误判成没签到。
+	LastCheckin func() (time.Time, string)
+
 	// Logs 进程日志环形缓冲（可为 nil）。
 	Logs *Ring
 

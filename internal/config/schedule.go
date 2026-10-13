@@ -35,6 +35,14 @@ type Schedule struct {
 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
+	// CheckinOnStartup 启动后补跑一次签到（缺省 true）。
+	//
+	// 为什么需要：调度器只在 nextFire 算出的整点触发、**启动时不跑**，而 nextFire
+	// 对已过去的时点是直接 +24h 排到明天，没有任何补偿。容器若在签到时点（如 10:00）
+	// 未运行——重启、停机、改配置——当天那次签到就被整体跳过，用户看到的现象就是
+	// 「自动签到好像没生效」。签到幂等（当天重复签到上游返回 already），补跑安全，
+	// 代价只是多一轮余额查询。
+	CheckinOnStartup bool `json:"checkin_on_startup"`
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -61,7 +69,8 @@ func DefaultSchedule() Schedule {
 		KeepaliveEnabled:    true,
 		SchoolEnabled:       true,
 		CatEnabled:          true,
-		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+		CheckinOnStartup:    true, // 启动补跑签到：容器在签到时点未运行时兜底
+		ActivityReportCount: 5,    // 领猫前置需 5 次对话，5 连发刷满 chat_5
 	}
 }
 
