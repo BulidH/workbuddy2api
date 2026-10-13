@@ -1539,16 +1539,101 @@ func TestBreakerExponentialBackoffCapped(t *testing.T) {
 	}
 }
 
-func TestFallbackPicksEarliestExpiry(t *testing.T) {
+func TestFallbackPicksAmongCooled(t *testing.T) {
+	// 兜底改为加权随机（破除单号热点）后不再保证选「最早到期」——只保证从冷却号中选出。
+	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "late"})
 	p.Add(&auth.Auth{UID: "early"})
-	// 两个都软冷却；early 更早到期 → 兜底选 early。
 	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
 	p.Cooldown("early", CoolSoft, time.Hour, "x")
 	got := p.Pick("")
-	if got == nil || got.UID != "early" {
-		t.Fatalf("fallback should pick earliest expiry (early), got %+v", got)
+	if got == nil {
+		t.Fatal("fallback should pick a cooled account")
+	}
+	if got.UID != "early" && got.UID != "late" {
+		t.Fatalf("fallback should pick a cooled account, got %+v", got)
+	}
+}
+
+// TestFallbackSpreadsAcrossCooledAccounts 是本次修正的核心回归：持续限流期（全池冷却）下，
+// 兜底不得把请求恒定压在同一个号上。旧实现恒选「最早到期」者 → 单号扛下全部流量
+// （实测 6h 窗口 116/360 请求压在 bd59789a，并吃下 40/105 次 429）。
+// 断言：多次兜底后每个号都分到请求，且无单号超过 50%。
+func TestFallbackSpreadsAcrossCooledAccounts(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	const n = 4
+	uids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		uid := fmt.Sprintf("c%d", i)
+		uids = append(uids, uid)
+		p.Add(&auth.Auth{UID: uid})
+		// 全部软冷却，且到期时间各不相同（旧实现必选最早的 c0）。
+		p.Cooldown(uid, CoolSoft, time.Duration(i+1)*time.Hour, "429")
+	}
+	counts := map[string]int{}
+	const N = 400
+	for i := 0; i < N; i++ {
+		got := p.Pick("")
+		if got == nil {
+			t.Fatalf("pick %d: fallback returned nil", i)
+		}
+		counts[got.UID]++
+	}
+	for _, uid := range uids {
+		if counts[uid] == 0 {
+			t.Errorf("account %s never picked in %d fallbacks: %v", uid, N, counts)
+		}
+		if counts[uid] > N/2 {
+			t.Errorf("account %s picked %d/%d (>50%%): fallback hotspot not fixed", uid, counts[uid], N)
+		}
+	}
+}
+
+// TestFallbackPrefersNeverUsed 断言 usedSeq=0（从未被兜底选中）的号权重高于刚被选中的号，
+// 保证「久未使用」是兜底轮换的主导因子（直接断言权重，避免依赖随机抽签结果）。
+func TestFallbackPrefersNeverUsed(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "fresh"})
+	p.Add(&auth.Auth{UID: "recent"})
+	p.Cooldown("fresh", CoolSoft, time.Hour, "429")
+	p.Cooldown("recent", CoolSoft, time.Hour, "429")
+	now := time.Now()
+	p.mu.Lock()
+	p.pickSeq = 100
+	p.byUID["recent"].usedSeq = 100 // 刚被选中 → stale=0
+	p.byUID["fresh"].usedSeq = 0    // 从未选中 → stale=100
+	maxStale := uint64(100)
+	wFresh := p.fallbackWeightOf(p.byUID["fresh"], maxStale, time.Hour, now)
+	wRecent := p.fallbackWeightOf(p.byUID["recent"], maxStale, time.Hour, now)
+	p.mu.Unlock()
+	if wFresh <= wRecent {
+		t.Fatalf("never-used account should weigh more: fresh=%v recent=%v", wFresh, wRecent)
+	}
+}
+
+// TestFallbackLogThrottled 断言兜底日志按 uid 节流：窗口内重复兜底同一号不再重复打印，
+// 超窗后恢复打印。持续限流期（全池冷却）每个请求都走兜底，不节流会刷屏淹没 429 日志。
+func TestFallbackLogThrottled(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "only"})
+	p.Cooldown("only", CoolSoft, time.Hour, "429")
+	now := time.Now()
+	p.mu.Lock()
+	p.logFallbackLocked(p.byUID["only"], now, 1) // 首条：记录
+	first := p.fallbackLogAt["only"]
+	p.logFallbackLocked(p.byUID["only"], now.Add(5*time.Second), 1) // 窗口内：跳过
+	second := p.fallbackLogAt["only"]
+	p.logFallbackLocked(p.byUID["only"], now.Add(31*time.Second), 1) // 超窗：更新
+	third := p.fallbackLogAt["only"]
+	p.mu.Unlock()
+	if !second.Equal(first) {
+		t.Errorf("log within interval should be throttled: %v -> %v", first, second)
+	}
+	if !third.After(second) {
+		t.Errorf("log after interval should update timestamp: %v -> %v", second, third)
 	}
 }
 
@@ -1587,7 +1672,9 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 }
 
 func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
-	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
+	// D3：soft 与 breaker 冷却号都允许参与兜底（改加权随机后不再保证选最早者，
+	// 故断言「选中的必须是这两个可参与号之一」，且不因是熔断号被排除）。
+	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "soft"})
 	p.Add(&auth.Auth{UID: "brk"})
@@ -1597,10 +1684,10 @@ func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	p.NoteError("brk")                                  // brk: 熔断，breakerUntil=5m
 	got := p.Pick("")
 	if got == nil {
-		t.Fatal("fallback should pick breaker (earliest) account")
+		t.Fatal("fallback should pick a participating account")
 	}
-	if got.UID != "brk" {
-		t.Fatalf("fallback should pick earliest expiry brk (5m < soft 10m), got %+v", got)
+	if got.UID != "soft" && got.UID != "brk" {
+		t.Fatalf("fallback should pick soft or brk, got %+v", got)
 	}
 }
 

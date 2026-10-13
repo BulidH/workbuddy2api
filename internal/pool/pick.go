@@ -57,9 +57,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		// 全冷却兜底：无 healthy 候选时，在冷却账号里**加权随机**选一个（闲置为主 +
+		// 临近到期为辅），避免恒选最早到期者造成的单号热点（见 pickFallbackLocked）。
+		return p.pickFallbackLocked(tried, now, realm)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -196,12 +196,28 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return e.a
 }
 
-// pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
-// 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
-// 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
-	var best *entry
+// pickFallbackLocked 全冷却兜底：无 healthy 候选时，在「可参与兜底」的冷却账号里
+// **加权随机**选一个，而不是恒选「截止最早」的那一个。
+//
+// 为什么不再恒选最早到期（本次修正）：旧实现 `best = 最早 expiry` 是**确定性**的，于是
+// 持续限流期（全池冷却）会把每个请求都压到同一个号上——实测 6h 窗口里 bd59789a 独自扛了
+// 116/360 请求、吃了 40/105 次 429。退避的本意是「躲开这个号减压」，结果变成「死盯这个号
+// 加压」，与限流保护的目标相反。
+//
+// 权重口径（见 fallbackWeightOf）：
+//   - 闲置补偿为主：距上次被选中越久权重越高（按选号序号差计量，封顶 idleWeightMax）。刚被
+//     兜底选中的号权重立刻降下来，下一个请求自然轮换到别的号，从根本上破除单号热点；
+//   - 临近到期为辅：剩余冷却越短权重越高（上限 fallbackProximityBonus）。越接近恢复的号
+//     越可能已可用（429 多为瞬时限流），优先试它失败成本更低。
+//
+// 参与资格不变：disabled 永不参与；CoolHard（余额耗尽，等签到的号）排除——调了必 402；
+// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。被 tried 排除、在途占满的
+// 账号同样跳过。无任何可用返回 nil。
+//
+// 候选按 UID 排序后再抽签：map 遍历顺序随机，若不排序则注入随机源（测试）的结果不可复现。
+func (p *Pool) pickFallbackLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+	var cands []*entry
+	var maxRemain time.Duration
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -222,16 +238,104 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if exp.IsZero() {
 			continue
 		}
-		if best == nil || exp.Before(best.expiry(now)) {
-			best = e
+		if remain := exp.Sub(now); remain > maxRemain {
+			maxRemain = remain
 		}
+		cands = append(cands, e)
 	}
-	if best == nil {
+	if len(cands) == 0 {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
-	best.lastUsed = time.Now()
+	sort.Slice(cands, func(i, j int) bool { return cands[i].a.UID < cands[j].a.UID })
+
+	var best *entry
+	if len(cands) == 1 {
+		best = cands[0]
+	} else {
+		// 闲置项按**选号序号**计量，故先求候选集内的最大序号差用于归一。
+		var maxStale uint64
+		for _, e := range cands {
+			if s := p.pickSeq - e.usedSeq; s > maxStale {
+				maxStale = s
+			}
+		}
+		const scale = 1_000_000 // 定点放大：与 pickWeighted 同口径
+		weights := make([]int64, len(cands))
+		var total int64
+		for i, e := range cands {
+			wi := int64(p.fallbackWeightOf(e, maxStale, maxRemain, now)*scale + 0.5)
+			if wi < 1 {
+				wi = 1 // 保底权重：低权重号不得归零而彻底失去被抽中机会
+			}
+			weights[i] = wi
+			total += wi
+		}
+		rnd := rand.Int64N
+		if p.randInt64N != nil {
+			rnd = p.randInt64N
+		}
+		r := rnd(total)
+		var acc int64
+		for i, e := range cands {
+			acc += weights[i]
+			if r < acc {
+				best = e
+				break
+			}
+		}
+		if best == nil {
+			best = cands[len(cands)-1]
+		}
+	}
+	p.logFallbackLocked(best, now, len(cands))
+	// 单调序号即时标记（与 pick 同口径）：本号 stale 立刻归零，下一个请求自然轮换到别的号
+	// ——这是破除「持续限流期全部流量压在单号上」的关键，墙钟 lastUsed 在突发下做不到。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
+	best.lastUsed = now
 	return best.a
+}
+
+// fallbackWeightOf 兜底候选权重：闲置补偿为主 + 临近到期为辅（口径见 pickFallbackLocked）。
+//
+// 闲置项按**选号序号差**（pickSeq - usedSeq）而非墙钟计量：突发流量下相邻请求仅隔数百毫秒
+// 到数秒，now.Sub(lastUsed) 趋近 0，墙钟无法区分先后（与正常选号 LRU 兜底弃用墙钟同一理由，
+// 见 entry.usedSeq 注释）。序号差是严格全序，与时钟精度无关。maxStale 为候选集内最大序号差，
+// 用于把闲置项归一到 [0, idleWeightMax]；usedSeq=0（从未被选中）的号序号差最大 → 优先探索。
+func (p *Pool) fallbackWeightOf(e *entry, maxStale uint64, maxRemain time.Duration, now time.Time) float64 {
+	w := 1.0
+	if maxStale > 0 {
+		stale := p.pickSeq - e.usedSeq
+		if stale > maxStale {
+			stale = maxStale
+		}
+		w += float64(stale) / float64(maxStale) * p.idleWeightMax
+	}
+	if maxRemain > 0 {
+		remain := e.expiry(now).Sub(now)
+		if remain < 0 {
+			remain = 0
+		}
+		if remain > maxRemain {
+			remain = maxRemain
+		}
+		w += (1 - float64(remain)/float64(maxRemain)) * fallbackProximityBonus
+	}
+	return w
+}
+
+// logFallbackLocked 兜底选号日志（按 uid 节流）。持续限流期每个请求都会走兜底，不节流会
+// 刷屏——实测 6h 窗口 255 条 WARN vs 360 条请求，把真正有用的 429 日志淹没。同一账号在
+// fallbackLogInterval 内最多打一条。cands 是本次参与兜底的候选数，供判断"池子塌缩程度"。
+// 调用方必须已持 p.mu 写锁。
+func (p *Pool) logFallbackLocked(best *entry, now time.Time, cands int) {
+	uid := best.a.UID
+	if last, ok := p.fallbackLogAt[uid]; ok && now.Sub(last) < fallbackLogInterval {
+		return
+	}
+	p.fallbackLogAt[uid] = now
+	log.Printf("WARN: [pool] fallback_pick uid=%s until=%s kind=%s cands=%d",
+		logfmt.UID8(uid), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now), cands)
 }
 
 // inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
@@ -246,6 +350,14 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
+
+// fallbackProximityBonus 兜底权重里「临近到期」项的加成上限。取 3：明显低于 idleWeightMax(5)，
+// 使「久未使用」成为兜底轮换的主导因子（破除单号热点），同时让快恢复的号略占优。
+const fallbackProximityBonus = 3.0
+
+// fallbackLogInterval 兜底日志节流窗口：同一账号在该窗口内最多打一条兜底 WARN。
+// 取 30s：持续限流期足以把日志量压到可读（每号每 30s 一条），又不至于完全看不到兜底发生。
+const fallbackLogInterval = 30 * time.Second
 
 // expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
 // 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，

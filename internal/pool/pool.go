@@ -46,6 +46,10 @@ type Pool struct {
 	// pickSeq 选号单调序号源：仅 pick 在持 p.mu 写锁时自增并赋给 entry.usedSeq，
 	// 无需 atomic。见 entry.usedSeq 注释（解决 Windows 时钟精度导致的 LRU 失效）。
 	pickSeq uint64
+	// fallbackLogAt 兜底选号日志节流：uid → 上次打印时刻。持续限流期（全池冷却）兜底
+	// 每个请求都会触发，不节流会刷屏（实测 6h 窗口 255 条 WARN vs 360 条请求），把真正
+	// 有用的 429 日志淹没。条目数上界 = 账号数，无需清理。仅 pickFallbackLocked 持写锁访问。
+	fallbackLogAt map[string]time.Time
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -64,6 +68,7 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		freeTierBonus:      defaultFreeTierBonus,
+		fallbackLogAt:      map[string]time.Time{},
 	}
 	if stateFp != "" {
 		p.load()
