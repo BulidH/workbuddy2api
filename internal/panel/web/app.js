@@ -192,7 +192,7 @@ async function viewOverview() {
       toast(`已重载，当前 ${r.accounts} 个账号`); render();
     } catch (e) { toast(e.message, 'err'); }
   };
-  bindAccountActions();
+  bindAccountActions(S.accounts);
 }
 
 function setHealth(ok, counts) {
@@ -212,7 +212,7 @@ function accountsTable(list, { compact = false } = {}) {
   const maxCredit = Math.max(1, ...list.map(a => a.credits || 0));
   const rows = list.map(a => {
     let st = '<span class="tag ok"><i class="tdot"></i>健康</span>';
-    if (a.disabled) st = '<span class="tag err"><i class="tdot"></i>已禁用</span>';
+    if (a.disabled) st = `<span class="tag err" title="${esc(a.reason || '已禁用')}"><i class="tdot"></i>已禁用</span>`;
     else if (a.cooling) st = `<span class="tag warn"><i class="tdot"></i>冷却 ${esc(fmtRemain(a.cool_remaining_sec))}</span>`;
     else if (a.in_flight > 0) st = `<span class="tag info"><i class="tdot"></i>在途 ${a.in_flight}</span>`;
 
@@ -231,6 +231,10 @@ function accountsTable(list, { compact = false } = {}) {
       <td class="num" style="font-size:11.5px">${esc(a.expires_at ? fmtTime(a.expires_at * 1000) : '—')}</td>
       <td class="num" style="font-size:11.5px">${esc(a.last_success || '—')}</td>
       <td style="white-space:nowrap">
+        <button class="btn xs ${a.disabled ? 'primary' : 'warn'}" data-toggle-enable="${esc(a.uid)}"
+          data-enabled="${a.disabled ? '0' : '1'}" data-nick="${esc(a.nickname || a.uid)}"
+          title="${a.disabled ? '解禁后重新参与选号（若上游仍在拦截会被再次禁用）' : '禁用后不再参与选号，重启后仍保持'}">
+          ${a.disabled ? '解禁' : '禁用'}</button>
         <button class="btn xs danger" data-del="${esc(a.uid)}" data-nick="${esc(a.nickname || a.uid)}">移除</button>
       </td>
     </tr>`;
@@ -240,6 +244,8 @@ function accountsTable(list, { compact = false } = {}) {
     <div class="card-head">
       <h3>账号池 <span class="sub" style="font-weight:400">（${list.length} 个）</span></h3>
       <div class="row-flex">
+        ${list.some(a => a.disabled) ? `<button class="btn sm warn" data-enable-all
+          title="解禁当前所有被禁用的账号（重新参与选号）">全部解禁（${list.filter(a => a.disabled).length}）</button>` : ''}
         <button class="btn sm" data-balance
           title="只读查询所有账号余额（含国际版）。不发签到请求，不触发任何自动调用">查询余额</button>
         <button class="btn sm" data-checkin
@@ -257,11 +263,46 @@ function accountsTable(list, { compact = false } = {}) {
   </div>`;
 }
 
-function bindAccountActions() {
+function bindAccountActions(list) {
   $$('[data-del]').forEach(b => b.onclick = () => confirmDelete(b.dataset.del, b.dataset.nick));
   $$('[data-add]').forEach(b => b.onclick = addAccountFlow);
   $$('[data-checkin]').forEach(b => b.onclick = runCheckin);
   $$('[data-balance]').forEach(b => b.onclick = runBalance);
+  $$('[data-toggle-enable]').forEach(b => b.onclick = () =>
+    toggleAccountEnabled(b.dataset.toggleEnable, b.dataset.enabled === '0', b.dataset.nick, b));
+  $$('[data-enable-all]').forEach(b => b.onclick = () => enableAllDisabled(list || S.accounts, b));
+}
+
+// toggleAccountEnabled 手动禁用 / 解禁单个账号。
+// enable=true 表示当前是禁用态、点击后要解禁。
+async function toggleAccountEnabled(uid, enable, nick, btn) {
+  const label = enable ? '解禁' : '禁用';
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = label + '中…'; }
+  try {
+    const r = await api('/accounts/enable', { method: 'POST', body: { uid, enabled: enable } });
+    toast(`${nick} ${r.msg || '已' + label}`);
+    await render();
+  } catch (e) {
+    toast(e.message, 'err', 7000);
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+// enableAllDisabled 一键解禁当前所有被禁用的账号（逐个调用，串行避免并发写池）。
+async function enableAllDisabled(list, btn) {
+  const targets = (list || []).filter(a => a.disabled);
+  if (!targets.length) { toast('没有被禁用的账号'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = '解禁中…'; }
+  let okN = 0, failN = 0;
+  for (const a of targets) {
+    try {
+      await api('/accounts/enable', { method: 'POST', body: { uid: a.uid, enabled: true } });
+      okN++;
+    } catch { failN++; }
+  }
+  toast(`已解禁 ${okN} 个` + (failN ? `，失败 ${failN} 个` : ''), failN ? 'warn' : 'ok', 7000);
+  await render();
 }
 
 // runBalance 只读查询所有账号余额（含国际版）。
@@ -363,7 +404,7 @@ async function viewAccounts() {
       加号后<b>无需重启</b>，凭证落盘即自动入池。
     </div>
     ${accountsTable(S.accounts)}`;
-  bindAccountActions();
+  bindAccountActions(S.accounts);
 }
 
 /* ── 添加账号（OAuth 三步）───────────────────────────── */

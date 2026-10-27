@@ -80,6 +80,16 @@ type Deps struct {
 	// 用户无从确认，容易误判成没签到。
 	LastCheckin func() (time.Time, string)
 
+	// SetAccountEnabled 手动启用/解禁账号（面板「禁用 / 解禁」按钮）。
+	//
+	// enabled=true → 复活该号（清 disabled + reason + 连续 12153 计数），重新入池；
+	// enabled=false → 硬禁用（不参与选号，reason 标注为手动）。
+	// 账号不在池内时返回 error。两条路径都置 dirty 由周期落盘持久化，重启后保持。
+	//
+	// 为什么需要这个入口：上游 11140 等账号级错误会硬禁用账号，而此前没有任何
+	// HTTP/面板入口，只能停容器改 state.json 再重启，误操作风险高。
+	SetAccountEnabled func(uid string, enabled bool) error
+
 	// Logs 进程日志环形缓冲（可为 nil）。
 	Logs *Ring
 
@@ -140,6 +150,7 @@ func New(deps Deps) *Panel {
 	// ── 写操作 ────────────────────────────────────────────
 	p.mux.HandleFunc("PUT /panel/api/config", p.handleConfigPut)
 	p.mux.HandleFunc("POST /panel/api/accounts/delete", p.handleAccountDelete)
+	p.mux.HandleFunc("POST /panel/api/accounts/enable", p.handleAccountEnable)
 	p.mux.HandleFunc("POST /panel/api/reload", p.handleReload)
 	p.mux.HandleFunc("POST /panel/api/checkin", p.handleCheckin)
 	p.mux.HandleFunc("POST /panel/api/balance", p.handleBalance)

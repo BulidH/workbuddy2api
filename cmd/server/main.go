@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -215,6 +216,23 @@ func main() {
 				log.Printf("[panel] 收到重启请求，进程退出（容器 restart 策略将自动拉起）")
 				p.Flush()
 				os.Exit(0)
+			},
+			// 手动启用 / 解禁：运维开关，直接改账号的 disabled 标志。
+			// 解禁走 ReviveDisabled（清 disabled + reason + 12153 计数），
+			// 禁用走 Disable（硬禁用，不参与选号）。两条路径都置 dirty，
+			// 由后台周期落盘持久化，重启后状态保持——不像冷却那样会被时间冲掉。
+			SetAccountEnabled: func(uid string, enabled bool) error {
+				if _, ok := p.Status(uid); !ok {
+					return fmt.Errorf("账号不在池内: %s", uid)
+				}
+				if enabled {
+					p.ReviveDisabled(uid)
+					log.Printf("[panel] 手动解禁账号 %s", logfmt.UID8(uid))
+				} else {
+					p.Disable(uid, "disabled manually via panel")
+					log.Printf("[panel] 手动禁用账号 %s", logfmt.UID8(uid))
+				}
+				return nil
 			},
 			// 手动签到 / 查余额：定时任务只在 checkin_hours 整点触发且启动时不跑，
 			// 新加的账号在下一个整点前积分恒为 0，故开放这个当场触发的入口。

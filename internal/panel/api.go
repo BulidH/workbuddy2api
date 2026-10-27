@@ -214,6 +214,40 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	okJSON(w, map[string]any{"ok": true, "deleted": filepath.Base(path), "backup": filepath.Base(bak), "accounts": n})
 }
 
+// handleAccountEnable 手动启用 / 解禁账号。
+//
+// 与签到解冻（ReenableIfCredits）的分工：那条路径只清冷却、**不动 disabled**，
+// 用于余额恢复后自动解冻；本入口是运维手动摘除/放回账号的开关，直接改 disabled。
+// 典型场景：上游 11140 误判批量禁用后手动恢复，或临时摘掉某个不想再用的号。
+func (p *Panel) handleAccountEnable(w http.ResponseWriter, r *http.Request) {
+	if p.deps.SetAccountEnabled == nil {
+		errJSON(w, http.StatusNotImplemented, "账号启用/禁用入口不可用")
+		return
+	}
+	var body struct {
+		UID     string `json:"uid"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
+		errJSON(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	// 复用与删除相同的 uid 校验，防路径穿越 / 非法取值。
+	if _, ok := p.authFilePath(body.UID); !ok {
+		errJSON(w, http.StatusBadRequest, "非法 uid")
+		return
+	}
+	if err := p.deps.SetAccountEnabled(body.UID, body.Enabled); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	action := "已解禁"
+	if !body.Enabled {
+		action = "已禁用"
+	}
+	okJSON(w, map[string]any{"ok": true, "uid": body.UID, "enabled": body.Enabled, "msg": action})
+}
+
 // handleModels 复用网关的模型清单。
 func (p *Panel) handleModels(w http.ResponseWriter, r *http.Request) {
 	if p.deps.ModelList == nil {
