@@ -956,6 +956,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				ap.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
+				// 余额实时扣减：同一份权威回执同时驱动面板积分，避免两次快照之间
+				// 面板停在旧值（用户要手点「查询余额」才看到真实数字）。
+				ap.NoteCreditSpend(acct.UID, credit)
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -978,6 +981,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			ap.NoteModelCost(acct.UID, bareModel, credit, total)
+			ap.NoteCreditSpend(acct.UID, credit)
 		}
 		return
 	}

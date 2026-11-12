@@ -73,6 +73,20 @@ const fmtRemain = s => {
   if (s < 3600) return `${Math.floor(s / 60)}m${s % 60 ? (s % 60) + 's' : ''}`;
   return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
 };
+// fmtSnap 把余额快照时刻转成「新鲜度」提示。
+// 积分只在权威快照（每日签到 / 点「查询余额」）时与上游对齐，之后由每个成功请求的
+// usage.credit 实时扣减——所以面板数字 = 快照余额 − 已发生的消耗。标明快照时刻，
+// 用户才知道这个数字有多可信；空值 = 从未取到过快照（旧账号/重启前的旧 state.json）。
+const fmtSnap = ts => {
+  if (!ts) return '未校准';
+  const d = new Date(ts);
+  if (isNaN(d)) return '未校准';
+  const mins = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return '刚校准';
+  if (mins < 60) return `快照 ${mins}m 前`;
+  if (mins < 1440) return `快照 ${Math.floor(mins / 60)}h 前`;
+  return `快照 ${Math.floor(mins / 1440)}d 前`;
+};
 
 /* ── 全局状态 ───────────────────────────────────────── */
 const S = { route: 'overview', overview: null, accounts: [], config: null, timer: null };
@@ -242,7 +256,9 @@ function accountsTable(list, { compact = false } = {}) {
       </td>
       <td>${realm}</td>
       <td class="num">${a.credits ?? 0}<div class="bar ${a.credits > 0 ? 'ok' : ''}" style="margin-top:5px">
-          <i style="width:${pct}%"></i></div></td>
+          <i style="width:${pct}%"></i></div>
+          <div style="font-size:10.5px;color:var(--text-mute);margin-top:2px"
+            title="积分在签到时与上游对齐，之后按每个成功请求的实测扣费实时递减；点「查询余额」可立即重新校准">${esc(fmtSnap(a.credits_at))}</div></td>
       <td class="num">${a.success_count || 0} / ${a.err_total || 0}</td>
       <td class="num" style="font-size:11.5px">${esc(a.expires_at ? fmtTime(a.expires_at * 1000) : '—')}</td>
       <td class="num" style="font-size:11.5px">${esc(a.last_success || '—')}</td>

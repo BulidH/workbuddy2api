@@ -7,11 +7,20 @@ import (
 	"time"
 )
 
+// setCreditsLocked 以**上游权威快照**改写余额：同时记快照时刻（creditsAt，面板据此
+// 展示新鲜度）并把实时扣减小数余量清零（余额已与上游对齐，旧余量再累加就是重复扣）。
+// 调用方必须已持有 p.mu。
+func (e *entry) setCreditsLocked(credits int64) {
+	e.credits = credits
+	e.creditsAt = time.Now()
+	e.creditFrac = 0
+}
+
 func (p *Pool) SetCredits(uid string, credits int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.credits = credits
+		e.setCreditsLocked(credits)
 		p.dirty.Store(true)
 	}
 }
@@ -28,7 +37,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 		if expiring > credits {
 			expiring = credits
 		}
-		e.credits = credits
+		e.setCreditsLocked(credits)
 		e.creditsExpiring = expiring
 		p.dirty.Store(true)
 	}

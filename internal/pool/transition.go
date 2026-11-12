@@ -60,6 +60,6 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 // 不清熔断」的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
 // 历史软冷却累积。调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
-	e.credits = credits
+	e.setCreditsLocked(credits) // 权威快照：同时记 creditsAt、清实时扣减余量
 	e.clearCoolingLocked()
 }

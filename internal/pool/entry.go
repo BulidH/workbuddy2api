@@ -27,10 +27,14 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Realm         string    `json:"realm,omitempty"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
+	UID      string `json:"uid"`
+	Realm    string `json:"realm,omitempty"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsAt 最近一次从上游权威快照（签到 / 查询余额）写入 Credits 的时刻；
+	// 其后的积分消耗由每个成功请求的 usage.credit 实时扣减（NoteCreditSpend），
+	// 故 Credits 是「快照 + 已扣消耗」的估算值。零值 = 从未取到过快照。
+	CreditsAt     time.Time `json:"credits_at,omitempty"`
 	Cooling       bool      `json:"cooling"`
 	CoolKind      string    `json:"cool_kind,omitempty"`
 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
@@ -88,6 +92,15 @@ type RateLimitedModel struct {
 type entry struct {
 	a       *auth.Auth
 	credits int64
+	// creditsAt 最近一次以**上游权威快照**写入 credits 的时刻（签到 / 面板查余额 /
+	// Qoder 额度刷新）。信号：credits 是"该时刻的余额"还是"被本地实时扣减过的估算"。
+	// 持久化（stateAccount.CreditsAt）：重启后仍能告诉面板这份余额有多旧。
+	creditsAt time.Time
+	// creditFrac 实时扣减的小数余量：上游 usage.credit 常带小数（如 0.0132），
+	// 而池内 credits 是整数。每笔消耗先累加到 creditFrac，攒满 ≥1 才落到整数
+	// credits 上，避免逐笔 int64 截断把消耗全部抹掉（那等于没扣）。
+	// 每次权威快照刷新（SetCredits*/ReenableIfCredits）清零——余额已对齐上游。
+	creditFrac float64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -261,7 +274,10 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
+	Credits int64 `json:"credits"`
+	// CreditsAt 余额快照时刻（最近一次上游权威写入）。旧 state.json 缺此字段 → 零值，
+	// 面板显示为"未知"而非误当成刚刷新（向后兼容）。
+	CreditsAt    time.Time `json:"credits_at,omitempty"`
 	Disabled     bool      `json:"disabled"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`

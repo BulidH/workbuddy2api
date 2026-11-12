@@ -62,11 +62,15 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 // accountView 面板账号视图：池状态 + 凭证文件信息合并。
 type accountView struct {
-	UID         string `json:"uid"`
-	Nickname    string `json:"nickname"`
-	Provider    string `json:"provider"`
-	Realm       string `json:"realm"`
-	Credits     int64  `json:"credits"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname"`
+	Provider string `json:"provider"`
+	Realm    string `json:"realm"`
+	Credits  int64  `json:"credits"`
+	// CreditsAt 最后一次从上游权威快照（签到 / 查询余额）读到余额的时刻。展示它的意义：
+	// credits 在快照之后由每个成功请求的 usage.credit 实时扣减（pool.NoteCreditSpend），
+	// 所以这是「估算值 + 估算起点」。空 = 从未取到过快照，前端不给新鲜度提示。
+	CreditsAt   string `json:"credits_at,omitempty"`
 	Cooling     bool   `json:"cooling"`
 	Disabled    bool   `json:"disabled"`
 	InFlight    int    `json:"in_flight"`
@@ -153,6 +157,7 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				Provider:    provider,
 				Realm:       strOf(m["realm"]),
 				Credits:     int64Of(m["credits"]),
+				CreditsAt:   timeStr(m["credits_at"]),
 				Cooling:     boolOf(m["cooling"]),
 				Disabled:    boolOf(m["disabled"]),
 				InFlight:    intOf(m["in_flight"]),
@@ -220,7 +225,10 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				v.OrgName = a.OrganizationName
 				v.VpcEndpoint = a.VpcEndpoint
 				v.HasPAT = a.PersonalToken != ""
-				if v.Credits == 0 {
+				// 池里没有余额（从未入池/刚加载）时才用凭证文件里的旧快照兜底。
+				// 一旦池内有过权威快照（credits_at 非空），0 就是真实的 0——此时再用
+				// 文件里的旧值覆盖会把"已花完的号"显示成有余额，正是本次要修的问题。
+				if v.Credits == 0 && v.CreditsAt == "" {
 					v.Credits = a.CreditsRemain()
 				}
 			}

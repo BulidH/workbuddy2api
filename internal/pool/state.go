@@ -82,7 +82,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 		if remain > 0 && !e.disabled {
 			p.reviveCoolingLocked(e, remain)
 		} else {
-			e.credits = remain
+			e.setCreditsLocked(remain) // 仍是权威快照（零余额也算）：记时刻、清余量
 		}
 		p.dirty.Store(true)
 	}
@@ -154,6 +154,51 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 			Samples:   prev.Samples + 1,
 		}
 	}
+}
+
+// NoteCreditSpend 按一次成功请求实测的 usage.credit 实时扣减账号余额。
+//
+// 为什么需要它：credits 只在**权威快照**（签到 09:00/21:00、面板「查询余额」、Qoder
+// 额度刷新）时对齐上游，两次快照之间账号一直在消耗。只靠快照，面板上的积分会长时间
+// 停在旧值上，用户必须手点一次「查询余额」才看到真实数字——这就是「积分显示不正确」
+// 的根因。每次成功请求本来就带着上游回执的本次扣费（usage.credit），据此实时扣减，
+// 快照之间的展示值就跟着实际消耗走。
+//
+// 调用方约束（重要）：只在**确证**了本次扣费时调用。usage 缺 credit 字段 ≠ 扣了 0，
+// 那种情况不扣；显式 credit:0 是合法免费观测，扣 0 无害。credit<=0（含负数/NaN 这类
+// 上游异常）一律忽略，不改余额。
+//
+// 两个精度/边界处理：
+//   - 小数累加：Qoder 单次扣费常是 0.01 量级，逐笔 int64 取整会把消耗全部抹零，所以先累加
+//     到 creditFrac，攒够 1 才落到整数 credits 上；权威快照刷新时余量清零。
+//   - 下限 0：这是估算值，不允许变负（真实余额由下一次快照纠正）；负积分会污染选号
+//     权重与面板进度条。
+func (p *Pool) NoteCreditSpend(uid string, credit float64) {
+	if uid == "" || !(credit > 0) { // NaN/负数/零：非有效扣费观测
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.creditFrac += credit
+	if e.creditFrac < 1 {
+		return // 尚未攒够 1 积分，留在余量里继续累积
+	}
+	spent := int64(e.creditFrac)
+	e.creditFrac -= float64(spent)
+	if spent >= e.credits {
+		e.credits = 0
+	} else {
+		e.credits -= spent
+	}
+	// 快过期子集是 credits 的一部分，随总量一起收缩（不得大于剩余总量）。
+	if e.creditsExpiring > e.credits {
+		e.creditsExpiring = e.credits
+	}
+	p.dirty.Store(true)
 }
 
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
@@ -390,6 +435,7 @@ func (p *Pool) List() []Status {
 	}
 	return out
 }
+
 // modelCostViewsLocked 构造成本账本视图（须在 p.mu 持锁下调用）。
 //
 // 只输出**仍然有效**的观测（未过期）：过期观测在 pick 的 costTier 里同样返回
@@ -439,6 +485,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
+		CreditsAt:         e.creditsAt,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
