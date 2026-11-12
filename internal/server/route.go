@@ -6,6 +6,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoder"
 )
 
 // resolveRoute 解析模型名的 provider 路由协议：
@@ -71,11 +72,26 @@ func (h *Handler) qoderEnabled() bool {
 }
 
 // qoderSupports 报告 Qoder 目录（任一区域）是否认识该模型名。
+// 配置了别名时以 Qoder 侧目标名为准。
 func (h *Handler) qoderSupports(bare string) bool {
 	if h.cfg.Qoder == nil {
 		return false
 	}
+	if target := h.providerModel(auth.ProviderQoder, bare); target != bare {
+		return len(h.cfg.Qoder.Catalog.LookupAny(target)) > 0
+	}
 	return len(h.cfg.Qoder.Catalog.LookupAny(bare)) > 0
+}
+
+// providerModel 返回该 Provider 出站时应使用的模型名：命中别名用目标名，
+// 否则原样返回。别名让同名但字面不同的两个模型仍能按一个裸名混合调度。
+func (h *Handler) providerModel(provider, bare string) string {
+	if a, ok := qoder.LookupAlias(h.cfg.QoderAliases, bare); ok {
+		if target := a.Target(provider); target != "" {
+			return target
+		}
+	}
+	return bare
 }
 
 // poolFor 返回 Provider 对应的账号池（未知 Provider 回落 WorkBuddy 池）。

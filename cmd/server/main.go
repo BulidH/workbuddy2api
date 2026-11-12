@@ -534,6 +534,7 @@ func main() {
 		QoderGuard:        qguard,
 		QoderPrices:       qoderPrices,
 		QoderWebTools:     cfg.Qoder.WebTools,
+		QoderAliases:      cfg.Qoder.Aliases,
 		AnthropicThinking: cfg.Qoder.AnthropicThinking,
 	})
 

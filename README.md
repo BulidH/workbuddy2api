@@ -158,6 +158,15 @@ cp config.example.json config.json
 - `web_tools`：仅对 `qoder:<model>` 强路由生效；客户端声明内置 `web_search` / `web_fetch` 时由网关代跑（DDG → Bing → Wikipedia），最多 3 轮回灌。
 - `anthropic_thinking`：`/v1/messages` 的 thinking 模式，默认 `off` 不透传。
 - `pricing_file`：可选价格覆盖（USD / 1M tokens），仅用于元数据与估算，不参与结算。
+- `aliases`：两侧模型叫法不同时仍可按同一个裸名混合调度。键是网关对外裸名，值是各上游真实模型名：
+
+```json
+"aliases": {
+  "deepseek-flash": { "workbuddy": "deepseek-v4.1-flash", "qoder": "DeepSeek-Flash" }
+}
+```
+
+配置后请求 `model: "deepseek-flash"` 即可：裸名按 `qoder.weight` 加权选择 Provider，选中 Qoder 时出站改写为 `DeepSeek-Flash`，选中 WorkBuddy 时改写为 `deepseek-v4.1-flash`；一侧无可用账号/模型时自动降级。`/v1/models` 也会以 `owned_by: "merged"` 暴露该裸名。强制路由 `qoder:` / `cn:` / `global:` 仍然有效。
 
 Anthropic / Responses 入口与 OpenAI 入口共用同一鉴权（`Authorization: Bearer` 或 `x-api-key`）与账号轮转：
 

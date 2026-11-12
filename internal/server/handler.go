@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,8 @@ type Config struct {
 	QoderPrices map[string]qoder.Price
 	// QoderWebTools 允许网关本地执行 web_search / web_fetch。
 	QoderWebTools bool
+	// QoderAliases 对外裸名 → 各上游模型名（nil = 不做别名映射）。
+	QoderAliases map[string]qoder.ModelAlias
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -366,6 +369,72 @@ func (h *Handler) modelList() []map[string]any {
 	}
 	if h.cfg.Qoder != nil {
 		out = h.appendQoderModels(out)
+	}
+	out = h.appendAliasModels(out)
+	return out
+}
+
+// appendAliasModels 把配置的跨上游别名暴露成可直接调用的裸名。
+// 两侧都配置时标记 merged：同一个裸名会根据调度落到任一 Provider。
+func (h *Handler) appendAliasModels(out []map[string]any) []map[string]any {
+	if len(h.cfg.QoderAliases) == 0 {
+		return out
+	}
+	// 归一化名 → 已存在条目下标。Qoder 独有模型通常以 display_name（如
+	// DeepSeek-Flash）先入列，与别名的裸名归一化后同名；此时不重复追加，
+	// 而是把该条目升级为 merged，避免模型清单里出现两个等价名字。
+	seen := map[string]int{}
+	for i, e := range out {
+		if id, _ := e["id"].(string); id != "" {
+			if n := qoder.NormalizeModelName(id); n != "" {
+				seen[n] = i
+			}
+		}
+	}
+	names := make([]string, 0, len(h.cfg.QoderAliases))
+	for alias := range h.cfg.QoderAliases {
+		names = append(names, alias)
+	}
+	sort.Strings(names)
+	for _, alias := range names {
+		a := h.cfg.QoderAliases[alias]
+		id := strings.TrimSpace(alias)
+		if id == "" || (a.WorkBuddy == "" && a.Qoder == "") {
+			continue
+		}
+		key := qoder.NormalizeModelName(id)
+		if idx, ok := seen[key]; ok {
+			e := out[idx]
+			if e["provider"] == string(auth.ProviderQoder) || e["owned_by"] == string(auth.ProviderQoder) {
+				e["owned_by"], e["provider"] = "merged", "merged"
+				if a.WorkBuddy != "" {
+					e["workbuddy_model"] = a.WorkBuddy
+				}
+				if a.Qoder != "" {
+					e["qoder_model"] = a.Qoder
+				}
+			}
+			continue
+		}
+		seen[key] = len(out)
+		owner, provider := "merged", "merged"
+		switch {
+		case a.WorkBuddy == "":
+			owner, provider = "qoder", "qoder"
+		case a.Qoder == "":
+			owner, provider = "workbuddy", "workbuddy"
+		}
+		entry := map[string]any{
+			"id": id, "object": "model", "created": time.Now().Unix(),
+			"owned_by": owner, "provider": provider,
+		}
+		if a.WorkBuddy != "" {
+			entry["workbuddy_model"] = a.WorkBuddy
+		}
+		if a.Qoder != "" {
+			entry["qoder_model"] = a.Qoder
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -766,6 +835,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
 		// Qoder 返回已归一化为 OpenAI SSE 的流，复用同一 Stream/Aggregate 出口。
+		// 按 Provider 改写模型名：别名可能把同一个对外裸名映射到两侧不同的
+		// 上游名字（如 deepseek-flash → Qoder:DeepSeek-Flash / WB:deepseek-v4.1-flash）。
+		// 必须在每次尝试前算：降级重试会换 body，但别名不能丢。
+		outbound := body
+		if target := h.providerModel(provider, bareModel); target != bareModel {
+			outbound = rewriteModel(body, target)
+		}
 		var rc io.ReadCloser
 		var status int
 		var respBody []byte
@@ -775,7 +851,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if h.cfg.QoderGuard != nil {
 				gateLease, _ = h.cfg.QoderGuard.Acquire(r.Context(), acct.UID)
 			}
-			rc, status, respBody, terr = h.cfg.Qoder.ChatStreamContext(r.Context(), acct, body,
+			rc, status, respBody, terr = h.cfg.Qoder.ChatStreamContext(r.Context(), acct, outbound,
 				qoder.ChatMeta{SessionKey: sessKey, RequestID: chatMeta.ConversationRequestID})
 			if gateLease != nil {
 				if terr == nil && status == http.StatusOK && rc != nil {
@@ -787,7 +863,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		} else {
-			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, outbound, clientIP, chatMeta)
 		}
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。

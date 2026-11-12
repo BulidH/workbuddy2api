@@ -84,6 +84,12 @@
       "max_wait_ms": 20000,
       "jitter_ms": 120
     },
-    "endpoints": {}
+    "endpoints": {},
+    "aliases": {
+      "deepseek-flash": {
+        "workbuddy": "deepseek-v4.1-flash",
+        "qoder": "DeepSeek-Flash"
+      }
+    }
   }
 }

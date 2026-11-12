@@ -189,6 +189,11 @@ type Config struct {
 		// PricingFile 用户覆盖参考价 JSON（空 = 只用内置表）。
 		PricingFile string `json:"pricing_file"`
 
+		// Aliases 对外裸名 → 两侧各自的上游模型名。用于两个上游同名不同叫法
+		// （如 Qoder 的 DeepSeek-Flash 与 WorkBuddy 的 deepseek-v4.1-flash）
+		// 仍能按同一个裸名混合调度。键按归一化名匹配，大小写/连字符不敏感。
+		Aliases map[string]qoder.ModelAlias `json:"aliases"`
+
 		// AnthropicThinking off（默认）/ empty。
 		AnthropicThinking string `json:"anthropic_thinking"`
 	} `json:"qoder"`
