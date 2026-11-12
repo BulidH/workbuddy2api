@@ -47,6 +47,11 @@ func (e *entry) clearCoolingLocked() {
 // 熔断观测仍有效，不应被禁用覆盖。
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
+	if !e.disabled {
+		// 只在「健康/冷却 → 禁用」这次跃迁记时刻：已经禁用的号再次收到
+		// session_dead 不应把排序时间线刷新成现在，否则老号会永远压在新号前面。
+		e.disabledAt = time.Now()
+	}
 	e.disabled = true
 	e.reason = reason
 	p.dirty.Store(true)

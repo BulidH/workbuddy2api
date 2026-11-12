@@ -47,10 +47,13 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount      int64              `json:"success_count,omitempty"`
-	ErrTotal          int64              `json:"err_total,omitempty"`
-	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
-	LastErrTime       time.Time          `json:"last_err,omitempty"`
+	// DisabledAt 最近一次被禁用的时刻（持久化，重启后仍可据此排序）。零值 = 旧
+	// state.json 没记过，statusOf 会用 last_err 兜底（历史禁用号也能排进时间线）。
+	DisabledAt      time.Time `json:"disabled_at,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -113,8 +116,11 @@ type entry struct {
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// disabledAt 最近一次被禁用的时刻（持久化）。面板用它把「刚被禁用的」排在最前，
+	// 便于第一时间发现误杀；旧 state.json 没这个字段 → 零值，statusOf 回落到 lastErr。
+	disabledAt time.Time
+	reason     string
+	lastUsed   time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
@@ -277,8 +283,11 @@ type stateAccount struct {
 	Credits int64 `json:"credits"`
 	// CreditsAt 余额快照时刻（最近一次上游权威写入）。旧 state.json 缺此字段 → 零值，
 	// 面板显示为"未知"而非误当成刚刷新（向后兼容）。
-	CreditsAt    time.Time `json:"credits_at,omitempty"`
-	Disabled     bool      `json:"disabled"`
+	CreditsAt time.Time `json:"credits_at,omitempty"`
+	Disabled  bool      `json:"disabled"`
+	// DisabledAt 禁用时刻（stateOverviewLocked 写入；旧文件缺此字段 → 零值，
+	// statusOf 回落 last_err）。用于面板把刚被禁用的账号排在最前。
+	DisabledAt   time.Time `json:"disabled_at,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
 	CoolKind     CoolKind  `json:"cool_kind"`

@@ -70,9 +70,12 @@ type accountView struct {
 	// CreditsAt 最后一次从上游权威快照（签到 / 查询余额）读到余额的时刻。展示它的意义：
 	// credits 在快照之后由每个成功请求的 usage.credit 实时扣减（pool.NoteCreditSpend），
 	// 所以这是「估算值 + 估算起点」。空 = 从未取到过快照，前端不给新鲜度提示。
-	CreditsAt   string `json:"credits_at,omitempty"`
-	Cooling     bool   `json:"cooling"`
-	Disabled    bool   `json:"disabled"`
+	CreditsAt string `json:"credits_at,omitempty"`
+	Cooling   bool   `json:"cooling"`
+	Disabled  bool   `json:"disabled"`
+	// DisabledAt 最近一次禁用时刻（RFC3339）；旧 state.json 无该字段时池状态用
+	// last_err 兜底。前端据此把「刚被禁用的」排在最前，也显示禁用时间。
+	DisabledAt  string `json:"disabled_at,omitempty"`
 	InFlight    int    `json:"in_flight"`
 	Success     int64  `json:"success_count"`
 	ErrTotal    int64  `json:"err_total"`
@@ -160,6 +163,7 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				CreditsAt:   timeStr(m["credits_at"]),
 				Cooling:     boolOf(m["cooling"]),
 				Disabled:    boolOf(m["disabled"]),
+				DisabledAt:  rfc3339Str(m["disabled_at"]),
 				InFlight:    intOf(m["in_flight"]),
 				Success:     int64Of(m["success_count"]),
 				ErrTotal:    int64Of(m["err_total"]),
@@ -525,6 +529,20 @@ func boolOf(v any) bool {
 		return b
 	}
 	return false
+}
+
+// rfc3339Str 规整时间字段为 RFC3339（丢掉纳秒与本地时区偏移），前端 Date 可直接解析。
+// 零值/解析失败返回空串（旧 state.json 无禁用时刻）。
+func rfc3339Str(v any) string {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil || t.IsZero() || t.Year() <= 1 {
+		return ""
+	}
+	return t.Local().Format(time.RFC3339)
 }
 
 // timeStr 把 time.Time 的 JSON 形态转成 HH:MM:SS；零值返回空串。

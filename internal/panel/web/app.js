@@ -89,7 +89,32 @@ const fmtSnap = ts => {
 };
 
 /* ── 全局状态 ───────────────────────────────────────── */
-const S = { route: 'overview', overview: null, accounts: [], config: null, timer: null };
+// hideDisabled 默认 true：账号页只列可用账号，被禁用的号默认收起（历史上池里
+// 累积了十几个老禁用号，会把真正要盯的号挤到下面）。开关状态存 localStorage，
+// 刷新/切页保持；'0' 表示用户主动展开过，其余（含无记录）都按默认隐藏。
+const HIDE_DISABLED_KEY = 'wb2a-hide-disabled';
+const S = {
+  route: 'overview', overview: null, accounts: [], config: null, timer: null,
+  hideDisabled: localStorage.getItem(HIDE_DISABLED_KEY) !== '0',
+};
+
+// accountsDisplayList 账号表的「展示序」：
+//   - 隐藏开关打开时过滤掉 disabled 账号；
+//   - 展开时把 disabled 账号整体提到最前，并按 disabled_at 倒序（刚被禁用的排最前），
+//     健康的保持既有顺序（Array.prototype.sort 自 ES2019 起稳定）。
+// disabled_at 缺失（旧 state.json）记 0，落在同组末尾，不参与「最新」比较。
+function accountsDisplayList(list) {
+  const shown = S.hideDisabled ? list.filter(a => !a.disabled) : list;
+  if (!shown.some(a => a.disabled)) return shown;
+  return [...shown].sort((a, b) => {
+    if (a.disabled !== b.disabled) return a.disabled ? -1 : 1;
+    if (!a.disabled) return 0;
+    const ta = Date.parse(a.disabled_at || '') || 0;
+    const tb = Date.parse(b.disabled_at || '') || 0;
+    if (ta !== tb) return tb - ta;
+    return 0;
+  });
+}
 
 /* ── 路由 ───────────────────────────────────────────── */
 const ROUTES = {
@@ -228,13 +253,17 @@ function setHealth(ok, counts) {
 
 /* ── 账号表 ─────────────────────────────────────────── */
 function accountsTable(list, { compact = false } = {}) {
-  if (!list.length) {
+  const shown = accountsDisplayList(list);
+  if (!shown.length) {
+    const empty = S.hideDisabled && list.some(a => a.disabled)
+      ? `<div class="empty">当前没有可显示的账号（已隐藏 ${list.filter(a => a.disabled).length} 个已禁用账号）。关闭「隐藏已禁用」即可查看。</div>`
+      : `<div class="empty">还没有任何账号，点击「添加账号」选择 WorkBuddy 或 Qoder 接入。</div>`;
     return `<div class="card"><div class="card-head"><h3>账号池</h3>
-      <div class="row-flex"><button class="btn primary sm" data-add>+ 添加账号</button></div></div>
-      <div class="empty">还没有任何账号，点击「添加账号」选择 WorkBuddy 或 Qoder 接入。</div></div>`;
+      <div class="row-flex">${hideDisabledToggleHTML()}<button class="btn primary sm" data-add>+ 添加账号</button></div></div>
+      ${empty}</div>`;
   }
-  const maxCredit = Math.max(1, ...list.map(a => a.credits || 0));
-  const rows = list.map(a => {
+  const maxCredit = Math.max(1, ...shown.map(a => a.credits || 0));
+  const rows = shown.map(a => {
     let st = '<span class="tag ok"><i class="tdot"></i>健康</span>';
     if (a.disabled) st = `<span class="tag err" title="${esc(a.reason || '已禁用')}"><i class="tdot"></i>已禁用</span>`;
     else if (a.cooling) st = `<span class="tag warn"><i class="tdot"></i>冷却 ${esc(fmtRemain(a.cool_remaining_sec))}</span>`;
@@ -247,8 +276,10 @@ function accountsTable(list, { compact = false } = {}) {
         ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>');
     const pct = Math.min(100, Math.round(((a.credits || 0) / maxCredit) * 100));
 
-    return `<tr>
-      <td>${st}</td>
+    return `<tr${a.disabled ? ' class="row-disabled"' : ''}>
+      <td>${st}
+          ${a.disabled && a.disabled_at ? `<div style="font-size:10.5px;color:var(--text-mute);margin-top:3px"
+            title="禁用时刻；已禁用账号按此时间由近到远排序">${esc(fmtTime(a.disabled_at))}</div>` : ''}</td>
       <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
           <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div>
           ${qoder && (a.plan || a.last_checkin) ? `<div style="font-size:11px;color:var(--text-mute)">
@@ -274,12 +305,14 @@ function accountsTable(list, { compact = false } = {}) {
     </tr>`;
   }).join('');
 
+  const disabledCount = list.filter(a => a.disabled).length;
   return `<div class="card">
     <div class="card-head">
-      <h3>账号池 <span class="sub" style="font-weight:400">（${list.length} 个）</span></h3>
+      <h3>账号池 <span class="sub" style="font-weight:400">（${shown.length} 个${S.hideDisabled && disabledCount ? ` · 已隐藏 ${disabledCount} 个禁用` : ''}）</span></h3>
       <div class="row-flex">
-        ${list.some(a => a.disabled) ? `<button class="btn sm warn" data-enable-all
-          title="解禁当前所有被禁用的账号（重新参与选号）">全部解禁（${list.filter(a => a.disabled).length}）</button>` : ''}
+        ${hideDisabledToggleHTML()}
+        ${disabledCount ? `<button class="btn sm warn" data-enable-all
+          title="解禁所有被禁用的账号（包括当前被隐藏的；重新参与选号）">全部解禁（${disabledCount}）</button>` : ''}
         <button class="btn sm" data-balance
           title="只读查询所有账号余额（含国际版）。不发签到请求，不触发任何自动调用">查询余额</button>
         <button class="btn sm" data-checkin
@@ -299,7 +332,23 @@ function accountsTable(list, { compact = false } = {}) {
   </div>`;
 }
 
+// hideDisabledToggleHTML 账号表头的「隐藏已禁用」开关；默认开，状态存 localStorage。
+function hideDisabledToggleHTML() {
+  return `<label class="field row" style="gap:7px;white-space:nowrap;cursor:pointer"
+      title="默认隐藏已禁用账号；关闭后按禁用时刻由近到远把它们排在最前">
+    <label class="switch sm">
+      <input type="checkbox" id="hideDisabled" data-hide-disabled ${S.hideDisabled ? 'checked' : ''}>
+      <span></span></label>
+    <label for="hideDisabled" style="font-size:12px;cursor:pointer">隐藏已禁用</label>
+  </label>`;
+}
+
 function bindAccountActions(list) {
+  $$('[data-hide-disabled]').forEach(cb => cb.onchange = () => {
+    S.hideDisabled = cb.checked;
+    localStorage.setItem(HIDE_DISABLED_KEY, cb.checked ? '1' : '0');
+    render();
+  });
   $$('[data-del]').forEach(b => b.onclick = () =>
     confirmDelete(b.dataset.del, b.dataset.nick, b.dataset.provider));
   $$('[data-add]').forEach(b => b.onclick = addAccountFlow);

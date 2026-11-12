@@ -65,6 +65,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
 		e.reason = ""
+		e.disabledAt = time.Time{} // 解禁后不再是「被禁用的账号」，不留旧时刻
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
@@ -502,6 +503,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+		// 旧 state.json 没有 disabled_at：用最后一次错误时刻兜底，让历史禁用号
+		// 也能落进「刚被禁用排前」的时间线，而不是全部挤在最底下。
+		st.DisabledAt = e.disabledAt
+		if st.DisabledAt.IsZero() {
+			st.DisabledAt = e.lastErr
+		}
 	}
 	st.ModelCosts = p.modelCostViewsLocked(e, now)
 	if st.Cooling {
