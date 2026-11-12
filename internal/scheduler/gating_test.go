@@ -32,7 +32,8 @@ func TestGlobalAccountsSkipCheckinTravel(t *testing.T) {
 	// 显式 realm=global（下行 Domain 兜底场景在 auth 包单测覆盖，这里直接构造 global）。
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, GlobalEnabled: true}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up})
 
 	// 签到/旅行循环：global 账号不应发起任何上游调用。
@@ -105,7 +106,7 @@ func TestGlobalAndCNMixedPoolServed(t *testing.T) {
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
 	up := &upstream.Client{HTTP: both.Client(), ChatBaseCN: both.URL, BillingBaseCN: both.URL,
-		BillingBaseGlobal: both.URL, GlobalEnabled: true}
+		ChatBaseGlobal: both.URL, BillingBaseGlobal: both.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
 
 	s.RunActivityNow()
@@ -138,6 +139,10 @@ func TestRunActivityNowReportsGlobalAccounts(t *testing.T) {
 		w.Write([]byte(`{"code":0,"msg":"OK"}`))
 	})
 	globalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/report" {
+			http.NotFound(w, r)
+			return
+		}
 		globalCalls.Add(1)
 		reportOK.ServeHTTP(w, r)
 	}))
@@ -153,7 +158,7 @@ func TestRunActivityNowReportsGlobalAccounts(t *testing.T) {
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
 	up := &upstream.Client{HTTP: globalSrv.Client(), ChatBaseCN: cnSrv.URL, BillingBaseCN: cnSrv.URL,
-		BillingBaseGlobal: globalSrv.URL, GlobalEnabled: true}
+		ChatBaseGlobal: globalSrv.URL, BillingBaseGlobal: globalSrv.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
 
 	s.RunActivityNow()
@@ -192,7 +197,8 @@ func TestRunActivityNowGlobalReportFailWarnsButOthersProceed(t *testing.T) {
 	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
 		Domain: "www.workbuddy.ai"})
 	p.Add(&auth.Auth{UID: "cn1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
-	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, GlobalEnabled: true}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		ChatBaseGlobal: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true}
 	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
 
 	s.RunActivityNow() // 不应 panic，g1 的 report 失败只记 WARN

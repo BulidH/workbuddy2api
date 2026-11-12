@@ -424,3 +424,10 @@ html[data-theme="light"] .logbox { background: #10141b; }
 }
 .mini-tbl { font-size: 12px; }
 .mini-tbl th, .mini-tbl td { padding: 4px 8px; }
+
+pre.code {
+  margin: 8px 0 0; padding: 10px 12px; overflow: auto; max-height: 320px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}

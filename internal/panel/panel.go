@@ -9,6 +9,7 @@
 package panel
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"io/fs"
@@ -19,6 +20,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/agentcfg"
+	"workbuddy2api/internal/qoder"
+	"workbuddy2api/internal/qoderops"
 )
 
 // Version 面板版本（前端页脚展示）。
@@ -95,6 +100,30 @@ type Deps struct {
 
 	// HTTPClient 出站客户端（OAuth 用）；nil 时用默认。
 	HTTPClient *http.Client
+
+	// ── Qoder 第二上游（可选；QoderEnabled=false 时全部忽略）──
+	QoderEnabled bool
+	QoderAuthDir string
+	// QoderLogin 设备授权 / PAT / 账号导入管理器。
+	QoderLogin *qoder.LoginManager
+	// ReloadQoderAuths 重扫 Qoder 账号目录并对齐 Qoder 账号池。
+	ReloadQoderAuths func() (int, error)
+	// SetQoderAccountEnabled 手动启用/禁用 Qoder 账号。
+	SetQoderAccountEnabled func(uid string, enabled bool) error
+
+	// ── Qoder 运营（签到 / 额度 / 活动）──
+	// 全部由 cmd/server 注入 qoderops.Service 的薄封装；面板不直接持有上游客户端。
+	QoderCheckin        func(ctx context.Context, uids []string, onlyDaily bool) ([]qoderops.CheckinOutcome, error)
+	QoderBalance        func(ctx context.Context, uids []string) ([]qoderops.BalanceOutcome, error)
+	QoderCampaigns      func(ctx context.Context, uid string, force bool) (*qoder.CampaignsResult, error)
+	QoderClaim          func(ctx context.Context, uid, campaignID string) (qoder.ClaimResult, error)
+	QoderSetCheckinPref func(uid string, whenDisabled bool) error
+	QoderLastCheckin    func() (time.Time, string)
+	QoderActivity       *qoder.ActivityLog
+
+	// Agents 智能体一键配置（可选；nil 时相关接口返回 501）。
+	// 只读写本机客户端配置与 state 目录，密钥不落网关 state。
+	Agents *agentcfg.Service
 }
 
 // CheckinOutcome 面板侧的单账号签到回执（刻意与 scheduler.CheckinOutcome 解耦，
@@ -161,6 +190,27 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.handleLoginPoll)
 	p.mux.HandleFunc("POST /panel/api/login/region", p.handleLoginRegion)
 
+	// ── Qoder 接入（设备授权 / PAT / 账号导入）────────────
+	p.mux.HandleFunc("POST /panel/api/qoder/login/start", p.handleQoderLoginStart)
+	p.mux.HandleFunc("GET /panel/api/qoder/login/poll", p.handleQoderLoginPoll)
+	p.mux.HandleFunc("POST /panel/api/qoder/pat", p.handleQoderPAT)
+	p.mux.HandleFunc("POST /panel/api/qoder/import", p.handleQoderImport)
+
+	// ── Qoder 运营（签到 / 额度 / 活动）────────────────────
+	p.mux.HandleFunc("POST /panel/api/qoder/checkin", p.handleQoderCheckin)
+	p.mux.HandleFunc("POST /panel/api/qoder/balance", p.handleQoderBalance)
+	p.mux.HandleFunc("GET /panel/api/qoder/campaigns", p.handleQoderCampaigns)
+	p.mux.HandleFunc("POST /panel/api/qoder/campaign/claim", p.handleQoderClaim)
+	p.mux.HandleFunc("POST /panel/api/qoder/prefs", p.handleQoderPrefs)
+	p.mux.HandleFunc("GET /panel/api/qoder/activity", p.handleQoderActivity)
+
+	// ── 智能体一键配置（本机客户端）──────────────────────
+	p.mux.HandleFunc("GET /panel/api/agents", p.handleAgentsOverview)
+	p.mux.HandleFunc("POST /panel/api/agents/plan", p.handleAgentsPlan)
+	p.mux.HandleFunc("POST /panel/api/agents/apply", p.handleAgentsApply)
+	p.mux.HandleFunc("POST /panel/api/agents/restore", p.handleAgentsRestore)
+	p.mux.HandleFunc("GET /panel/api/agents/template", p.handleAgentsTemplate)
+
 	// ── 静态资源 ──────────────────────────────────────────
 	p.mux.Handle("GET /panel/", http.StripPrefix("/panel/", http.FileServerFS(p.staticFS())))
 
@@ -225,6 +275,25 @@ func (p *Panel) authFilePath(uid string) (string, bool) {
 	abs := filepath.Join(p.deps.AuthDir, "workbuddy-"+uid+".json")
 	// 二次确认：拼接结果必须仍在 AuthDir 内
 	if !strings.HasPrefix(filepath.Clean(abs), filepath.Clean(p.deps.AuthDir)) {
+		return "", false
+	}
+	return abs, true
+}
+
+// qoderFilePath 同 authFilePath，但定位 Qoder 账号目录（qoder-<uid>.json）。
+func (p *Panel) qoderFilePath(uid string) (string, bool) {
+	if !p.deps.QoderEnabled || uid == "" || len(uid) > 128 {
+		return "", false
+	}
+	for _, c := range uid {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return "", false
+		}
+	}
+	abs := filepath.Join(p.deps.QoderAuthDir, "qoder-"+uid+".json")
+	if !strings.HasPrefix(filepath.Clean(abs), filepath.Clean(p.deps.QoderAuthDir)) {
 		return "", false
 	}
 	return abs, true

@@ -10,13 +10,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/agentcfg"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/guard"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoder"
+	"workbuddy2api/internal/qoderops"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -49,6 +54,71 @@ func main() {
 		log.Fatalf("load auths: %v", err)
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+
+	// Qoder 第二上游：独立账号目录 + 独立账号池（冷却/熔断/在途租约互不影响）。
+	// 未启用时不创建任何对象，纯 WorkBuddy 部署零变化。
+	var qoderAuths []*auth.Auth
+	var qp *pool.Pool
+	var qclient *qoder.Client
+	var qlogin *qoder.LoginManager
+	var qops *qoderops.Service
+	var qactivity *qoder.ActivityLog
+	var qguard *guard.Gate
+	var qoderPrices map[string]qoder.Price
+	if cfg.Qoder.Enabled {
+		qoderAuths, err = auth.LoadQoderDir(cfg.Qoder.AuthDir)
+		if err != nil {
+			log.Printf("WARN: load qoder auths from %s: %v", cfg.Qoder.AuthDir, err)
+		}
+		log.Printf("loaded %d qoder account(s) from %s", len(qoderAuths), cfg.Qoder.AuthDir)
+		qp = pool.New(cfg.Qoder.StateFile)
+		// 注意：不共享 Redis 状态快照键（wb2api:state 为单池设计），Qoder 池仅用本地文件。
+		qp.RestoreFromSnapshot()
+		qp.SyncToDir(qoderAuths)
+		qp.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+		// 单号并发闸门与 pool 的在途上限取同一口径：闸门负责排队等待，
+		// pool 负责兜底抢占失败换号。
+		maxInFlight := cfg.Qoder.Guard.MaxConcurrency
+		if !cfg.Qoder.Guard.Enabled {
+			maxInFlight = cfg.Pool.MaxInFlight
+		}
+		qp.SetMaxInFlight(maxInFlight)
+		qp.SetSoftRateMax(cfg.SoftRateMaxDur)
+		qp.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+		qp.SetFreeTierBonus(cfg.Pool.FreeTierBonus)
+		qclient = qoder.New(qoder.Config{
+			Endpoints:      cfg.Qoder.Endpoints,
+			CosyVersion:    cfg.Qoder.CosyVersion,
+			DesktopVersion: cfg.Qoder.DesktopVersion,
+			Timeout:        time.Duration(cfg.Qoder.TimeoutSeconds) * time.Second,
+		})
+		qlogin = qoder.NewLoginManager(qclient, cfg.Qoder.AuthDir)
+		qclient.SetLoginManager(qlogin)
+		qactivity = qoder.NewActivityLog(cfg.Qoder.ActivityFile)
+		qoderPrices = qoder.LoadPriceOverrides(cfg.Qoder.PricingFile)
+		qguard = guard.New(guard.Config{
+			Enabled:        cfg.Qoder.Guard.Enabled,
+			MaxConcurrency: cfg.Qoder.Guard.MaxConcurrency,
+			MinGap:         time.Duration(cfg.Qoder.Guard.MinGapMs) * time.Millisecond,
+			MaxWait:        time.Duration(cfg.Qoder.Guard.MaxWaitMs) * time.Millisecond,
+			Jitter:         time.Duration(cfg.Qoder.Guard.JitterMs) * time.Millisecond,
+		})
+		if cfg.Qoder.ImageTranscode != nil {
+			qoder.ImageTranscodeEnabled = *cfg.Qoder.ImageTranscode
+		}
+		qops = qoderops.New(qoderops.Config{
+			Pool:     qp,
+			Client:   qclient,
+			Activity: qactivity,
+			Gap:      time.Duration(cfg.Qoder.RequestGapSeconds * float64(time.Second)),
+		})
+	}
+	closePools := func() {
+		if qp != nil {
+			qp.Close()
+		}
+	}
+	defer closePools()
 
 	// global realm 路由开关（config global.enabled，缺省 true）：注入 auth 包全局闸。
 	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
@@ -88,7 +158,7 @@ func main() {
 			// 而不是被钉在这个号上反复失败。
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
 			// 见 wiring.go）；裸名走 cn（现状零回归）。
-			AvailableForModel: realmAwareAvailableForModel(p),
+			AvailableForModel: realmAwareAvailableForModel(p, qp),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -131,22 +201,27 @@ func main() {
 	up.GlobalEnabled = cfg.Global.Enabled
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:                p,
-		Upstream:            up,
-		CheckinHours:        cfg.Schedule.CheckinHours,
-		TravelHours:         cfg.Schedule.TravelHours,
-		ActivityHours:       cfg.Schedule.ActivityHours,
-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
-		SchoolHours:         cfg.Schedule.SchoolHours,
-		CatHours:            cfg.Schedule.CatHours,
-		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		CatDisabled:         !cfg.Schedule.CatEnabled,
+		Pool:                   p,
+		Upstream:               up,
+		CheckinHours:           cfg.Schedule.CheckinHours,
+		TravelHours:            cfg.Schedule.TravelHours,
+		ActivityHours:          cfg.Schedule.ActivityHours,
+		KeepaliveHours:         cfg.Schedule.KeepaliveHours,
+		SchoolHours:            cfg.Schedule.SchoolHours,
+		CatHours:               cfg.Schedule.CatHours,
+		ActivityReportCount:    cfg.Schedule.ActivityReportCount,
+		ExpiringSoonWindow:     cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		CheckinDisabled:        !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:         !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:       !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:         !cfg.Schedule.SchoolEnabled,
+		CatDisabled:            !cfg.Schedule.CatEnabled,
+		QoderOps:               qops,
+		QoderCheckinHours:      cfg.Qoder.CheckinHours,
+		QoderKeepaliveHours:    cfg.Qoder.KeepaliveHours,
+		QoderCheckinDisabled:   cfg.Qoder.CheckinEnabled == false,
+		QoderKeepaliveDisabled: cfg.Qoder.KeepaliveEnabled == false,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -180,6 +255,18 @@ func main() {
 		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+	}
+	if cfg.Qoder.Enabled {
+		if cfg.Qoder.CheckinEnabled {
+			log.Printf("Qoder 签到已启用：%v 点（活动领取 + Credits 补领）", cfg.Qoder.CheckinHours)
+		} else {
+			log.Printf("Qoder 签到已禁用（qoder.checkin_enabled=false）")
+		}
+		if cfg.Qoder.KeepaliveEnabled {
+			log.Printf("Qoder token 保活已启用：%v 点", cfg.Qoder.KeepaliveHours)
+		} else {
+			log.Printf("Qoder token 保活已禁用（qoder.keepalive_enabled=false）")
+		}
 	}
 
 	// ── 内置 Web 管理面板 ─────────────────────────────────────────────
@@ -215,6 +302,9 @@ func main() {
 			Restart: func() {
 				log.Printf("[panel] 收到重启请求，进程退出（容器 restart 策略将自动拉起）")
 				p.Flush()
+				if qp != nil {
+					qp.Flush()
+				}
 				os.Exit(0)
 			},
 			// 手动启用 / 解禁：运维开关，直接改账号的 disabled 标志。
@@ -342,6 +432,79 @@ func main() {
 				return recs, errs, nil
 			},
 			Logs: logRing,
+
+			// ── Qoder 第二上游（未启用时全部零值，面板忽略）──
+			QoderEnabled: cfg.Qoder.Enabled,
+			QoderAuthDir: cfg.Qoder.AuthDir,
+			QoderLogin:   qlogin,
+			ReloadQoderAuths: func() (int, error) {
+				if qp == nil {
+					return 0, nil
+				}
+				auths, err := auth.LoadQoderDir(cfg.Qoder.AuthDir)
+				if err != nil {
+					return 0, err
+				}
+				qp.SyncToDir(auths)
+				return len(auths), nil
+			},
+			SetQoderAccountEnabled: func(uid string, enabled bool) error {
+				if qp == nil {
+					return fmt.Errorf("Qoder 未启用")
+				}
+				if _, ok := qp.Status(uid); !ok {
+					return fmt.Errorf("账号不在池内: %s", uid)
+				}
+				if enabled {
+					qp.ReviveDisabled(uid)
+					log.Printf("[panel] 手动解禁 Qoder 账号 %s", logfmt.UID8(uid))
+				} else {
+					qp.Disable(uid, "disabled manually via panel")
+					log.Printf("[panel] 手动禁用 Qoder 账号 %s", logfmt.UID8(uid))
+				}
+				return nil
+			},
+
+			// ── Qoder 运营（签到 / 额度 / 活动）──
+			QoderCheckin: func(ctx context.Context, uids []string, onlyDaily bool) ([]qoderops.CheckinOutcome, error) {
+				if qops == nil {
+					return nil, fmt.Errorf("Qoder 未启用")
+				}
+				return qops.CheckinAll(ctx, uids, onlyDaily)
+			},
+			QoderBalance: func(ctx context.Context, uids []string) ([]qoderops.BalanceOutcome, error) {
+				if qops == nil {
+					return nil, fmt.Errorf("Qoder 未启用")
+				}
+				return qops.RefreshBalances(ctx, uids)
+			},
+			QoderCampaigns: func(ctx context.Context, uid string, force bool) (*qoder.CampaignsResult, error) {
+				if qops == nil {
+					return nil, fmt.Errorf("Qoder 未启用")
+				}
+				return qops.Campaigns(ctx, uid, force)
+			},
+			QoderClaim: func(ctx context.Context, uid, campaignID string) (qoder.ClaimResult, error) {
+				if qops == nil {
+					return qoder.ClaimResult{}, fmt.Errorf("Qoder 未启用")
+				}
+				return qops.Claim(ctx, uid, campaignID)
+			},
+			QoderSetCheckinPref: func(uid string, whenDisabled bool) error {
+				if qops == nil {
+					return fmt.Errorf("Qoder 未启用")
+				}
+				return qops.SetCheckinWhenDisabled(uid, whenDisabled)
+			},
+			QoderLastCheckin: func() (time.Time, string) {
+				if qops == nil {
+					return time.Time{}, ""
+				}
+				return qops.LastCheckin()
+			},
+			QoderActivity: qactivity,
+			// 智能体配置的 state/备份放在状态文件同目录，默认 ./accounts。
+			Agents: agentcfg.New(filepath.Dir(cfg.StateFile), ""),
 		})
 		log.Printf("内置管理面板已启用：http://<host>%s/panel/", cfg.Listen)
 	}
@@ -363,6 +526,15 @@ func main() {
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Panel:         panelHandler,
+
+		// Qoder 第二上游：两池各自冷却/熔断，按模型在 handler 层混合调度。
+		Qoder:             qclient,
+		QoderPool:         qp,
+		QoderWeight:       cfg.Qoder.Weight,
+		QoderGuard:        qguard,
+		QoderPrices:       qoderPrices,
+		QoderWebTools:     cfg.Qoder.WebTools,
+		AnthropicThinking: cfg.Qoder.AnthropicThinking,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -374,6 +546,19 @@ func main() {
 	if cfg.Schedule.CheckinOnStartup {
 		sch.RunStartupCatchUp(scheduler.StartupCatchUpDelay)
 		log.Printf("已安排启动补跑签到（%s 后执行一次，可用 schedule.checkin_on_startup=false 关闭）",
+			scheduler.StartupCatchUpDelay)
+	}
+	// Qoder 启动补跑：与 WorkBuddy 同口径（签到幂等，容器在签到时点未运行时兜底）。
+	if qops != nil && cfg.Qoder.CheckinEnabled && cfg.Qoder.CheckinOnStartup {
+		go func() {
+			time.Sleep(scheduler.StartupCatchUpDelay)
+			qctx, qcancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer qcancel()
+			if _, err := qops.CheckinAll(qctx, nil, false); err != nil {
+				log.Printf("qoder 启动补跑签到: %v", err)
+			}
+		}()
+		log.Printf("已安排 Qoder 启动补跑签到（%s 后执行一次，可用 qoder.checkin_on_startup=false 关闭）",
 			scheduler.StartupCatchUpDelay)
 	}
 
@@ -392,6 +577,9 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		if qp != nil {
+			qp.Flush()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

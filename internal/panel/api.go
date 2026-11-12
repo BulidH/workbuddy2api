@@ -40,15 +40,16 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"gateway_ver": p.deps.GatewayVer,
 		"healthy":     healthy > 0,
 		"counts": map[string]any{
-			"total":         total,
-			"healthy":       healthy,
-			"cooling":       cooling,
-			"disabled":      disabled,
-			"in_flight":     status["in_flight_full"],
-			"auth_files":    authFiles,
-			"sticky":        status["sticky_sessions"],
+			"total":      total,
+			"healthy":    healthy,
+			"cooling":    cooling,
+			"disabled":   disabled,
+			"in_flight":  status["in_flight_full"],
+			"auth_files": authFiles,
+			"sticky":     status["sticky_sessions"],
 		},
 		"realm_totals": status["realm_totals"],
+		"providers":    status["providers"],
 		"redis_mode":   status["redis_mode"],
 		"paths": map[string]string{
 			"config": p.deps.ConfigPath,
@@ -63,6 +64,7 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 type accountView struct {
 	UID         string `json:"uid"`
 	Nickname    string `json:"nickname"`
+	Provider    string `json:"provider"`
 	Realm       string `json:"realm"`
 	Credits     int64  `json:"credits"`
 	Cooling     bool   `json:"cooling"`
@@ -80,6 +82,16 @@ type accountView struct {
 	ExpiresAt int64  `json:"expires_at,omitempty"`
 	Domain    string `json:"domain,omitempty"`
 	File      string `json:"file,omitempty"`
+
+	// 以下仅 Qoder：运营状态（签到 / 套餐 / 额度构成 / 企业 VPC）
+	Plan                string         `json:"plan,omitempty"`
+	LastCheckin         string         `json:"last_checkin,omitempty"`
+	CheckinWhenDisabled bool           `json:"checkin_when_disabled,omitempty"`
+	CreditsDetail       map[string]any `json:"credits_detail,omitempty"`
+	UserType            string         `json:"user_type,omitempty"`
+	OrgName             string         `json:"org_name,omitempty"`
+	VpcEndpoint         string         `json:"vpc_endpoint,omitempty"`
+	HasPAT              bool           `json:"has_pat,omitempty"`
 }
 
 // statusMap 取 /status 载荷并规整为通用 JSON 结构（map[string]any / []any / float64）。
@@ -110,6 +122,16 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	byUID := map[string]*accountView{}
 	order := []string{}
 
+	// Qoder 账号 UID 集合：池状态里不带 provider 字段，按目录文件归属标注。
+	qoderUIDs := map[string]bool{}
+	if p.deps.QoderEnabled {
+		if auths, err := auth.LoadQoderDir(p.deps.QoderAuthDir); err == nil {
+			for _, a := range auths {
+				qoderUIDs[a.UID] = true
+			}
+		}
+	}
+
 	// 1) 池内账号（statusMap 已规整，此处断言必定成功）
 	if list, ok := status["accounts"].([]any); ok {
 		for _, it := range list {
@@ -121,19 +143,24 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			if uid == "" {
 				continue
 			}
+			provider := auth.ProviderWorkBuddy
+			if qoderUIDs[uid] {
+				provider = auth.ProviderQoder
+			}
 			v := &accountView{
-				UID:        uid,
-				Nickname:   strOf(m["nickname"]),
-				Realm:      strOf(m["realm"]),
-				Credits:    int64Of(m["credits"]),
-				Cooling:    boolOf(m["cooling"]),
-				Disabled:   boolOf(m["disabled"]),
-				InFlight:   intOf(m["in_flight"]),
-				Success:    int64Of(m["success_count"]),
-				ErrTotal:   int64Of(m["err_total"]),
-				CoolRemain: int64Of(m["cool_remaining_sec"]),
-				CoolKind:   strOf(m["cool_kind"]),
-				Reason:     strOf(m["reason"]),
+				UID:         uid,
+				Nickname:    strOf(m["nickname"]),
+				Provider:    provider,
+				Realm:       strOf(m["realm"]),
+				Credits:     int64Of(m["credits"]),
+				Cooling:     boolOf(m["cooling"]),
+				Disabled:    boolOf(m["disabled"]),
+				InFlight:    intOf(m["in_flight"]),
+				Success:     int64Of(m["success_count"]),
+				ErrTotal:    int64Of(m["err_total"]),
+				CoolRemain:  int64Of(m["cool_remaining_sec"]),
+				CoolKind:    strOf(m["cool_kind"]),
+				Reason:      strOf(m["reason"]),
 				LastSuccess: timeStr(m["last_success"]),
 				LastErr:     timeStr(m["last_err"]),
 			}
@@ -151,6 +178,7 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 				byUID[a.UID] = v
 				order = append(order, a.UID)
 			}
+			v.Provider = auth.ProviderWorkBuddy
 			v.ExpiresAt = a.ExpiresAt
 			v.Domain = a.Domain
 			v.File = filepath.Base(a.FilePath)
@@ -163,11 +191,50 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 3) Qoder 凭证目录（池里没有的也列出来，便于发现加载失败）
+	if p.deps.QoderEnabled {
+		if auths, err := auth.LoadQoderDir(p.deps.QoderAuthDir); err == nil {
+			for _, a := range auths {
+				v, ok := byUID[a.UID]
+				if !ok {
+					v = &accountView{UID: a.UID}
+					byUID[a.UID] = v
+					order = append(order, a.UID)
+				}
+				v.Provider = auth.ProviderQoder
+				v.ExpiresAt = a.ExpiresAt
+				v.Domain = a.Domain
+				v.File = filepath.Base(a.FilePath)
+				if v.Nickname == "" {
+					v.Nickname = a.Nickname
+				}
+				if v.Realm == "" {
+					v.Realm = a.Realm()
+				}
+				st := a.QoderStateSnapshot()
+				v.Plan = st.Plan
+				v.LastCheckin = st.LastCheckin
+				v.CheckinWhenDisabled = st.CheckinWhenDisabled
+				v.CreditsDetail = st.Credits
+				v.UserType = a.UserType
+				v.OrgName = a.OrganizationName
+				v.VpcEndpoint = a.VpcEndpoint
+				v.HasPAT = a.PersonalToken != ""
+				if v.Credits == 0 {
+					v.Credits = a.CreditsRemain()
+				}
+			}
+		}
+	}
+
 	out := make([]*accountView, 0, len(order))
 	for _, uid := range order {
 		out = append(out, byUID[uid])
 	}
 	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
 		if out[i].Realm != out[j].Realm {
 			return out[i].Realm < out[j].Realm
 		}
@@ -178,15 +245,28 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAccountDelete 删除账号：移除凭证文件后对齐账号池。
+// body.provider 缺省 workbuddy；qoder 走 Qoder 目录与 qoderPool。
 func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		UID string `json:"uid"`
+		UID      string `json:"uid"`
+		Provider string `json:"provider"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
 		errJSON(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
 	}
-	path, ok := p.authFilePath(body.UID)
+	qoder := isQoderProvider(body.Provider)
+	if qoder && !p.deps.QoderEnabled {
+		errJSON(w, http.StatusBadRequest, "Qoder 未启用")
+		return
+	}
+	var path string
+	var ok bool
+	if qoder {
+		path, ok = p.qoderFilePath(body.UID)
+	} else {
+		path, ok = p.authFilePath(body.UID)
+	}
 	if !ok {
 		errJSON(w, http.StatusBadRequest, "非法 uid")
 		return
@@ -196,7 +276,7 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 先备份再删：误删可从 backups/ 找回
-	bakDir := filepath.Join(filepath.Dir(p.deps.AuthDir), "backups")
+	bakDir := filepath.Join(filepath.Dir(filepath.Dir(path)), "backups")
 	_ = os.MkdirAll(bakDir, 0o700)
 	bak := filepath.Join(bakDir, filepath.Base(path)+"."+time.Now().Format("20060102-150405")+".bak")
 	if raw, err := os.ReadFile(path); err == nil {
@@ -206,7 +286,11 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
-	n, err := p.reload()
+	reload := p.reload
+	if qoder {
+		reload = p.reloadQoder
+	}
+	n, err := reload()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "账号池对齐失败: "+err.Error())
 		return
@@ -220,24 +304,38 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 // 用于余额恢复后自动解冻；本入口是运维手动摘除/放回账号的开关，直接改 disabled。
 // 典型场景：上游 11140 误判批量禁用后手动恢复，或临时摘掉某个不想再用的号。
 func (p *Panel) handleAccountEnable(w http.ResponseWriter, r *http.Request) {
-	if p.deps.SetAccountEnabled == nil {
-		errJSON(w, http.StatusNotImplemented, "账号启用/禁用入口不可用")
-		return
-	}
 	var body struct {
-		UID     string `json:"uid"`
-		Enabled bool   `json:"enabled"`
+		UID      string `json:"uid"`
+		Enabled  bool   `json:"enabled"`
+		Provider string `json:"provider"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
 		errJSON(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
 	}
-	// 复用与删除相同的 uid 校验，防路径穿越 / 非法取值。
-	if _, ok := p.authFilePath(body.UID); !ok {
+	// 按 provider 路由到对应池的开关；Qoder 未启用时拒绝。
+	qoder := isQoderProvider(body.Provider)
+	setEnabled := p.deps.SetAccountEnabled
+	if qoder {
+		if !p.deps.QoderEnabled {
+			errJSON(w, http.StatusBadRequest, "Qoder 未启用")
+			return
+		}
+		if _, ok := p.qoderFilePath(body.UID); !ok {
+			errJSON(w, http.StatusBadRequest, "非法 uid")
+			return
+		}
+		setEnabled = p.deps.SetQoderAccountEnabled
+	} else if _, ok := p.authFilePath(body.UID); !ok {
+		// 复用与删除相同的 uid 校验，防路径穿越 / 非法取值。
 		errJSON(w, http.StatusBadRequest, "非法 uid")
 		return
 	}
-	if err := p.deps.SetAccountEnabled(body.UID, body.Enabled); err != nil {
+	if setEnabled == nil {
+		errJSON(w, http.StatusNotImplemented, "账号启用/禁用入口不可用")
+		return
+	}
+	if err := setEnabled(body.UID, body.Enabled); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}

@@ -81,8 +81,10 @@ const S = { route: 'overview', overview: null, accounts: [], config: null, timer
 const ROUTES = {
   overview: { title: '概览', sub: '网关健康状态与账号池总览', render: viewOverview },
   accounts: { title: '账号管理', sub: '账号池详情、添加与移除', render: viewAccounts },
+  qoder: { title: 'Qoder 活动', sub: '每日签到 / 活动领取 / 额度与活动流水', render: viewQoder },
   config: { title: '网关配置', sub: '在线编辑 config.json（保存后需重启生效）', render: viewConfig },
   models: { title: '模型列表', sub: '网关对外暴露的全部模型', render: viewModels },
+  agents: { title: '智能体配置', sub: '检测本机 AI 客户端，一键指向本网关；写入前备份，可精确还原', render: viewAgents },
   usage: { title: '用量统计', sub: '按账号 / 小时 / 天 / 模型统计积分消耗与调用量', render: viewUsage },
   logs: { title: '运行日志', sub: '网关进程日志与请求流水', render: viewLogs },
 };
@@ -126,6 +128,7 @@ async function viewOverview() {
   const c = ov.counts;
   const rt = ov.realm_totals || {};
   const g = (rt.global || {}), n = (rt.cn || {});
+  const qd = (ov.providers || {}).qoder;
 
   const card = (label, value, foot, cls = '') =>
     `<div class="card stat ${cls}"><div class="stat-label">${label}</div>
@@ -148,19 +151,25 @@ async function viewOverview() {
 
     <div class="grid cols-2" style="margin-top:16px">
       <div class="card">
-        <div class="card-head"><h3>按域可用性</h3><span class="sub">模型名前缀决定路由</span></div>
+        <div class="card-head"><h3>按 Provider 可用性</h3><span class="sub">模型名前缀决定路由</span></div>
         <div class="card-body">
           <table class="tbl">
-            <thead><tr><th>域</th><th>前缀</th><th class="num">总数</th><th class="num">健康</th><th>状态</th></tr></thead>
+            <thead><tr><th>上游</th><th>前缀</th><th class="num">总数</th><th class="num">健康</th><th>状态</th></tr></thead>
             <tbody>
-              <tr><td><span class="tag purple">国内版</span></td><td class="mono">cn:</td>
+              <tr><td><span class="tag purple">WorkBuddy 国内版</span></td><td class="mono">cn:</td>
                   <td class="num">${n.total || 0}</td><td class="num">${n.healthy || 0}</td>
                   <td>${n.healthy > 0 ? '<span class="tag ok"><i class="tdot"></i>可服务</span>'
                                     : '<span class="tag gray">无可用账号</span>'}</td></tr>
-              <tr><td><span class="tag info">国际版</span></td><td class="mono">global:</td>
+              <tr><td><span class="tag info">WorkBuddy 国际版</span></td><td class="mono">global:</td>
                   <td class="num">${g.total || 0}</td><td class="num">${g.healthy || 0}</td>
                   <td>${g.healthy > 0 ? '<span class="tag ok"><i class="tdot"></i>可服务</span>'
                                     : '<span class="tag gray">无可用账号</span>'}</td></tr>
+              ${qd ? `<tr><td><span class="tag ok">Qoder</span></td><td class="mono">qoder:</td>
+                  <td class="num">${qd.total || 0}</td><td class="num">${qd.healthy || 0}</td>
+                  <td>${qd.healthy > 0 ? '<span class="tag ok"><i class="tdot"></i>可服务</span>'
+                                    : '<span class="tag gray">无可用账号</span>'}</td></tr>`
+                  : `<tr><td><span class="tag gray">Qoder</span></td><td class="mono">qoder:</td>
+                  <td class="num">—</td><td class="num">—</td><td><span class="tag gray">未启用</span></td></tr>`}
             </tbody>
           </table>
         </div>
@@ -206,8 +215,9 @@ function setHealth(ok, counts) {
 /* ── 账号表 ─────────────────────────────────────────── */
 function accountsTable(list, { compact = false } = {}) {
   if (!list.length) {
-    return `<div class="card"><div class="card-head"><h3>账号池</h3></div>
-      <div class="empty">还没有任何账号，点击右上角「添加账号」开始。</div></div>`;
+    return `<div class="card"><div class="card-head"><h3>账号池</h3>
+      <div class="row-flex"><button class="btn primary sm" data-add>+ 添加账号</button></div></div>
+      <div class="empty">还没有任何账号，点击「添加账号」选择 WorkBuddy 或 Qoder 接入。</div></div>`;
   }
   const maxCredit = Math.max(1, ...list.map(a => a.credits || 0));
   const rows = list.map(a => {
@@ -216,14 +226,20 @@ function accountsTable(list, { compact = false } = {}) {
     else if (a.cooling) st = `<span class="tag warn"><i class="tdot"></i>冷却 ${esc(fmtRemain(a.cool_remaining_sec))}</span>`;
     else if (a.in_flight > 0) st = `<span class="tag info"><i class="tdot"></i>在途 ${a.in_flight}</span>`;
 
-    const realm = a.realm === 'global'
-      ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>';
+    const qoder = a.provider === 'qoder';
+    const realm = qoder
+      ? `<span class="tag ok">Qoder ${a.realm === 'intl' ? '国际' : '国内'}</span>`
+      : (a.realm === 'global'
+        ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>');
     const pct = Math.min(100, Math.round(((a.credits || 0) / maxCredit) * 100));
 
     return `<tr>
       <td>${st}</td>
       <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
-          <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div></td>
+          <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div>
+          ${qoder && (a.plan || a.last_checkin) ? `<div style="font-size:11px;color:var(--text-mute)">
+            ${a.plan ? '套餐 ' + esc(a.plan) : ''}${a.plan && a.last_checkin ? ' · ' : ''}${a.last_checkin ? '签到 ' + esc(a.last_checkin) : ''}</div>` : ''}
+      </td>
       <td>${realm}</td>
       <td class="num">${a.credits ?? 0}<div class="bar ${a.credits > 0 ? 'ok' : ''}" style="margin-top:5px">
           <i style="width:${pct}%"></i></div></td>
@@ -232,10 +248,12 @@ function accountsTable(list, { compact = false } = {}) {
       <td class="num" style="font-size:11.5px">${esc(a.last_success || '—')}</td>
       <td style="white-space:nowrap">
         <button class="btn xs ${a.disabled ? 'primary' : 'warn'}" data-toggle-enable="${esc(a.uid)}"
+          data-provider="${esc(a.provider || 'workbuddy')}"
           data-enabled="${a.disabled ? '0' : '1'}" data-nick="${esc(a.nickname || a.uid)}"
           title="${a.disabled ? '解禁后重新参与选号（若上游仍在拦截会被再次禁用）' : '禁用后不再参与选号，重启后仍保持'}">
           ${a.disabled ? '解禁' : '禁用'}</button>
-        <button class="btn xs danger" data-del="${esc(a.uid)}" data-nick="${esc(a.nickname || a.uid)}">移除</button>
+        <button class="btn xs danger" data-del="${esc(a.uid)}" data-provider="${esc(a.provider || 'workbuddy')}"
+          data-nick="${esc(a.nickname || a.uid)}">移除</button>
       </td>
     </tr>`;
   }).join('');
@@ -250,6 +268,8 @@ function accountsTable(list, { compact = false } = {}) {
           title="只读查询所有账号余额（含国际版）。不发签到请求，不触发任何自动调用">查询余额</button>
         <button class="btn sm" data-checkin
           title="执行签到流程（上游只对国内版生效，国际版会被 D4 门控跳过）">签到</button>
+        ${list.some(a => a.provider === 'qoder') ? `<button class="btn sm" data-qcheckin-all
+          title="对全部 Qoder 账号执行活动签到（活动领取 + Credits）">Qoder 签到</button>` : ''}
         <button class="btn primary sm" data-add>+ 添加账号</button>
       </div>
     </div>
@@ -264,23 +284,35 @@ function accountsTable(list, { compact = false } = {}) {
 }
 
 function bindAccountActions(list) {
-  $$('[data-del]').forEach(b => b.onclick = () => confirmDelete(b.dataset.del, b.dataset.nick));
+  $$('[data-del]').forEach(b => b.onclick = () =>
+    confirmDelete(b.dataset.del, b.dataset.nick, b.dataset.provider));
   $$('[data-add]').forEach(b => b.onclick = addAccountFlow);
   $$('[data-checkin]').forEach(b => b.onclick = runCheckin);
   $$('[data-balance]').forEach(b => b.onclick = runBalance);
   $$('[data-toggle-enable]').forEach(b => b.onclick = () =>
     toggleAccountEnabled(b.dataset.toggleEnable, b.dataset.enabled === '0', b.dataset.nick, b));
   $$('[data-enable-all]').forEach(b => b.onclick = () => enableAllDisabled(list || S.accounts, b));
+  $$('[data-qcheckin-all]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const res = await api('/qoder/checkin', { method: 'POST', body: { only_daily: false } });
+      const s = res.summary || {};
+      toast(`Qoder 签到完成：${s.total || 0} 个账号，成功 ${(s.ok || 0) + (s.already || 0)}，失败 ${s.fail || 0}${s.earned_credit ? '，+' + s.earned_credit + ' 积分' : ''}`,
+        s.fail ? 'warn' : 'ok', 8000);
+      await render();
+    } catch (e) { toast(e.message, 'err', 7000); b.disabled = false; }
+  });
 }
 
 // toggleAccountEnabled 手动禁用 / 解禁单个账号。
 // enable=true 表示当前是禁用态、点击后要解禁。
 async function toggleAccountEnabled(uid, enable, nick, btn) {
   const label = enable ? '解禁' : '禁用';
+  const provider = btn ? btn.dataset.provider : '';
   const old = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = label + '中…'; }
   try {
-    const r = await api('/accounts/enable', { method: 'POST', body: { uid, enabled: enable } });
+    const r = await api('/accounts/enable', { method: 'POST', body: { uid, enabled: enable, provider } });
     toast(`${nick} ${r.msg || '已' + label}`);
     await render();
   } catch (e) {
@@ -297,7 +329,7 @@ async function enableAllDisabled(list, btn) {
   let okN = 0, failN = 0;
   for (const a of targets) {
     try {
-      await api('/accounts/enable', { method: 'POST', body: { uid: a.uid, enabled: true } });
+      await api('/accounts/enable', { method: 'POST', body: { uid: a.uid, enabled: true, provider: a.provider } });
       okN++;
     } catch { failN++; }
   }
@@ -378,16 +410,18 @@ async function runCheckin() {
   }
 }
 
-function confirmDelete(uid, nick) {
+function confirmDelete(uid, nick, provider = 'workbuddy') {
+  const dir = provider === 'qoder' ? 'qoder_auths/' : 'auths/';
   modal('移除账号', `
-    <div class="alert warn">将从 <code>auths/</code> 删除该账号的凭证文件，并立即从账号池移除。
+    <div class="alert warn">将从 <code>${dir}</code> 删除该账号的凭证文件，并立即从账号池移除。
       删除前会自动备份到 <code>backups/</code>。</div>
-    <dl class="kv"><dt>昵称</dt><dd>${esc(nick)}</dd><dt>UID</dt><dd>${esc(uid)}</dd></dl>`,
+    <dl class="kv"><dt>昵称</dt><dd>${esc(nick)}</dd><dt>UID</dt><dd>${esc(uid)}</dd>
+      <dt>上游</dt><dd>${provider === 'qoder' ? 'Qoder' : 'WorkBuddy'}</dd></dl>`,
     `<button class="btn" data-close>取消</button>
      <button class="btn danger" id="doDel">确认移除</button>`);
   $('#doDel').onclick = async () => {
     try {
-      const r = await api('/accounts/delete', { method: 'POST', body: { uid } });
+      const r = await api('/accounts/delete', { method: 'POST', body: { uid, provider } });
       closeModal(); toast(`已移除，剩余 ${r.accounts} 个账号`); render();
     } catch (e) { toast(e.message, 'err'); }
   };
@@ -407,8 +441,213 @@ async function viewAccounts() {
   bindAccountActions(S.accounts);
 }
 
-/* ── 添加账号（OAuth 三步）───────────────────────────── */
+/* ── Qoder 活动（签到 / 活动领取 / 额度）────────────── */
+const qoderSafeURL = u => (/^https?:\/\//i.test(u || '') ? u : '');
+
+async function viewQoder() {
+  const r = await api('/accounts');
+  S.accounts = r.accounts || [];
+  const qs = S.accounts.filter(a => a.provider === 'qoder');
+  if (!qs.length) {
+    $('#view').innerHTML = `<div class="card"><div class="empty">
+      Qoder 未启用或还没有 Qoder 账号。请在「账号管理」添加 Qoder 账号
+      （设备授权 / PAT / 账号文件导入）。</div></div>`;
+    return;
+  }
+  const uid = qs.some(a => a.uid === S.qoderUID) ? S.qoderUID : qs[0].uid;
+  S.qoderUID = uid;
+  const acct = qs.find(a => a.uid === uid) || qs[0];
+
+  let camp = null, campErr = '';
+  try {
+    camp = (await api('/qoder/campaigns?uid=' + encodeURIComponent(uid))).result;
+  } catch (e) { campErr = e.message; }
+  let act = { entries: [] };
+  try { act = await api('/qoder/activity?limit=100'); } catch { /* 无流水不算错误 */ }
+
+  const statusTag = s => {
+    const map = { CLAIMABLE: ['ok', '可领取'], CLAIMED: ['gray', '已领取'],
+      BLOCKED: ['err', '被拦截'], PENDING: ['warn', '待发放'], LOCKED: ['warn', '未解锁'] };
+    const [cls, label] = map[(s || '').toUpperCase()] || ['gray', s || '—'];
+    return `<span class="tag ${cls}">${esc(label)}</span>`;
+  };
+
+  const campRows = (camp?.campaigns || []).map(c => {
+    const claimable = (c.claim_status || '').toUpperCase() === 'CLAIMABLE';
+    const url = qoderSafeURL(c.detail_url);
+    return `<tr>
+      <td><div style="font-weight:500">${esc(c.title || c.key || c.id)}</div>
+        <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(c.key || c.id)}</div></td>
+      <td>${esc(c.benefit_kind || '—')}${c.benefit_amount ? ' · ' + c.benefit_amount : ''}</td>
+      <td>${statusTag(c.claim_status)}</td>
+      <td style="font-size:11.5px;color:var(--text-mute)">${esc(c.unavailable_reason || c.required_achievement_key || '')}</td>
+      <td style="white-space:nowrap">
+        ${claimable ? `<button class="btn xs primary" data-claim="${esc(c.id)}"
+          data-title="${esc(c.title || c.key || c.id)}">领取</button>` : ''}
+        ${url ? `<a class="btn xs" href="${esc(url)}" target="_blank" rel="noopener noreferrer">详情</a>` : ''}
+      </td></tr>`;
+  }).join('');
+
+  const codes = Object.entries(acct.credits_detail?.campaign_codes || {});
+  const pkgs = (acct.credits_detail?.packages || []).map(p =>
+    `<tr><td>${esc(p.label || p.kind || '—')}</td>
+      <td class="num">${p.unlimited ? '∞' : (p.remain ?? 0)}</td>
+      <td class="num">${p.size ?? 0}</td></tr>`).join('');
+
+  const actRows = (act.entries || []).slice().reverse().map(e => `<tr>
+    <td class="mono" style="font-size:11.5px">${esc(e.time ? fmtTime(e.time) : '—')}</td>
+    <td>${esc(e.nickname || e.uid || '')}</td>
+    <td>${esc(e.kind || '')}${e.campaign ? ' · ' + esc(e.campaign) : ''}</td>
+    <td class="num">${e.credits ? '+' + e.credits : '—'}</td>
+    <td>${statusTag(e.status)}</td>
+    <td style="font-size:11.5px;color:var(--text-mute)">${esc(e.message || '')}</td>
+  </tr>`).join('');
+
+  const opts = qs.map(a => `<option value="${esc(a.uid)}" ${a.uid === uid ? 'selected' : ''}>
+    ${esc(a.nickname || a.uid.slice(0, 12))} · ${a.realm === 'intl' ? '国际' : '国内'}${a.disabled ? '（已禁用）' : ''}
+  </option>`).join('');
+
+  $('#view').innerHTML = `
+    <div class="alert info">
+      签到走官方活动平台：先列出活动，再对可领取项 POST claim（幂等）。每日 10:00（UTC+8）
+      刷新名额；上游按「人」去重时本轮会显示 blocked，属正常。
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>运营操作</h3>
+        <div class="row-flex">
+          <select class="input" id="qAccount" style="min-width:260px">${opts}</select>
+          <button class="btn sm" data-qcheckin="daily" title="只领 Credits 类活动（每日签到）">每日签到</button>
+          <button class="btn sm" data-qcheckin="full" title="领取所有可领活动（含兑换码 / 券）">全额领取</button>
+          <button class="btn sm" data-qbalance title="只读刷新额度与套餐">刷新额度</button>
+          <button class="btn sm" data-qrefresh title="强制重新拉取活动列表">刷新活动</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="row-flex" style="gap:16px;flex-wrap:wrap;font-size:12.5px">
+          <span>套餐：<b>${esc(acct.plan || '—')}</b></span>
+          <span>最近签到：<b>${esc(acct.last_checkin || '—')}</b></span>
+          <span>余额：<b>${acct.credits ?? 0}</b></span>
+          <label class="row-flex" style="gap:6px;cursor:pointer">
+            <input type="checkbox" id="qPrefCheckin" ${acct.checkin_when_disabled ? 'checked' : ''}>
+            账号被禁用时也参与签到
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div style="height:16px"></div>
+    <div class="card">
+      <div class="card-head"><h3>活动任务中心</h3>
+        <span class="sub">${camp ? (camp.claimable ? '有可领取项' : '当前无可领取项') : ''}</span></div>
+      ${campErr ? `<div class="card-body"><div class="alert err">活动查询失败：${esc(campErr)}</div></div>`
+        : campRows ? `<div class="table-wrap"><table class="tbl">
+            <thead><tr><th>活动</th><th>奖励</th><th>状态</th><th>说明</th><th>操作</th></tr></thead>
+            <tbody>${campRows}</tbody></table></div>`
+        : `<div class="empty">当前没有活动可展示${camp && camp.hint ? '（' + esc(camp.hint) + '）' : ''}</div>`}
+    </div>
+
+    <div style="height:16px"></div>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="card-head"><h3>额度构成</h3></div>
+        <div class="card-body">
+          <dl class="kv">
+            <dt>剩余（有效）</dt><dd>${acct.credits_detail?.remain_effective ?? acct.credits ?? 0}</dd>
+            <dt>已用 / 总量</dt><dd>${acct.credits_detail?.used ?? 0} / ${acct.credits_detail?.size ?? 0}</dd>
+          </dl>
+          ${pkgs ? `<table class="tbl" style="margin-top:8px">
+            <thead><tr><th>资源包</th><th class="num">剩余</th><th class="num">总量</th></tr></thead>
+            <tbody>${pkgs}</tbody></table>` : ''}
+          ${codes.length ? `<div style="margin-top:10px;font-size:12.5px">
+            兑换码：${codes.map(([k, v]) => `<span class="mono">${esc(k)}=${esc(v)}</span>`).join('、')}</div>` : ''}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>活动流水</h3><span class="sub">最近 100 条</span></div>
+        <div class="table-wrap" style="max-height:320px;overflow:auto">
+          ${actRows ? `<table class="tbl">
+            <thead><tr><th>时间</th><th>账号</th><th>类型</th><th class="num">积分</th><th>状态</th><th>说明</th></tr></thead>
+            <tbody>${actRows}</tbody></table>` : '<div class="empty">还没有活动记录</div>'}
+        </div>
+      </div>
+    </div>`;
+
+  $('#qAccount').onchange = e => { S.qoderUID = e.target.value; render(); };
+  $('#qPrefCheckin').onchange = async e => {
+    try {
+      await api('/qoder/prefs', { method: 'POST', body: { uid, checkin_when_disabled: e.target.checked } });
+      toast('偏好已保存');
+      render();
+    } catch (err) { toast(err.message, 'err'); e.target.checked = !e.target.checked; }
+  };
+  $$('[data-qcheckin]').forEach(b => b.onclick = async () => {
+    const onlyDaily = b.dataset.qcheckin === 'daily';
+    b.disabled = true;
+    const old = b.textContent;
+    b.textContent = '执行中…';
+    try {
+      const res = await api('/qoder/checkin', { method: 'POST', body: { uids: [uid], only_daily: onlyDaily } });
+      const o = (res.outcomes || [])[0] || {};
+      const earned = o.earned_credit ? ` +${o.earned_credit}` : '';
+      toast(`签到 ${o.status || '完成'}${earned}${o.detail ? '：' + o.detail : ''}`,
+        o.status === 'fail' ? 'err' : 'ok', 7000);
+      render();
+    } catch (err) {
+      toast(err.message, 'err', 7000);
+      b.disabled = false;
+      b.textContent = old;
+    }
+  });
+  $$('[data-qbalance]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const res = await api('/qoder/balance', { method: 'POST', body: { uids: [uid] } });
+      const o = (res.outcomes || [])[0] || {};
+      toast(o.error ? '刷新失败：' + o.error : `余额已刷新：${o.credits ?? 0}`, o.error ? 'err' : 'ok');
+      render();
+    } catch (err) { toast(err.message, 'err'); b.disabled = false; }
+  });
+  $$('[data-qrefresh]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await api('/qoder/campaigns?uid=' + encodeURIComponent(uid) + '&force=1');
+      render();
+    } catch (err) { toast(err.message, 'err'); b.disabled = false; }
+  });
+  $$('[data-claim]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const res = await api('/qoder/campaign/claim', { method: 'POST', body: { uid, campaign_id: b.dataset.claim } });
+      const rr = res.result || {};
+      toast(rr.ok || rr.replayed ? `已领取：${b.dataset.title}` : `领取未成功：${rr.message || rr.error || ''}`,
+        rr.ok || rr.replayed ? 'ok' : 'warn', 7000);
+      render();
+    } catch (err) { toast(err.message, 'err', 7000); b.disabled = false; }
+  });
+}
+
+
+/* ── 添加账号（WorkBuddy OAuth / Qoder 三种接入）──────── */
 function addAccountFlow() {
+  let provider = 'workbuddy';
+
+  const renderProvider = () => {
+    modal('添加账号 · 选择类型', `
+      <p class="muted" style="margin-top:0">选择要接入的上游。同名模型会在两个上游之间混合调度。</p>
+      <div class="radio-row">
+        <div class="radio-card ${provider === 'workbuddy' ? 'sel' : ''}" data-pv="workbuddy">
+          <strong>WorkBuddy</strong><small>国内版 / 国际版 · OAuth 登录</small></div>
+        <div class="radio-card ${provider === 'qoder' ? 'sel' : ''}" data-pv="qoder">
+          <strong>Qoder</strong><small>设备授权 / PAT / 账号 JSON 导入</small></div>
+      </div>`,
+      `<button class="btn" data-close>取消</button><button class="btn primary" id="next0">下一步</button>`);
+    $$('[data-pv]').forEach(c => c.onclick = () => { provider = c.dataset.pv; renderProvider(); });
+    $('#next0').onclick = () => (provider === 'qoder' ? qoderFlow() : workbuddyFlow());
+  };
+
+  const workbuddyFlow = () => {
   let realm = 'global';
   let state = null;
   let pollTimer = null;
@@ -541,7 +780,132 @@ function addAccountFlow() {
       </dl>`,
       `<button class="btn primary" data-close>完成</button>`);
     $$('[data-close]').forEach(b => b.onclick = () => { closeModal(); render(); });
-  }
+  };
+  };
+
+  // qoderFlow：设备授权 / PAT / 账号 JSON 三合一弹窗。
+  const qoderFlow = () => {
+    let realm = 'cn';
+    let state = null;
+
+    const renderQoder = () => {
+      modal('添加 Qoder 账号', `
+        <p class="muted" style="margin-top:0">设备授权最省事；已持有令牌可用 PAT；账号 JSON 支持批量导入。</p>
+        <div class="radio-row">
+          <div class="radio-card ${realm === 'cn' ? 'sel' : ''}" data-r="cn">
+            <strong>国内版</strong><small>qoder.com.cn</small></div>
+          <div class="radio-card ${realm === 'intl' ? 'sel' : ''}" data-r="intl">
+            <strong>国际版</strong><small>qoder.com</small></div>
+        </div>
+        <div class="row-flex" style="margin-top:16px">
+          <button class="btn primary sm" id="qLogin">设备授权登录</button>
+        </div>
+        <div id="qLoginBox" style="margin-top:10px"></div>
+
+        <details class="form-section" style="margin-top:16px">
+          <summary>个人访问令牌（PAT）</summary>
+          <div class="field" style="margin-top:8px">
+            <label>PAT（pt- 开头）</label>
+            <input type="password" id="qPat" autocomplete="off" placeholder="pt-...">
+          </div>
+          <div class="row-flex" style="gap:8px">
+            <button class="btn sm" id="qPatBtn">导入 PAT</button>
+            <span class="muted" id="qPatMsg" style="font-size:12px;align-self:center"></span>
+          </div>
+        </details>
+
+        <details class="form-section">
+          <summary>账号文件导入（JSON）</summary>
+          <div class="field" style="margin-top:8px">
+            <label>粘贴 qoder-*.json 内容（单个对象 / 数组 / {"accounts":[...]}）</label>
+            <textarea id="qJson" rows="6" class="mono"
+              placeholder='{"uid":"...","accessToken":"...","refreshToken":"drt-..."}'></textarea>
+          </div>
+          <div class="row-flex" style="gap:8px">
+            <button class="btn sm" id="qImpBtn">导入</button>
+            <span class="muted" id="qImpMsg" style="font-size:12px;align-self:center"></span>
+          </div>
+        </details>`,
+        `<button class="btn" data-close>关闭</button>`);
+
+      $$('[data-r]').forEach(c => c.onclick = () => { realm = c.dataset.r; renderQoder(); });
+
+      $('#qLogin').onclick = async () => {
+        const box = $('#qLoginBox');
+        box.innerHTML = '<div class="muted">正在生成授权链接…</div>';
+        try {
+          const r = await api('/qoder/login/start', { method: 'POST', body: { realm } });
+          state = r.state;
+          box.innerHTML = `
+            <div class="url-box">${esc(r.authUrl || r.url || '')}</div>
+            <p class="muted" style="font-size:12px">在浏览器打开上面的链接完成授权，然后点击右侧按钮。</p>
+            <div class="row-flex" style="gap:8px">
+              <button class="btn primary sm" id="qPoll">我已完成授权</button>
+              <span class="muted" id="qPollMsg" style="font-size:12px;align-self:center"></span>
+            </div>`;
+          $('#qPoll').onclick = pollQoder;
+        } catch (e) {
+          box.innerHTML = `<div class="alert err">${esc(e.message)}</div>`;
+        }
+      };
+
+      $('#qPatBtn').onclick = async () => {
+        const pat = $('#qPat').value.trim();
+        if (!pat) { toast('请填写 PAT', 'err'); return; }
+        const b = $('#qPatBtn');
+        b.disabled = true; b.textContent = '导入中…';
+        try {
+          const r = await api('/qoder/pat', { method: 'POST', body: { pat, realm } });
+          closeModal();
+          toast(`已添加 Qoder 账号${r.account?.nickname ? '：' + r.account.nickname : ''}`);
+          render();
+        } catch (e) {
+          toast(e.message, 'err', 8000);
+          b.disabled = false; b.textContent = '导入 PAT';
+        }
+      };
+
+      $('#qImpBtn').onclick = async () => {
+        const raw = $('#qJson').value.trim();
+        if (!raw) { toast('请粘贴账号 JSON', 'err'); return; }
+        let payload;
+        try { payload = JSON.parse(raw); } catch (e) { toast('JSON 解析失败：' + e.message, 'err'); return; }
+        const b = $('#qImpBtn');
+        b.disabled = true; b.textContent = '导入中…';
+        try {
+          const r = await api('/qoder/import', { method: 'POST', body: payload });
+          closeModal();
+          const n = (r.imported || []).length, bad = (r.errors || []).length;
+          toast(`已导入 ${n} 个${bad ? `，失败 ${bad} 个` : ''}`, bad ? 'warn' : 'ok', 8000);
+          render();
+        } catch (e) {
+          toast(e.message, 'err', 8000);
+          b.disabled = false; b.textContent = '导入';
+        }
+      };
+    };
+
+    const pollQoder = async () => {
+      const btn = $('#qPoll');
+      if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+      const retry = (msg) => {
+        $('#qPollMsg').textContent = msg || '';
+        if (btn) { btn.disabled = false; btn.textContent = '再试一次'; }
+      };
+      try {
+        const r = await api(`/qoder/login/poll?state=${encodeURIComponent(state)}`);
+        if (r.status === 'pending') { retry(r.message || '尚未完成授权'); return; }
+        closeModal(); toast('Qoder 账号已添加'); render();
+      } catch (e) {
+        const p = e.payload || {};
+        retry(p.status === 'pending' ? (p.message || '尚未完成授权') : (p.message || e.message));
+      }
+    };
+
+    renderQoder();
+  };
+
+  renderProvider();
 }
 
 /* ── 配置页 ─────────────────────────────────────────── */
@@ -612,6 +976,23 @@ const SCHEMA = [
   { sec: '状态镜像 (Upstash Redis)', desc: '可选；留空则纯内存', fields: [
     { p: 'upstash.url', l: 'Upstash URL', t: 'text', h: '留空 = 纯内存模式' },
     { p: 'upstash.token', l: 'Upstash Token', t: 'secret', h: '' },
+  ]},
+  { sec: 'Qoder 第二上游', desc: '可选；与 WorkBuddy 按模型名混合调度', fields: [
+    { p: 'qoder.enabled', l: '启用 Qoder', t: 'bool', h: '关闭后 Qoder 账号与 qoder: 前缀均不可用' },
+    { p: 'qoder.auth_dir', l: 'Qoder 账号目录', t: 'text', h: '默认 ./qoder_auths；与 qoder2api-hub 账号文件兼容' },
+    { p: 'qoder.state_file', l: 'Qoder 状态文件', t: 'text', h: '冷却/熔断状态落盘路径' },
+    { p: 'qoder.weight', l: '混合调度权重', t: 'float', h: '同名模型选中 Qoder 的相对权重（WorkBuddy 固定 1.0）' },
+    { p: 'qoder.cosy_version', l: 'COSY 版本', t: 'text', h: '留空 = 内置默认 1.1.75' },
+    { p: 'qoder.timeout_seconds', l: '请求超时 (秒)', t: 'int', h: '' },
+    { p: 'qoder.guard.enabled', l: '单号并发闸门', t: 'bool', h: '限制同一 Qoder 账号的在途请求数并做节奏控制（防风控）' },
+    { p: 'qoder.guard.max_concurrency', l: '每号最大并发', t: 'int', h: '默认 1' },
+    { p: 'qoder.guard.min_gap_ms', l: '请求最小间隔 (ms)', t: 'int', h: '默认 400ms' },
+    { p: 'qoder.guard.max_wait_ms', l: '排队最长等待 (ms)', t: 'int', h: '超过后放行（fail-open），避免拖死请求' },
+    { p: 'qoder.guard.jitter_ms', l: '间隔抖动 (ms)', t: 'int', h: '默认 120ms' },
+    { p: 'qoder.web_tools', l: '本地 Web 工具', t: 'bool', h: '为 qoder: 强路由代跑 web_search / web_fetch（SSRF 防护）' },
+    { p: 'qoder.image_transcode', l: '内联 PNG 压缩', t: 'bool', h: '仅对能省 ≥20% 的大 PNG 生效，不联网' },
+    { p: 'qoder.pricing_file', l: '价格覆盖文件', t: 'text', h: '可选 JSON：{"model":{"in":..,"cached":..,"out":..}}（USD/1M）' },
+    { p: 'qoder.anthropic_thinking', l: 'Anthropic thinking 档位', t: 'text', h: 'off = 不启用（默认）；留空也按 off 处理' },
   ]},
   { sec: '管理面板', desc: '本页面自身', fields: [
     { p: 'panel.enabled', l: '启用管理面板', t: 'bool', h: '关闭后 /panel/ 不再可用（需重启）' },
@@ -733,17 +1114,24 @@ async function viewModels() {
   const r = await api('/models');
   const list = r.data || [];
   if (!list.length) { $('#view').innerHTML = `<div class="card"><div class="empty">暂无模型</div></div>`; return; }
-  const rows = list.map(m => `<tr>
+  const rows = list.map(m => {
+    const src = m.provider || m.owned_by || 'workbuddy';
+    const badge = src === 'qoder' ? '<span class="tag ok">Qoder</span>'
+      : src === 'merged' ? '<span class="tag warn">混合</span>'
+      : '<span class="tag purple">WorkBuddy</span>';
+    return `<tr>
       <td class="mono">${esc(m.id)}</td>
+      <td>${badge}${m.qoder_key ? `<div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(m.qoder_key)}</div>` : ''}</td>
       <td class="num">${m.context_length ? (m.context_length / 1024).toFixed(0) + 'K' : '—'}</td>
       <td>${(m.reasoning_supported_efforts || []).map(e => `<span class="tag gray">${esc(e)}</span>`).join(' ') || '—'}</td>
       <td>${m.reasoning_default_effort ? `<span class="tag info">${esc(m.reasoning_default_effort)}</span>` : '—'}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   $('#view').innerHTML = `<div class="card">
     <div class="card-head"><h3>可用模型 <span class="sub" style="font-weight:400">（${list.length} 个）</span></h3>
-      <span class="sub">无前缀 = 国内版；global: = 国际版</span></div>
+      <span class="sub">裸名 = 两上游混合调度；cn: / global: / qoder: 强制指定</span></div>
     <div class="table-wrap"><table class="tbl">
-      <thead><tr><th>模型 ID</th><th>上下文</th><th>推理档位</th><th>默认档位</th></tr></thead>
+      <thead><tr><th>模型 ID</th><th>来源</th><th>上下文</th><th>推理档位</th><th>默认档位</th></tr></thead>
       <tbody>${rows}</tbody></table></div></div>`;
 }
 
@@ -1080,6 +1468,116 @@ function initAutoRefresh() {
   };
   cb.onchange = () => { cb.checked ? start() : (clearInterval(S.timer), info.textContent = ''); };
   if (cb.checked) start();
+}
+
+/* ── 智能体配置 ─────────────────────────────────────── */
+async function viewAgents() {
+  const data = await api('/agents');
+  const list = data.clients || [];
+  S.agentClients = list;
+  const auto = list.filter(c => c.mode === 'automatic');
+  const manual = list.filter(c => c.mode !== 'automatic');
+  const baseURL = S.agentBaseURL || location.origin;
+
+  const row = c => `
+    <tr>
+      <td><strong>${esc(c.label)}</strong><div class="muted" style="font-size:11px">${esc(c.desc)}</div></td>
+      <td>${c.installed ? '<span class="tag ok">已安装</span>' : '<span class="tag gray">未检测到</span>'}
+          ${c.configured ? '<span class="tag warn">已接入</span>' : ''}
+          <div class="muted" style="font-size:11px">${esc((c.evidence || []).join(' · ') || '—')}</div></td>
+      <td class="mono" style="font-size:11px">${esc((c.config_paths || []).join('\n') || '—')}</td>
+      <td style="white-space:nowrap">
+        ${c.mode === 'automatic'
+          ? `<button class="btn sm" data-plan="${esc(c.id)}">预览</button>
+             <button class="btn sm" data-apply="${esc(c.id)}">接入</button>
+             ${c.configured ? `<button class="btn sm warn" data-restore="${esc(c.id)}">还原</button>` : ''}`
+          : `<button class="btn sm" data-guide="${esc(c.id)}">接入指引</button>`}
+      </td>
+    </tr>`;
+
+  $('#view').innerHTML = `
+    <div class="card">
+      <div class="row-flex" style="gap:10px;align-items:end">
+        <div class="field" style="flex:2;min-width:240px"><label>网关地址</label>
+          <input id="agBase" value="${esc(baseURL)}" placeholder="http://127.0.0.1:8787"></div>
+        <div class="field" style="flex:2;min-width:200px"><label>API Key</label>
+          <input id="agKey" type="password" placeholder="面板/网关的 API Key"></div>
+        <div class="field" style="flex:1;min-width:160px"><label>默认模型</label>
+          <input id="agModel" value="${esc(S.agentModel || '')}" placeholder="如 qoder:DeepSeek-V4-Pro"></div>
+      </div>
+      <p class="muted" style="margin:8px 0 0">Key 只写入客户端本地配置；网关 state 仅保存 sha256。写入前会备份原件，还原回到首次接入前。</p>
+    </div>
+    <div class="card"><h3>可一键接入</h3>
+      <table class="tbl"><thead><tr><th>客户端</th><th>状态</th><th>配置文件</th><th>操作</th></tr></thead>
+      <tbody>${auto.map(row).join('')}</tbody></table></div>
+    <div class="card"><h3>仅检测 / 手动接入</h3>
+      <table class="tbl"><thead><tr><th>客户端</th><th>状态</th><th>配置</th><th>操作</th></tr></thead>
+      <tbody>${manual.map(row).join('')}</tbody></table></div>`;
+
+  const ctx = () => {
+    const body = { base_url: $('#agBase').value.trim(), api_key: $('#agKey').value, model: $('#agModel').value.trim() };
+    S.agentBaseURL = body.base_url; S.agentModel = body.model;
+    return body;
+  };
+  const needKey = () => {
+    if (!$('#agKey').value.trim()) { toast('请先填 API Key', 'err'); return false; }
+    return true;
+  };
+
+  $$('[data-plan]').forEach(b => b.onclick = async () => {
+    if (!needKey()) return;
+    b.disabled = true;
+    try {
+      const r = await api('/agents/plan', { method: 'POST', body: { client: b.dataset.plan, ...ctx() } });
+      showAgentPlan(r.plan, '预览（尚未写入）');
+    } catch (e) { toast(e.message, 'err'); } finally { b.disabled = false; }
+  });
+  $$('[data-apply]').forEach(b => b.onclick = async () => {
+    if (!needKey()) return;
+    b.disabled = true;
+    try {
+      const r = await api('/agents/apply', { method: 'POST', body: { client: b.dataset.apply, ...ctx() } });
+      const files = (r.result.files || []).map(f => f.path).join('\n');
+      toast(`已接入 ${r.result.label}`);
+      modal('接入完成', `<p>已写入并备份：</p><pre class="code">${esc(files)}</pre>`);
+      render();
+    } catch (e) { toast(e.message, 'err'); } finally { b.disabled = false; }
+  });
+  $$('[data-restore]').forEach(b => b.onclick = async () => {
+    if (!confirm('还原到首次接入前的状态？')) return;
+    try {
+      const r = await api('/agents/restore', { method: 'POST', body: { client: b.dataset.restore } });
+      toast(`已还原 ${r.result.label}`);
+      render();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  $$('[data-guide]').forEach(b => b.onclick = () => {
+    const c = S.agentClients.find(x => x.id === b.dataset.guide);
+    const guide = (c.guide || '').replaceAll('{BASE_URL_V1}', $('#agBase').value.trim());
+    modal(c.label, `<p>${esc(c.desc)}</p><pre class="code" style="white-space:pre-wrap">${esc(guide)}</pre>
+      ${c.docs_url ? `<p><a href="${esc(c.docs_url)}" target="_blank" rel="noopener">官方文档</a></p>` : ''}`);
+  });
+}
+
+function showAgentPlan(plan, title) {
+  const files = plan.files || [];
+  const body = files.length
+    ? files.map(f => `<div class="muted mono" style="margin-top:8px">${esc(f.path)}${f.existed ? '（已存在，将备份）' : '（新建）'}</div>
+        <pre class="code" style="white-space:pre-wrap">${esc(f.content)}</pre>`).join('')
+    : `<p>${esc(plan.guide || '请参考官方配置指引。')}</p>`;
+  modal(`${title} · ${plan.label}`, body,
+    files.length ? `<button class="btn" data-close>关闭</button><button class="btn primary" id="agGo">确认写入</button>` : '');
+  const go = $('#agGo');
+  if (go) go.onclick = async () => {
+    go.disabled = true;
+    try {
+      await api('/agents/apply', { method: 'POST', body: {
+        client: plan.client, base_url: $('#agBase').value.trim(),
+        api_key: $('#agKey').value, model: $('#agModel').value.trim(),
+      } });
+      closeModal(); toast('已接入'); render();
+    } catch (e) { toast(e.message, 'err'); go.disabled = false; }
+  };
 }
 
 /* ── 启动 ───────────────────────────────────────────── */

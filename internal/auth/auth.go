@@ -3,6 +3,8 @@
 package auth
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,6 +18,12 @@ import (
 	"workbuddy2api/internal/logfmt"
 )
 
+// Provider 标识账号所属上游。
+const (
+	ProviderWorkBuddy = "workbuddy"
+	ProviderQoder     = "qoder"
+)
+
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
@@ -25,22 +33,156 @@ type Auth struct {
 	RefreshToken string
 	ExpiresAt    int64 // Unix 秒
 	Domain       string
+	// provider 账号所属上游（空 = workbuddy）。由加载路径决定：
+	// workbuddy*.json 恒为 workbuddy，qoder*.json 恒为 qoder。
+	provider string
+	// PersonalToken 仅 Qoder：pt- 个人访问令牌（refresh 的最终兜底）。
+	PersonalToken string
+	// UserType / OrganizationID / OrganizationName 仅 Qoder：COSY 身份体字段。
+	UserType         string
+	OrganizationID   string
+	OrganizationName string
 	// realm 账号域（"cn" / "global"），落盘于 auth.realm（嵌套形）或顶层 realm（扁平形）。
 	// 空 = 缺省：Realm() 按 domain 后缀回落，最终恒非空。
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm          string
-	UID            string
-	EnterpriseID   string
-	Nickname       string
-	FilePath       string // 来源文件；refresh 后原子写回此处
+	realm        string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// 以下字段仅 Qoder：原样保留以写回与 qoder2api-hub 兼容的账号文件。
+	Platform string
+	Group    string
+	Source   string
+	AddedAt  float64
+	// VpcEndpoint 企业 VPC 专属实例（qoder*.json 的 vpcEndpoint 键）。
+	// 空 = 跟随区域公网端点；非空时该账号的所有 openapi 请求走实例域名。
+	VpcEndpoint string
+
+	// ── Qoder 运营状态（与 qoder2api-hub 账号文件字段一一对应）──
+	LastCheckin          string            `json:"lastCheckin,omitempty"`
+	CheckinWhenDisabled  bool              `json:"checkinWhenDisabled,omitempty"`
+	Plan                 string            `json:"plan,omitempty"`
+	Credits              map[string]any    `json:"credits,omitempty"`
+	LastCreditsDelta     int64             `json:"lastCreditsDelta,omitempty"`
+	LastCreditsDeltaAt   int64             `json:"lastCreditsDeltaAt,omitempty"`
+	CampaignCodes        map[string]string `json:"campaignCodes,omitempty"`
+	CampaignBlockedUntil map[string]int64  `json:"campaignBlockedUntil,omitempty"`
+}
+
+// QoderState 账号运营状态的快照副本（积分 / 签到 / 活动），供面板与调度器读取。
+type QoderState struct {
+	LastCheckin          string
+	CheckinWhenDisabled  bool
+	Plan                 string
+	Credits              map[string]any
+	LastCreditsDelta     int64
+	LastCreditsDeltaAt   int64
+	CampaignCodes        map[string]string
+	CampaignBlockedUntil map[string]int64
+}
+
+// QoderStateSnapshot 返回运营状态的深拷贝（调用方无需再持锁）。
+func (a *Auth) QoderStateSnapshot() QoderState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.qoderStateLocked()
+}
+
+func (a *Auth) qoderStateLocked() QoderState {
+	s := QoderState{
+		LastCheckin:         a.LastCheckin,
+		CheckinWhenDisabled: a.CheckinWhenDisabled,
+		Plan:                a.Plan,
+		LastCreditsDelta:    a.LastCreditsDelta,
+		LastCreditsDeltaAt:  a.LastCreditsDeltaAt,
+	}
+	if a.Credits != nil {
+		s.Credits = make(map[string]any, len(a.Credits))
+		for k, v := range a.Credits {
+			s.Credits[k] = v
+		}
+	}
+	if a.CampaignCodes != nil {
+		s.CampaignCodes = make(map[string]string, len(a.CampaignCodes))
+		for k, v := range a.CampaignCodes {
+			s.CampaignCodes[k] = v
+		}
+	}
+	if a.CampaignBlockedUntil != nil {
+		s.CampaignBlockedUntil = make(map[string]int64, len(a.CampaignBlockedUntil))
+		for k, v := range a.CampaignBlockedUntil {
+			s.CampaignBlockedUntil[k] = v
+		}
+	}
+	return s
+}
+
+func (a *Auth) applyQoderStateLocked(s QoderState) {
+	a.LastCheckin = s.LastCheckin
+	a.CheckinWhenDisabled = s.CheckinWhenDisabled
+	a.Plan = s.Plan
+	a.Credits = s.Credits
+	a.LastCreditsDelta = s.LastCreditsDelta
+	a.LastCreditsDeltaAt = s.LastCreditsDeltaAt
+	a.CampaignCodes = s.CampaignCodes
+	a.CampaignBlockedUntil = s.CampaignBlockedUntil
+}
+
+// UpdateQoderState 在锁内修改运营状态并原子写回账号文件。
+// mut 拿到的是当前状态的副本，修改后整体应用；返回落盘错误（状态本身已生效）。
+func (a *Auth) UpdateQoderState(mut func(*QoderState)) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.qoderStateLocked()
+	mut(&s)
+	a.applyQoderStateLocked(s)
+	if a.FilePath == "" {
+		return nil
+	}
+	return a.saveQoderLocked()
+}
+
+// CheckedInToday 报告本地是否已为 now 所在自然日盖章签到。
+func (a *Auth) CheckedInToday(now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.HasPrefix(a.LastCheckin, now.Format("2006-01-02"))
+}
+
+// CreditsRemain 返回最近一次余额快照的有效剩余积分（无快照返回 0）。
+func (a *Auth) CreditsRemain() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return creditsRemainOf(a.Credits)
+}
+
+func creditsRemainOf(m map[string]any) int64 {
+	if m == nil {
+		return 0
+	}
+	for _, k := range []string{"remain_effective", "remain"} {
+		if v, ok := m[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				return int64(n)
+			case int64:
+				return n
+			case int:
+				return int64(n)
+			}
+		}
+	}
+	return 0
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -64,11 +206,34 @@ func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
 // GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
 func GlobalEnabled() bool { return globalEnabled.Load() }
 
-// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
-// 否则 "cn"。显式 global 优先于 domain 回落（D1）。
-// 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
-// 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
+// Provider 返回账号所属上游（空 = workbuddy）。
+func (a *Auth) Provider() string {
+	if a.provider == "" {
+		return ProviderWorkBuddy
+	}
+	return a.provider
+}
+
+// SetProvider 设置账号上游（反序列化/测试用）。
+func (a *Auth) SetProvider(p string) { a.provider = p }
+
+// IsQoder 报告账号是否为 Qoder 上游。
+func (a *Auth) IsQoder() bool { return a.Provider() == ProviderQoder }
+
+// Realm 返回账号的归一化域：
+//   - Qoder：cn / intl（来自 qoder*.json 的 realm 字段，缺省 cn），不受 global 逃生门影响；
+//   - WorkBuddy：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，否则 "cn"。
+//
+// 显式 global 优先于 domain 回落（D1）。WorkBuddy 全局开关 SetGlobalEnabled(false)
+// 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。空 realm + 空 domain → "cn"。
 func (a *Auth) Realm() string {
+	if a.Provider() == ProviderQoder {
+		if strings.EqualFold(strings.TrimSpace(a.realm), "intl") ||
+			strings.EqualFold(strings.TrimSpace(a.realm), "global") {
+			return "intl"
+		}
+		return "cn"
+	}
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -217,6 +382,9 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
+	if a.Provider() == ProviderQoder {
+		return a.saveQoderLocked()
+	}
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
@@ -245,6 +413,253 @@ func (a *Auth) SaveAtomic() error {
 		return err
 	}
 	return os.Rename(tmp, a.FilePath)
+}
+
+// saveQoderLocked 以 qoder2api-hub 账号文件形状写回（调用方已持 a.mu）。
+// 保持字段名与 Python 侧一致，使同一份账号文件可在两个网关间直接复用。
+func (a *Auth) saveQoderLocked() error {
+	// 先读回原文件，保留 credits / 签到等本网关不管理的键（qoder2api-hub 可能仍在用）。
+	doc := map[string]any{}
+	if old, err := os.ReadFile(a.FilePath); err == nil {
+		_ = json.Unmarshal(old, &doc)
+	}
+	for k, v := range map[string]any{
+		"uid":                 a.UID,
+		"nickname":            a.Nickname,
+		"group":               a.Group,
+		"domain":              a.Domain,
+		"realm":               a.Realm(),
+		"platform":            a.Platform,
+		"accessToken":         a.AccessToken,
+		"refreshToken":        a.RefreshToken,
+		"personalToken":       a.PersonalToken,
+		"expiresAt":           a.ExpiresAt,
+		"addedAt":             a.AddedAt,
+		"source":              a.Source,
+		"enabled":             true,
+		"userType":            a.UserType,
+		"organizationId":      a.OrganizationID,
+		"organizationName":    a.OrganizationName,
+		"plan":                a.Plan,
+		"lastCheckin":         a.LastCheckin,
+		"checkinWhenDisabled": bool(a.CheckinWhenDisabled),
+		"lastCreditsDelta":    a.LastCreditsDelta,
+		"lastCreditsDeltaAt":  a.LastCreditsDeltaAt,
+	} {
+		doc[k] = v
+	}
+	if a.VpcEndpoint != "" {
+		doc["vpcEndpoint"] = a.VpcEndpoint
+	}
+	// 运营快照非空才写键：保留 Python 侧对「缺键 = 未知」的判定语义，
+	// 也避免在纯凭证文件里塞空对象。
+	if a.Credits != nil {
+		doc["credits"] = a.Credits
+	}
+	if a.CampaignCodes != nil {
+		doc["campaignCodes"] = a.CampaignCodes
+	}
+	if a.CampaignBlockedUntil != nil {
+		doc["campaignBlockedUntil"] = a.CampaignBlockedUntil
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := a.FilePath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.FilePath)
+}
+
+// qoderFile Qoder 账号文件形状（qoder2api-hub accounts/*.json）。
+type qoderFile struct {
+	UID                  string            `json:"uid"`
+	Nickname             string            `json:"nickname"`
+	Group                string            `json:"group"`
+	Domain               string            `json:"domain"`
+	Realm                string            `json:"realm"`
+	VpcEndpoint          string            `json:"vpcEndpoint"`
+	Platform             string            `json:"platform"`
+	AccessToken          string            `json:"accessToken"`
+	RefreshToken         string            `json:"refreshToken"`
+	PersonalToken        string            `json:"personalToken"`
+	ExpiresAt            int64             `json:"expiresAt"`
+	AddedAt              float64           `json:"addedAt"`
+	Source               string            `json:"source"`
+	Enabled              *bool             `json:"enabled"`
+	UserType             string            `json:"userType"`
+	OrganizationID       string            `json:"organizationId"`
+	OrganizationName     string            `json:"organizationName"`
+	Plan                 string            `json:"plan"`
+	LastCheckin          string            `json:"lastCheckin"`
+	CheckinWhenDisabled  bool              `json:"checkinWhenDisabled"`
+	Credits              map[string]any    `json:"credits"`
+	LastCreditsDelta     int64             `json:"lastCreditsDelta"`
+	LastCreditsDeltaAt   int64             `json:"lastCreditsDeltaAt"`
+	CampaignCodes        map[string]string `json:"campaignCodes"`
+	CampaignBlockedUntil map[string]int64  `json:"campaignBlockedUntil"`
+}
+
+// ParseQoder 解析 qoder2api-hub 形状的账号文件。
+func ParseQoder(raw []byte) (*Auth, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty qoder auth file")
+	}
+	var f qoderFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("storage_parse_error: %w", err)
+	}
+	if strings.TrimSpace(f.AccessToken) == "" && strings.TrimSpace(f.PersonalToken) == "" {
+		return nil, fmt.Errorf("parse_error: missing accessToken/personalToken")
+	}
+	realm := strings.ToLower(strings.TrimSpace(f.Realm))
+	if realm == "" {
+		realm = detectQoderRealm(f.Domain)
+	}
+	if realm == "global" {
+		realm = "intl"
+	}
+	if realm != "intl" {
+		realm = "cn"
+	}
+	a := &Auth{
+		AccessToken:          f.AccessToken,
+		RefreshToken:         f.RefreshToken,
+		ExpiresAt:            f.ExpiresAt,
+		Domain:               f.Domain,
+		realm:                realm,
+		provider:             ProviderQoder,
+		PersonalToken:        f.PersonalToken,
+		UserType:             f.UserType,
+		OrganizationID:       f.OrganizationID,
+		OrganizationName:     f.OrganizationName,
+		UID:                  f.UID,
+		Nickname:             f.Nickname,
+		Platform:             f.Platform,
+		Group:                f.Group,
+		Source:               f.Source,
+		AddedAt:              f.AddedAt,
+		VpcEndpoint:          f.VpcEndpoint,
+		Plan:                 f.Plan,
+		LastCheckin:          f.LastCheckin,
+		CheckinWhenDisabled:  f.CheckinWhenDisabled,
+		Credits:              f.Credits,
+		LastCreditsDelta:     f.LastCreditsDelta,
+		LastCreditsDeltaAt:   f.LastCreditsDeltaAt,
+		CampaignCodes:        f.CampaignCodes,
+		CampaignBlockedUntil: f.CampaignBlockedUntil,
+	}
+	if a.Platform == "" {
+		a.Platform = "CLI"
+	}
+	if a.Source == "" {
+		a.Source = "oauth"
+	}
+	if a.AddedAt == 0 {
+		a.AddedAt = float64(time.Now().UnixNano()) / 1e9
+	}
+	if a.UID == "" {
+		// 缺 uid 的旧文件：用 token 派生的短标识占位，保持账号唯一可寻址。
+		a.UID = "q-" + shortHash(a.AccessToken+a.PersonalToken)
+	}
+	if a.Nickname == "" {
+		a.Nickname = "u" + tail(a.UID, 8)
+	}
+	return a, nil
+}
+
+// NewQoderAuth 构造一个新 Qoder 账号（登录/导入路径使用）。
+func NewQoderAuth(uid, nickname, accessToken, refreshToken, personalToken, realm, source string) *Auth {
+	realm = strings.ToLower(strings.TrimSpace(realm))
+	if realm != "intl" {
+		realm = "cn"
+	}
+	domain := "qoder.com.cn"
+	if realm == "intl" {
+		domain = "qoder.com"
+	}
+	if uid == "" {
+		uid = "q-" + shortHash(accessToken+personalToken+fmt.Sprint(time.Now().UnixNano()))
+	}
+	if nickname == "" {
+		nickname = "u" + tail(uid, 8)
+	}
+	return &Auth{
+		AccessToken:   accessToken,
+		RefreshToken:  refreshToken,
+		PersonalToken: personalToken,
+		realm:         realm,
+		provider:      ProviderQoder,
+		Domain:        domain,
+		UID:           uid,
+		Nickname:      nickname,
+		Platform:      "CLI",
+		Source:        source,
+		AddedAt:       float64(time.Now().UnixNano()) / 1e9,
+	}
+}
+
+// QoderFilePath 返回账号在 dir 下的落盘路径（qoder-<safe uid>.json）。
+func QoderFilePath(dir, uid string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, uid)
+	safe = strings.Trim(safe, "_")
+	if safe == "" {
+		safe = shortHash(uid)
+	}
+	return filepath.Join(dir, "qoder-"+safe+".json")
+}
+
+// LoadQoderDir 扫描 dir 下 qoder*.json；解析失败的文件静默跳过。
+func LoadQoderDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "qoder*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Auth
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		a, err := ParseQoder(raw)
+		if err != nil {
+			log.Printf("WARN: qoder auth %s skipped: %v", f, err)
+			continue
+		}
+		a.FilePath = f
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// detectQoderRealm 按 domain 推断 Qoder 区域（qoder.com.cn / 其它 CN 域 → cn）。
+func detectQoderRealm(domain string) string {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	if strings.Contains(d, "qoder.sh") || (strings.HasSuffix(d, "qoder.com") && !strings.Contains(d, "qoder.com.cn")) {
+		return "intl"
+	}
+	return "cn"
+}
+
+func shortHash(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:8])
+}
+
+func tail(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。

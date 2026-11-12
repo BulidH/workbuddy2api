@@ -65,5 +65,25 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "qoder": {
+    "enabled": false,
+    "auth_dir": "./qoder_auths",
+    "state_file": "./data/qoder_state.json",
+    "weight": 1.0,
+    "cosy_version": "1.1.75",
+    "timeout_seconds": 600,
+    "anthropic_thinking": "off",
+    "image_transcode": true,
+    "web_tools": false,
+    "pricing_file": "",
+    "guard": {
+      "enabled": true,
+      "max_concurrency": 1,
+      "min_gap_ms": 400,
+      "max_wait_ms": 20000,
+      "jitter_ms": 120
+    },
+    "endpoints": {}
   }
 }

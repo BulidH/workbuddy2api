@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/guard"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -53,6 +55,23 @@ type Config struct {
 	// Panel 内置 Web 管理面板（可选）。nil = 不注册 /panel/* 路由（零回归）。
 	// 由 cmd/server 装配后注入，面板自身不感知 pool/upstream 细节。
 	Panel http.Handler
+
+	// Qoder 第二上游（可选；nil = 关闭，纯 WorkBuddy）。
+	// QoderPool 与 Pool 结构相同但独立运行，冷却/熔断/在途租约互不影响。
+	Qoder       *qoder.Client
+	QoderPool   *pool.Pool
+	QoderWeight float64 // 裸名合并调度的相对权重（默认 1.0）
+
+	// AnthropicThinking Anthropic 桥接的 thinking 输出模式："off"（默认，不暴露）
+	// / "empty"（暴露空签名 thinking 块）。
+	AnthropicThinking string
+
+	// QoderGuard Qoder 出站闸门（可选；nil = 不做节奏/并发等待）。
+	QoderGuard *guard.Gate
+	// QoderPrices 用户覆盖的参考价（nil = 只用内置表）。
+	QoderPrices map[string]qoder.Price
+	// QoderWebTools 允许网关本地执行 web_search / web_fetch。
+	QoderWebTools bool
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -93,6 +112,10 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// 协议桥接：Anthropic Messages / OpenAI Responses 复用同一条 chat 主链路。
+	h.mux.HandleFunc("POST /v1/messages", h.withBridgeAuth(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withBridgeAuth(h.anthropicCountTokens))
+	h.mux.HandleFunc("POST /v1/responses", h.withBridgeAuth(h.responses))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// 内置管理面板：挂在 /panel/ 下，与 OpenAI 兼容面完全隔离。
@@ -136,12 +159,21 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
-	writeJSON(w, status, map[string]any{
+	payload := map[string]any{
 		"healthy":        healthy,
 		"total":          total,
 		"service":        ServiceName,
 		"realm_servable": realmServable,
-	})
+		"images":         qoder.ImageStatus(),
+	}
+	if h.cfg.QoderGuard != nil {
+		payload["risk"] = h.cfg.QoderGuard.Snapshot()
+	}
+	if h.cfg.QoderPool != nil {
+		qt, qh, qc, qd, qi := h.cfg.QoderPool.CountsDetailed()
+		payload["qoder"] = countsMapFrom(qt, qh, qc, qd, qi)
+	}
+	writeJSON(w, status, payload)
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
@@ -162,10 +194,24 @@ func (h *Handler) StatusPayload() map[string]any {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	providers := map[string]map[string]int{
+		auth.ProviderWorkBuddy: countsMapFrom(total, healthy, cooling, disabled, inFlightFull),
+	}
+	accounts := h.cfg.Pool.List()
+	if h.cfg.QoderPool != nil {
+		qt, qh, qc, qd, qi := h.cfg.QoderPool.CountsDetailed()
+		providers[auth.ProviderQoder] = countsMapFrom(qt, qh, qc, qd, qi)
+		accounts = append(accounts, h.cfg.QoderPool.List()...)
+		total += qt
+		healthy += qh
+		cooling += qc
+		disabled += qd
+		inFlightFull += qi
+	}
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	return map[string]any{
-		"accounts":       h.cfg.Pool.List(),
+		"accounts":       accounts,
 		"total":          total,
 		"healthy":        healthy,
 		"cooling":        cooling,
@@ -175,8 +221,11 @@ func (h *Handler) StatusPayload() map[string]any {
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
 		},
+		"providers":       providers,
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		"images":          qoder.ImageStatus(),
+		"risk":            h.cfg.QoderGuard.Snapshot(),
 	}
 }
 
@@ -315,6 +364,69 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	if h.cfg.Qoder != nil {
+		out = h.appendQoderModels(out)
+	}
+	return out
+}
+
+// appendQoderModels 把 Qoder 目录合并进模型清单（裸名路由协议）。
+//
+//   - 与 WorkBuddy 模型归一化同名（如 deepseek-v4-pro ↔ DeepSeek-V4-Pro）→ 只保留
+//     一条裸名，owned_by="merged"：同一个模型名底层可混合走两个 Provider；
+//   - Qoder 独有模型 → 以 display_name 暴露，owned_by="qoder"（key 仍可作为别名调用）。
+func (h *Handler) appendQoderModels(out []map[string]any) []map[string]any {
+	wbBare := map[string]string{} // 归一化名 → WorkBuddy 裸模型名
+	for _, e := range out {
+		id, _ := e["id"].(string)
+		bare := id
+		if idx := strings.IndexByte(bare, ':'); idx > 0 {
+			bare = bare[idx+1:]
+		}
+		if n := qoder.NormalizeModelName(bare); n != "" {
+			wbBare[n] = bare
+		}
+	}
+	seen := map[string]bool{}
+	for _, realm := range h.cfg.Qoder.Catalog.Realms() {
+		for _, mi := range h.cfg.Qoder.Catalog.Models(realm) {
+			if !mi.Enabled() || mi.Key == "auto" || mi.Key == "ultimate" ||
+				mi.Key == "performance" || mi.Key == "efficient" {
+				continue
+			}
+			norm := qoder.NormalizeModelName(mi.Name())
+			if norm == "" || seen[norm] {
+				continue
+			}
+			seen[norm] = true
+			entry := map[string]any{
+				"object":         "model",
+				"created":        time.Now().Unix(),
+				"context_length": mi.MaxInputToken,
+			}
+			if merged, ok := wbBare[norm]; ok {
+				entry["id"] = merged
+				entry["owned_by"] = "merged"
+				entry["provider"] = "merged"
+				entry["qoder_key"] = mi.Key
+			} else {
+				entry["id"] = mi.Name()
+				entry["owned_by"] = "qoder"
+				entry["provider"] = "qoder"
+				entry["qoder_key"] = mi.Key
+			}
+			for k, v := range mi.MetaView(time.Now(), h.cfg.QoderPrices) {
+				entry[k] = v
+			}
+			if mi.IsVL {
+				entry["supports_images"] = true
+			}
+			if mi.IsReasoning {
+				entry["reasoning"] = true
+			}
+			out = append(out, entry)
+		}
+	}
 	return out
 }
 
@@ -423,16 +535,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
-	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
+	// 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑。
+	// 必须在路由/轮转之前分流，否则改写的 function 声明会原样发给上游却无人执行。
+	if h.tryQoderWebTools(w, r, body, peek.Model, peek.Stream) {
+		return
+	}
+
+	// 路由解析：qoder:<model> 强制 Qoder；cn:/global:<model> 强制 WorkBuddy 对应 realm；
+	// 裸名 = 合并调度（按归一化名称同时匹配两个 Provider 目录）。
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	forced, realm, bareModel := resolveRoute(peek.Model)
+	if forced == auth.ProviderQoder && !h.qoderSupports(bareModel) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_not_found",
+			fmt.Sprintf("model %q is not available on qoder", bareModel))
+		return
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
 
-	tried := map[string]bool{}
+	providers := h.providerCandidates(forced, bareModel)
+	if len(providers) == 0 {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
+			"all accounts are temporarily unavailable, please retry later")
+		st.status = http.StatusServiceUnavailable
+		return
+	}
+	tried := map[string]map[string]bool{
+		auth.ProviderWorkBuddy: {},
+		auth.ProviderQoder:     {},
+	}
+	providerIdx := 0
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
@@ -465,15 +599,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
+	// 租约归属的池随 Provider 变化（Qoder 与 WorkBuddy 各自计在途）。
 	var heldUID string
+	var heldPool *pool.Pool
 	defer func() {
-		if heldUID != "" {
-			h.cfg.Pool.Release(heldUID)
+		if heldUID != "" && heldPool != nil {
+			heldPool.Release(heldUID)
 		}
 	}()
 	releaseHeld := func() {
-		if heldUID != "" {
-			h.cfg.Pool.Release(heldUID)
+		if heldUID != "" && heldPool != nil {
+			heldPool.Release(heldUID)
 			heldUID = ""
 		}
 	}
@@ -535,30 +671,52 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+	attempts := 0
+	for attempts < h.cfg.MaxRotate && providerIdx < len(providers) {
+		provider := providers[providerIdx]
+		ap := h.poolFor(provider)
+		if ap == nil {
+			providerIdx++
+			continue
+		}
+		triedThis := tried[provider]
+
+		// 选号：粘性号优先（仅当绑定号属于当前 Provider），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+			if sp, sprovider := h.stickyPool(stickyUID); sp == nil {
+				// 绑定号已从任何池移除（删号）→ 解绑，回落普通轮换。
 				unbindSticky()
+			} else if sprovider == provider {
+				acct = sp.PickByUIDForModel(stickyUID, bareModel)
+				if acct == nil || (provider == auth.ProviderWorkBuddy && realm != "" && acct.Realm() != realm) {
+					// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+					unbindSticky()
+					acct = nil
+				}
 			}
 		}
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
-			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// （healthyForModel），realm 谓词过滤跨域账号。Qoder 账号 cn/intl 双区
+			// 由模型目录做跨区匹配，此处不按 realm 过滤。
+			if provider == auth.ProviderQoder {
+				acct = ap.PickExcludingForRealm(triedThis, bareModel, "")
+			} else {
+				acct = ap.PickExcludingForRealm(triedThis, bareModel, realm)
+			}
 		}
 		if acct == nil {
-			st.status = http.StatusServiceUnavailable
-			break
+			// 当前 Provider 无可用账号 → 降级到下一个 Provider（跨 Provider failover）。
+			providerIdx++
+			continue
 		}
+		attempts++
 		st.uid = acct.UID
-		tried[acct.UID] = true
+		triedThis[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
-		if !h.cfg.Pool.Acquire(acct.UID) {
+		if !ap.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
@@ -567,26 +725,35 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue // 最后一个名额被并发抢走 → 换号
 		}
 		heldUID = acct.UID
+		heldPool = ap
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-				lastErr = err
+			var rerr error
+			if provider == auth.ProviderQoder {
+				rerr = h.cfg.Qoder.RefreshToken(r.Context(), acct) // 内部落盘并失效 COSY 会话
+			} else {
+				rerr = h.cfg.Upstream.RefreshToken(acct)
+			}
+			if rerr != nil {
+				lastErr = rerr
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				if errors.As(rerr, &ue) && ue.Kind == upstream.ErrSessionDead {
 					// 12153 一次失败不杀号（临时触发会误杀）：与 scheduler keepalive/checkin
 					// 同口径走连续计数，达到 sessionDeadThreshold 才禁用。
-					h.cfg.Pool.NoteSessionDead(acct.UID)
+					ap.NoteSessionDead(acct.UID)
 				} else {
-					h.cfg.Pool.NoteError(acct.UID)
+					ap.NoteError(acct.UID)
 				}
 				fail(acct.UID)
 				continue
 			}
-			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
-			if err := acct.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+			if provider != auth.ProviderQoder {
+				acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+				if err := acct.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
+					log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+				}
 			}
 		}
 
@@ -598,7 +765,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		// Qoder 返回已归一化为 OpenAI SSE 的流，复用同一 Stream/Aggregate 出口。
+		var rc io.ReadCloser
+		var status int
+		var respBody []byte
+		var terr error
+		var gateLease *guard.Lease
+		if provider == auth.ProviderQoder {
+			if h.cfg.QoderGuard != nil {
+				gateLease, _ = h.cfg.QoderGuard.Acquire(r.Context(), acct.UID)
+			}
+			rc, status, respBody, terr = h.cfg.Qoder.ChatStreamContext(r.Context(), acct, body,
+				qoder.ChatMeta{SessionKey: sessKey, RequestID: chatMeta.ConversationRequestID})
+			if gateLease != nil {
+				if terr == nil && status == http.StatusOK && rc != nil {
+					// 流式：闸门配额随响应体关闭一起归还。
+					rc = &gateReadCloser{ReadCloser: rc, lease: gateLease}
+				} else {
+					gateLease.Release()
+					gateLease = nil
+				}
+			}
+		} else {
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		}
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -610,6 +800,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
+			if provider == auth.ProviderQoder {
+				kind = qoder.Classify(status, string(respBody))
+			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
@@ -618,7 +811,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
-				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				delete(tried[provider], acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue
@@ -628,7 +821,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// （此前会落到 503 no_healthy_account + lastErr 泄露 11128 与账号语义）。
 				// 不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError），但 content_blocked
 				// 是本请求的终态——换任何账号都会撞同一审核，轮转纯属浪费时间。
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				h.applyErrorPolicyOn(ap, acct.UID, kind, string(respBody), bareModel)
 				fail(acct.UID)
 				msg := upstream.ContentBlockedClientMessage(string(respBody))
 				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
@@ -641,7 +834,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 换号必然同样被拦。继续轮换的代价是把上游请求量放大 MaxRotate 倍
 				// （一次客户端请求 → 3 次被拦请求），可能让风控评级更差、解封更慢。
 				// 不罚账号（applyErrorPolicy 该分支无冷却/熔断），风控解除后池子照常可用。
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				h.applyErrorPolicyOn(ap, acct.UID, kind, string(respBody), bareModel)
 				fail(acct.UID)
 				log.Printf("WARN: [server] upstream WAF blocked this egress IP (account-independent); " +
 					"skip rotation and fail fast")
@@ -657,7 +850,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 修复前它落到 ErrClient → 白轮换 MaxRotate 个号（实测一次请求耗 29s，
 				// 客户端等到自己断连），最终回一句语义完全错误的 503「全部账号不可用」，
 				// 让人误以为账号池空了。改为 400 + 上游的 token 数字，直指问题本身。
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				h.applyErrorPolicyOn(ap, acct.UID, kind, string(respBody), bareModel)
 				fail(acct.UID)
 				writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded",
 					upstream.ContextTooLongClientMessage(string(respBody)))
@@ -665,11 +858,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+			h.applyErrorPolicyOn(ap, acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
+		ap.NoteSuccess(acct.UID)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		if sessKey != "" && h.cfg.Session != nil {
@@ -685,7 +878,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
-				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
+				ap.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -707,7 +900,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			ap.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
 		return
 	}
@@ -741,6 +934,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.status = status
 }
 
+// gateReadCloser 把闸门配额的生命周期绑定到上游响应体：Close 时归还。
+type gateReadCloser struct {
+	io.ReadCloser
+	lease *guard.Lease
+}
+
+func (g *gateReadCloser) Close() error {
+	err := g.ReadCloser.Close()
+	g.lease.Release()
+	return err
+}
+
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：内容拦截会立即 400 返回，其余种类 continue 换号。
@@ -765,75 +970,68 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string) {
+	h.applyErrorPolicyOn(h.cfg.Pool, uid, kind, body, model)
+}
+
+// applyErrorPolicyOn 是 applyErrorPolicy 的按池版本：Qoder 与 WorkBuddy 各自
+// NoteSuccess/NoteError/Cooldown/Disable，冷却与熔断语义完全一致、状态互不串扰。
+func (h *Handler) applyErrorPolicyOn(p *pool.Pool, uid string, kind upstream.ErrKind, body, model string) {
+	if p == nil {
+		return
+	}
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
-		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
+		p.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」或
-		// 「reset at … UTC+8」，无论业务 code 是 6004 还是 11140 rate-limiting 等形态，
-		// 都精确冷却到该墙钟、绝不 softStreak 指数堆加。
+		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」或「reset at … UTC+8」，
+		// 无论业务 code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
-		//     豁免（既有 issue #31 语义）。**无论 ParseRateReset 是否成功**，6004 都
-		//     走模型级冷却——解析成功则对齐上游墙钟，解析失败则退化为模型级有界退避，
-		//     绝不退化成账号级冷却（否则切模型无法绕过，丢失 6004 豁免语义）。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
-		//     （普通账号级限流不该因切模型绕过）。
+		//     豁免（issue #31 语义）；解析失败退化为模型级有界退避。
+		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 		if upstream.IsModelRateLimit(body) {
 			if resetAt, ok := upstream.ParseRateReset(body); ok {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
+				p.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 			} else {
-				// 6004 但无解析时间：模型级有界退避（不写账号级 until，保留切模型豁免）。
-				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "6004 model rate limit")
+				p.CooldownSoftForModel(uid, h.cfg.SoftCooldown, time.Time{}, model, "6004 model rate limit")
 			}
 			return
 		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			p.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
 			return
 		}
 		// 非 6004 且无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、
 		// 封顶 soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
-		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
+		p.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		p.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+		p.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
-		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
-		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
-		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
-		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
-		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+		// 账号级授权/配额故障按 msg 分野：
+		//   - "request illegal"（11140）→ 授权封禁，重登前不可恢复 → 硬禁用；
+		//   - 14017（trial not activated）→ 补完 register 可自愈 → 保持软冷却。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+			p.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+		p.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
-		h.cfg.Pool.NoteError(uid)
+		p.NoteError(uid)
 	case upstream.ErrContentBlocked:
-		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
-		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
-		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
+		// 内容策略拦截：内容问题非账号问题，不罚账号。passthrough 首遇由
+		// chatCompletions 内降级重试处理；最终仍拦则回 400 content_blocked。
 	case upstream.ErrWAFBlocked:
-		// 边缘 WAF 按出口 IP 拦截：与账号无关，不罚账号（无冷却/熔断/NoteError）。
-		// 处罚毫无意义——被拦的是这台机器的 IP，所有账号会一起中招；冷却只会让
-		// 风控解除后池子还是空的。轮换同样无意义，由 chatCompletions 立即返回。
+		// 边缘 WAF 按出口 IP 拦截：与账号无关，不罚账号、不轮换。
 	case upstream.ErrContextTooLong:
-		// 上下文超长：客户端侧问题，与账号无关，不罚账号（无冷却/熔断/NoteError）。
-		// 轮换同样无意义（任何账号都会返回同一个 400），由 chatCompletions 立即返回。
+		// 上下文超长：客户端侧问题，与账号无关，不罚账号、不轮换。
 	case upstream.ErrBadParams:
-		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
-		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
-		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
+		// 请求体解析失败：发给上游的 body 有问题，换了账号照样 400，不罚账号；但仍轮转
 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。

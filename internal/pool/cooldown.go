@@ -64,8 +64,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 //     权威时间，不做 soft_rate_max 截断），ResetAt 记录上游原始墙钟（台账 ResetAt）。
 //     不写 until（全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
 //   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
-//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
-//     冷却越堆越厚）。不记录模型（不豁免）。
+//     softRateMax。有 model 时仍写模型级（不写 until，保留切模型豁免），
+//     **同模型**冷却中的兜底探测不推进/不延长；model 为空（账号级调用方）退回
+//     账号级 until 冷却、清空模型豁免。
 //
 // 与旧实现的差异：有上游重置时间时绝对不做指数堆加（旧实现 softStreak 计数含
 // 死逻辑，纯属库房麻痹）；无重置时间时，「冷却中兜底探测再 429」不再 softStreak++
@@ -91,9 +92,24 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
+		} else if model != "" {
+			// 无解析时间的 6004：模型级有界退避（base 起按 softStreak 翻倍、封顶
+			// softRateMax）。仍只锁触发模型，账号可继续服务其他模型；同模型冷却中
+			// 的兜底探测不推进/不延长。
+			if e.modelCooldowns == nil {
+				e.modelCooldowns = map[string]modelCooldown{}
+			}
+			if prev, ok := e.modelCooldowns[model]; !ok || !now.Before(prev.Until) {
+				d := p.softDurationLocked(base, e.softStreak+1)
+				e.softStreak++
+				e.modelCooldowns[model] = modelCooldown{
+					Until:  now.Add(d),
+					Reason: reason,
+				}
+			}
 		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+			// model 为空：账号级有界退避（旧调用方兼容）。注意：**在软冷却中**
+			// （until 未到期）时不推进/不延长。
 			if e.coolKind != CoolSoft || !now.Before(e.until) {
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++

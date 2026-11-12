@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/qoder"
 )
 
 // Config 顶层配置。
@@ -146,6 +148,51 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Qoder 第二上游（账号池 + 模型目录 + COSY 协议客户端）。
+	// enabled=false 时完全不加载 Qoder 账号，模型路由退化为纯 WorkBuddy。
+	Qoder struct {
+		Enabled        bool                      `json:"enabled"`
+		AuthDir        string                    `json:"auth_dir"`
+		StateFile      string                    `json:"state_file"`
+		Weight         float64                   `json:"weight"`          // 裸名合并调度时的相对权重，默认 1.0
+		CosyVersion    string                    `json:"cosy_version"`    // 缺省 1.1.75
+		TimeoutSeconds int                       `json:"timeout_seconds"` // 聊天流总时长上限，默认 600
+		Endpoints      map[string]qoder.Endpoint `json:"endpoints"`       // 空 = 官方双区域默认
+
+		// 桌面端活动平台版本（cosy-version），缺省 0.4.8。
+		DesktopVersion string `json:"desktop_version"`
+		// CheckinHours/KeepaliveHours Qoder 独立排程；空 = [9,21] / [22]。
+		CheckinHours   []int `json:"checkin_hours"`
+		KeepaliveHours []int `json:"keepalive_hours"`
+		// 开关缺省 true；false = 停止该排程。
+		CheckinEnabled   bool `json:"checkin_enabled"`
+		KeepaliveEnabled bool `json:"keepalive_enabled"`
+		CheckinOnStartup bool `json:"checkin_on_startup"`
+		// ActivityFile 活动流水 JSONL 路径；空 = <auth_dir>/qoder-activity.jsonl。
+		ActivityFile string `json:"activity_file"`
+		// RequestGapSeconds 批量操作时账号之间的间隔（秒），缺省 1.0，用于防风控。
+		RequestGapSeconds float64 `json:"request_gap_seconds"`
+
+		// Guard 出站流量闸门：单号并发等待 + 请求节奏控制 + 排队遥测。
+		Guard struct {
+			Enabled        bool `json:"enabled"`
+			MaxConcurrency int  `json:"max_concurrency"`
+			MinGapMs       int  `json:"min_gap_ms"`
+			MaxWaitMs      int  `json:"max_wait_ms"`
+			JitterMs       int  `json:"jitter_ms"`
+		} `json:"guard"`
+
+		// WebTools 本地执行 web_search / web_fetch（仅当客户端声明内置工具时）。
+		WebTools bool `json:"web_tools"`
+		// ImageTranscode 内联 PNG 压缩（默认开）。
+		ImageTranscode *bool `json:"image_transcode"`
+		// PricingFile 用户覆盖参考价 JSON（空 = 只用内置表）。
+		PricingFile string `json:"pricing_file"`
+
+		// AnthropicThinking off（默认）/ empty。
+		AnthropicThinking string `json:"anthropic_thinking"`
+	} `json:"qoder"`
+
 	// Panel 内置 Web 管理面板（/panel/）。缺省启用；显式 enabled=false 关闭。
 	// 面板无鉴权，仅供本机/内网运维使用——公网暴露前务必自行加反代鉴权。
 	Panel struct {
@@ -205,6 +252,24 @@ func Default() *Config {
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
 	c.Panel.Enabled = true // 内置面板缺省开（本机部署）；Dir 空 = 用内嵌资源
+	// Qoder 缺省关闭：未配置账号目录时不引入第二上游，纯 WorkBuddy 部署零变化。
+	c.Qoder.Enabled = false
+	c.Qoder.AuthDir = "./qoder_auths"
+	c.Qoder.StateFile = "./data/qoder_state.json"
+	c.Qoder.Weight = 1.0
+	c.Qoder.CosyVersion = "1.1.75"
+	c.Qoder.TimeoutSeconds = 600
+	c.Qoder.DesktopVersion = "0.4.8"
+	c.Qoder.CheckinEnabled = true
+	c.Qoder.KeepaliveEnabled = true
+	c.Qoder.CheckinOnStartup = true
+	c.Qoder.RequestGapSeconds = 1.0
+	c.Qoder.Guard.Enabled = true
+	c.Qoder.Guard.MaxConcurrency = 1
+	c.Qoder.Guard.MinGapMs = 400
+	c.Qoder.Guard.MaxWaitMs = 20000
+	c.Qoder.Guard.JitterMs = 120
+	c.Qoder.AnthropicThinking = "off"
 	return c
 }
 
@@ -315,6 +380,22 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_QODER_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Qoder.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_QODER_AUTH_DIR"); v != "" {
+		c.Qoder.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_QODER_STATE_FILE"); v != "" {
+		c.Qoder.StateFile = v
+	}
+	if v := os.Getenv("WB2A_QODER_WEIGHT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Qoder.Weight = f
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -368,6 +449,56 @@ func (c *Config) normalize() error {
 	}
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0 // 负值视为禁用，避免 upstream 判定窗口反转
+	}
+	if c.Qoder.Weight <= 0 {
+		c.Qoder.Weight = 1.0
+	}
+	if c.Qoder.CosyVersion == "" {
+		c.Qoder.CosyVersion = "1.1.75"
+	}
+	if c.Qoder.TimeoutSeconds <= 0 {
+		c.Qoder.TimeoutSeconds = 600
+	}
+	if c.Qoder.AuthDir == "" {
+		c.Qoder.AuthDir = "./qoder_auths"
+	}
+	if c.Qoder.StateFile == "" {
+		c.Qoder.StateFile = "./data/qoder_state.json"
+	}
+	if len(c.Qoder.CheckinHours) == 0 {
+		c.Qoder.CheckinHours = []int{9, 21}
+	}
+	if len(c.Qoder.KeepaliveHours) == 0 {
+		c.Qoder.KeepaliveHours = []int{22}
+	}
+	for _, h := range append(append([]int{}, c.Qoder.CheckinHours...), c.Qoder.KeepaliveHours...) {
+		if h < 0 || h > 23 {
+			return fmt.Errorf("qoder.checkin_hours/keepalive_hours: %d 不是合法小时（0-23）；如要关闭请用 qoder.checkin_enabled=false / keepalive_enabled=false", h)
+		}
+	}
+	if c.Qoder.ActivityFile == "" {
+		c.Qoder.ActivityFile = filepath.Join(c.Qoder.AuthDir, "qoder-activity.jsonl")
+	}
+	if c.Qoder.DesktopVersion == "" {
+		c.Qoder.DesktopVersion = "0.4.8"
+	}
+	if c.Qoder.RequestGapSeconds <= 0 {
+		c.Qoder.RequestGapSeconds = 1.0
+	}
+	if c.Qoder.Guard.MaxConcurrency <= 0 {
+		c.Qoder.Guard.MaxConcurrency = 1
+	}
+	if c.Qoder.Guard.MinGapMs < 0 {
+		c.Qoder.Guard.MinGapMs = 400
+	}
+	if c.Qoder.Guard.MaxWaitMs <= 0 {
+		c.Qoder.Guard.MaxWaitMs = 20000
+	}
+	if c.Qoder.Guard.JitterMs < 0 {
+		c.Qoder.Guard.JitterMs = 120
+	}
+	if c.Qoder.AnthropicThinking == "" {
+		c.Qoder.AnthropicThinking = "off"
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120

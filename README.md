@@ -72,6 +72,19 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 - 共享同一账号池，由账号 `realm` 或请求模型名前缀（`cn:` / `global:`）决定路由；`global.enabled` 可一键锁死纯 CN 部署
 - 国际版支持注册激活、地区完善、一次性 trial 加油包领取（`./trial.sh`）
 
+### Qoder 第二上游（可选）
+
+- **同一入口混合调度** — 开启 `qoder.enabled` 后，同一 `/v1/chat/completions` 可按模型在两个上游间调度：裸模型名（如 `deepseek-v4-pro`）在两侧目录归一化匹配后加权随机选择 Provider，一侧全不可用时自动降级到另一侧；`qoder:<model>` 强制 Qoder、`cn:<model>` / `global:<model>` 强制 WorkBuddy 对应域
+- **独立账号池** — Qoder 账号走独立池（`qoder.state_file`），冷却 / 熔断 / 在途租约与 WorkBuddy 池互不影响；账号文件为 `<auth_dir>/qoder-*.json`，与 qoder2api-hub 账号文件同形状、可直接互读
+- **三种接入** — 面板内可设备授权登录（PKCE）、导入 `pt-` 个人访问令牌、粘贴/上传账号 JSON；token 过期自动刷新（`drt-` / `jrt-` / `pt-` 分别走 deviceToken / jobToken 刷新与交换）
+- **纯 Go 协议实现** — COSY 签名（AES-128-CBC + RSA PKCS#1 v1.5 + MD5）、设备指纹、SSE 信封解包全部原生实现，无 Python 运行时依赖
+- **运营能力** — 每日签到 / 活动任务领取 / `checkin_when_disabled` / 批量签到；余额与额度详情（面板 Qoder 积分、消耗明细、定时刷新）；定时 token 保活
+- **防风控** — 每账号并发闸门 + 请求最小间隔 + 抖动，排队超时 fail-open；`/healthz` 透出 `risk` 排队遥测
+- **多协议入口** — 除 OpenAI `/v1/chat/completions` 外，原生支持 Anthropic `/v1/messages`（含 `count_tokens`）与 OpenAI Responses API `/v1/responses`，流式均逐事件转换
+- **附加能力** — 网关本地 `web_search` / `web_fetch`（SSRF 防护、TTL 缓存、多轮回灌）；内联大 PNG 无损重压；峰谷价 / 上下文窗口 / 思考档位元数据；面板「智能体配置」一键把 Claude Code、Codex、OpenCode、DSH、Crush 等客户端指向本网关（写入前备份、可 byte-exact 还原）
+
+`/v1/models` 合并两侧目录：两侧同名模型只保留一条裸名（`owned_by: "merged"`），Qoder 独有模型以裸 display_name 暴露（`owned_by: "qoder"`，`qoder_key` 可作为别名调用）；`/status` 新增 `providers` 段分别给出两侧 total / healthy / cooling / disabled。
+
 ### 辅助工具
 
 - 积分日报：`./credit.sh`（美化 / `-json`，realm 感知双域）
@@ -119,6 +132,46 @@ cp config.example.json config.json
 ```
 
 编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
+
+可选启用 Qoder 第二上游（默认关闭，纯 WorkBuddy 部署零变化）：
+
+```json
+"qoder": { "enabled": true, "auth_dir": "./qoder_auths", "state_file": "./data/qoder_state.json", "weight": 1.0 }
+```
+
+启用后在面板「添加账号」选择 Qoder，通过设备授权 / PAT / 账号 JSON 导入账号，或直接放置 `qoder_auths/qoder-<uid>.json` 后重启。
+
+新增可选项（默认值见 `config.example.json`）：
+
+```json
+"qoder": {
+  "enabled": true,
+  "guard": { "enabled": true, "max_concurrency": 1, "min_gap_ms": 400, "max_wait_ms": 20000, "jitter_ms": 120 },
+  "web_tools": false,
+  "image_transcode": true,
+  "anthropic_thinking": "off",
+  "pricing_file": ""
+}
+```
+
+- `guard`：每账号并发闸门与节奏控制，防止短时间打爆同一账号触发风控。
+- `web_tools`：仅对 `qoder:<model>` 强路由生效；客户端声明内置 `web_search` / `web_fetch` 时由网关代跑（DDG → Bing → Wikipedia），最多 3 轮回灌。
+- `anthropic_thinking`：`/v1/messages` 的 thinking 模式，默认 `off` 不透传。
+- `pricing_file`：可选价格覆盖（USD / 1M tokens），仅用于元数据与估算，不参与结算。
+
+Anthropic / Responses 入口与 OpenAI 入口共用同一鉴权（`Authorization: Bearer` 或 `x-api-key`）与账号轮转：
+
+```bash
+curl -s http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"qoder:DeepSeek-V4-Pro","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+
+curl -s http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{"model":"deepseek-v4-pro","input":"hi"}'
+```
+
+面板「智能体配置」页可检测本机已安装的 AI 客户端（只读探测命令 / 配置目录 / IDE 扩展），并一键接入或还原；API Key 只写入客户端本地配置，网关 state 仅存 sha256。
 
 ```bash
 # 登录添加账号（重复执行可加多号）

@@ -23,15 +23,15 @@ func realmPool(t *testing.T) *pool.Pool {
 // 带前缀的模型名按 realm 过滤可用账号，裸名走 cn。
 func TestRealmAwareAvailableForModel(t *testing.T) {
 	p := realmPool(t)
-	fn := realmAwareAvailableForModel(p)
+	fn := realmAwareAvailableForModel(p, nil)
 
 	cases := []struct {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1"}},           // 裸名 → cn 集合
-		{"cn:glm-5.2", []string{"cn1"}},        // 显式 cn 前缀 → cn 集合
-		{"global:gpt-5.4", []string{"g1"}},     // global 前缀 → global 集合
+		{"glm-5.2", []string{"cn1"}},       // 裸名 → cn 集合
+		{"cn:glm-5.2", []string{"cn1"}},    // 显式 cn 前缀 → cn 集合
+		{"global:gpt-5.4", []string{"g1"}}, // global 前缀 → global 集合
 	}
 	for _, c := range cases {
 		if got := fn(c.model); !reflect.DeepEqual(got, c.want) {
@@ -48,7 +48,7 @@ func TestRealmAwareAvailableForModelGlobalDisabled(t *testing.T) {
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
-	fn := realmAwareAvailableForModel(p)
+	fn := realmAwareAvailableForModel(p, nil)
 
 	// 开关关闭 → 该 global 账号 Realm()=="cn"（逃生门），对 global: 前缀不可见。
 	if got := fn("global:gpt-5.4"); len(got) != 0 {
@@ -69,15 +69,15 @@ func TestRealmAwareAvailableForModelDefaultOnCNZeroRegression(t *testing.T) {
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
 	p.Add(&auth.Auth{UID: "cn2", Domain: ""}) // 空 domain → cn（老 CN 凭证）
-	fn := realmAwareAvailableForModel(p)
+	fn := realmAwareAvailableForModel(p, nil)
 
 	cases := []struct {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1", "cn2"}},       // 裸名 → cn 集合（现状零回归）
-		{"cn:glm-5.2", []string{"cn1", "cn2"}},    // cn 前缀 → cn 集合
-		{"global:gpt-5.4", nil},                   // global 前缀 → 纯 CN 池无可用（不对 spread）
+		{"glm-5.2", []string{"cn1", "cn2"}},    // 裸名 → cn 集合（现状零回归）
+		{"cn:glm-5.2", []string{"cn1", "cn2"}}, // cn 前缀 → cn 集合
+		{"global:gpt-5.4", nil},                // global 前缀 → 纯 CN 池无可用（不对 spread）
 	}
 	for _, c := range cases {
 		want := c.want
@@ -87,5 +87,27 @@ func TestRealmAwareAvailableForModelDefaultOnCNZeroRegression(t *testing.T) {
 		if got := fn(c.model); !reflect.DeepEqual(got, want) {
 			t.Errorf("AvailableForModel(%q)=%v want %v", c.model, got, want)
 		}
+	}
+}
+
+// TestRealmAwareAvailableForModelQoder 双池：qoder: 前缀只取 Qoder 池，
+// 裸名返回两池并集（合并调度），WorkBuddy 前缀不泄漏 Qoder 号。
+func TestRealmAwareAvailableForModelQoder(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	qp := pool.New("")
+	qp.Add(auth.NewQoderAuth("q1", "qoder", "at", "rt", "", "cn", "test"))
+	fn := realmAwareAvailableForModel(p, qp)
+
+	if got := fn("qoder:DeepSeek-V4-Pro"); !reflect.DeepEqual(got, []string{"q1"}) {
+		t.Errorf("qoder prefix = %v want [q1]", got)
+	}
+	if got := fn("glm-5.2"); !reflect.DeepEqual(got, []string{"cn1", "q1"}) {
+		t.Errorf("bare merged = %v want [cn1 q1]", got)
+	}
+	if got := fn("cn:glm-5.2"); !reflect.DeepEqual(got, []string{"cn1"}) {
+		t.Errorf("cn prefix = %v want [cn1]", got)
 	}
 }

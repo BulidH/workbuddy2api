@@ -13,6 +13,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoderops"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -51,6 +52,13 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// ── Qoder 第二上游（QoderOps=nil 表示未启用，全部排程忽略）──
+	QoderOps               *qoderops.Service
+	QoderCheckinHours      []int // 默认 [9, 21]
+	QoderKeepaliveHours    []int // 默认 [22]
+	QoderCheckinDisabled   bool
+	QoderKeepaliveDisabled bool
 }
 
 // Scheduler 调度器。
@@ -100,6 +108,12 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
+	}
+	if len(cfg.QoderCheckinHours) == 0 {
+		cfg.QoderCheckinHours = []int{9, 21}
+	}
+	if len(cfg.QoderKeepaliveHours) == 0 {
+		cfg.QoderKeepaliveHours = []int{22}
 	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
@@ -159,6 +173,8 @@ const (
 	taskKeepalive
 	taskSchool
 	taskCat
+	taskQoderCheckin
+	taskQoderKeepalive
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -187,6 +203,14 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.CatDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
+	}
+	if s.cfg.QoderOps != nil {
+		if !s.cfg.QoderCheckinDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.QoderCheckinHours), taskQoderCheckin})
+		}
+		if !s.cfg.QoderKeepaliveDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.QoderKeepaliveHours), taskQoderKeepalive})
+		}
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -248,7 +272,33 @@ func (s *Scheduler) dispatch(k taskKind) {
 		s.RunSchoolNow()
 	case taskCat:
 		s.RunCatNow()
+	case taskQoderCheckin:
+		s.RunQoderCheckinNow()
+	case taskQoderKeepalive:
+		s.RunQoderKeepaliveNow()
 	}
+}
+
+// RunQoderCheckinNow 定时触发的 Qoder 全量签到（活动平台 + sash 兜底）。
+func (s *Scheduler) RunQoderCheckinNow() {
+	if s.cfg.QoderOps == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	if _, err := s.cfg.QoderOps.CheckinAll(ctx, nil, false); err != nil {
+		log.Printf("scheduled qoder checkin skipped: %v", err)
+	}
+}
+
+// RunQoderKeepaliveNow 定时刷新 Qoder token。
+func (s *Scheduler) RunQoderKeepaliveNow() {
+	if s.cfg.QoderOps == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	s.cfg.QoderOps.Keepalive(ctx)
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
@@ -271,7 +321,7 @@ const StartupCatchUpDelay = 30 * time.Second
 //
 // 显式关闭签到排程（schedule.checkin_enabled=false）时不补跑。
 func (s *Scheduler) RunStartupCatchUp(delay time.Duration) {
-	if s.cfg.CheckinDisabled {
+	if s.cfg.CheckinDisabled && s.cfg.QoderCheckinDisabled {
 		return
 	}
 	if delay <= 0 {
@@ -280,7 +330,12 @@ func (s *Scheduler) RunStartupCatchUp(delay time.Duration) {
 	go func() {
 		time.Sleep(delay)
 		log.Printf("启动补跑签到（容器在签到时点可能未运行，签到幂等可安全补跑）")
-		s.RunCheckinNow()
+		if !s.cfg.CheckinDisabled {
+			s.RunCheckinNow()
+		}
+		if s.cfg.QoderOps != nil && !s.cfg.QoderCheckinDisabled {
+			s.RunQoderCheckinNow()
+		}
 	}()
 }
 
