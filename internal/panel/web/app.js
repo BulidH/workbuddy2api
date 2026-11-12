@@ -100,14 +100,15 @@ const S = {
 
 // accountsDisplayList 账号表的「展示序」：
 //   - 隐藏开关打开时过滤掉 disabled 账号；
-//   - 展开时把 disabled 账号整体提到最前，并按 disabled_at 倒序（刚被禁用的排最前），
-//     健康的保持既有顺序（Array.prototype.sort 自 ES2019 起稳定）。
+//   - 展开时 disabled 账号整体沉到**所有状态账号的下边**，组内再按 disabled_at
+//     倒序（刚被禁用的在已禁用组内部排上边）；非禁用组保持既有顺序
+//     （Array.prototype.sort 自 ES2019 起稳定）。
 // disabled_at 缺失（旧 state.json）记 0，落在同组末尾，不参与「最新」比较。
 function accountsDisplayList(list) {
   const shown = S.hideDisabled ? list.filter(a => !a.disabled) : list;
   if (!shown.some(a => a.disabled)) return shown;
   return [...shown].sort((a, b) => {
-    if (a.disabled !== b.disabled) return a.disabled ? -1 : 1;
+    if (a.disabled !== b.disabled) return a.disabled ? 1 : -1;
     if (!a.disabled) return 0;
     const ta = Date.parse(a.disabled_at || '') || 0;
     const tb = Date.parse(b.disabled_at || '') || 0;
@@ -279,7 +280,7 @@ function accountsTable(list, { compact = false } = {}) {
     return `<tr${a.disabled ? ' class="row-disabled"' : ''}>
       <td>${st}
           ${a.disabled && a.disabled_at ? `<div style="font-size:10.5px;color:var(--text-mute);margin-top:3px"
-            title="禁用时刻；已禁用账号按此时间由近到远排序">${esc(fmtTime(a.disabled_at))}</div>` : ''}</td>
+            title="禁用时刻；已禁用账号沉底，组内按此时间由近到远排上边">${esc(fmtTime(a.disabled_at))}</div>` : ''}</td>
       <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
           <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div>
           ${qoder && (a.plan || a.last_checkin) ? `<div style="font-size:11px;color:var(--text-mute)">
@@ -335,7 +336,7 @@ function accountsTable(list, { compact = false } = {}) {
 // hideDisabledToggleHTML 账号表头的「隐藏已禁用」开关；默认开，状态存 localStorage。
 function hideDisabledToggleHTML() {
   return `<label class="field row" style="gap:7px;white-space:nowrap;cursor:pointer"
-      title="默认隐藏已禁用账号；关闭后按禁用时刻由近到远把它们排在最前">
+      title="默认隐藏已禁用账号；关闭后它们沉到列表底部，组内按禁用时刻由近到远排上边">
     <label class="switch sm">
       <input type="checkbox" id="hideDisabled" data-hide-disabled ${S.hideDisabled ? 'checked' : ''}>
       <span></span></label>
