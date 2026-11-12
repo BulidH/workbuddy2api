@@ -41,13 +41,17 @@ func emitChatLogSink(line string) {
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	start time.Time
+	model string
+	mode  string // "stream" | "sync"
+	uid   string // 完整 uid，展示时只取前 8 位
+	// providers 是本次请求实际尝试过的 Provider 链路（含失败降级的那些），
+	// 形如 ["qoder", "workbuddy"]。合并调度下只记最后一个无法回答
+	// 「有没有流量走到 Qoder」，故按尝试顺序全量记录。
+	providers []string
+	ttfb      time.Duration
+	toks      int // <0 表示 usage 缺失 → 显示 "-"
+	status    int
 
 	logged bool
 }
@@ -67,7 +71,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.providers, s.status, s.toks)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -209,7 +213,7 @@ func uidPrefix(uid string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, providers []string, status int, toks int) {
 	if !chatLogEnabled {
 		return
 	}
@@ -231,11 +235,23 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	line := fmt.Sprintf("| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |",
+	provField := "-"
+	if len(providers) > 0 {
+		short := make([]string, 0, len(providers))
+		for _, p := range providers {
+			if p == "workbuddy" {
+				p = "wb"
+			}
+			short = append(short, p)
+		}
+		provField = strings.Join(short, ">")
+	}
+	line := fmt.Sprintf("| #%03d | %s | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
+		provField,
 		status,
 		uidPrefix(uid),
 		ttfbMS,

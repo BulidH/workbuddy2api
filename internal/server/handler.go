@@ -782,6 +782,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		attempts++
 		st.uid = acct.UID
+		st.providers = append(st.providers, provider)
 		triedThis[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
