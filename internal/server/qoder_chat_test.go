@@ -31,7 +31,7 @@ const qoderChunk2 = `{"id":"q1","object":"chat.completion.chunk","created":1,"mo
 // TestChatQoderEndToEndNonStream 端到端：qoder: 前缀请求 → 强制走 Qoder 池 →
 // COSY 签名请求打到 fake 网关 → 信封 SSE 解包 → 非流式本地聚合返回 200。
 func TestChatQoderEndToEndNonStream(t *testing.T) {
-	var gotPath, gotKey, gotModelKey, gotAuthz string
+	var gotPath, gotQuery, gotKey, gotModelKey, gotAuthz string
 	var gotReq map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/agent_chat_generation") {
@@ -39,6 +39,7 @@ func TestChatQoderEndToEndNonStream(t *testing.T) {
 			return
 		}
 		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
 		gotKey = r.Header.Get("cosy-key")
 		gotModelKey = r.Header.Get("x-model-key")
 		gotAuthz = r.Header.Get("authorization")
@@ -78,6 +79,11 @@ func TestChatQoderEndToEndNonStream(t *testing.T) {
 
 	if gotPath != "/algo/api/v2/service/pro/sse/agent_chat_generation" {
 		t.Errorf("gateway path = %q", gotPath)
+	}
+	// 请求体是自定义 Base64 变体，必须带 Encode=1 告诉网关按编码体解析；
+	// 缺了它上游会按明文 JSON 解析并以 500 断开（空 SSE 流）。
+	if gotQuery != "Encode=1" {
+		t.Errorf("gateway query = %q, want Encode=1", gotQuery)
 	}
 	if gotKey == "" || !strings.HasPrefix(gotAuthz, "Bearer COSY.") {
 		t.Errorf("missing COSY signing headers: cosy-key=%q authz=%q", gotKey, gotAuthz)

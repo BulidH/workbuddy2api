@@ -18,7 +18,10 @@ import (
 )
 
 const (
-	chatPath   = "/algo/api/v2/service/pro/sse/agent_chat_generation"
+	// chatPath 必须带 Encode=1：请求体是 Qoder 自定义 Base64 变体（EncodeBody），
+	// 少了这个参数服务端会按明文 JSON 解析，直接抛 Jackson
+	// "Unrecognized token ..." 并以 500 结束（表现为空 SSE 流）。
+	chatPath   = "/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1"
 	modelsPath = "/algo/api/v2/model/list?Encode=1"
 
 	pathDevicePoll    = "/api/v1/deviceToken/poll"
@@ -256,7 +259,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			}
 			continue
 		}
-		rc, status, detail := c.unwrapSSE(resp.Body)
+		rc, status, detail := c.unwrapSSE(resp.Body, model)
 		if rc == nil {
 			if status < 500 {
 				return nil, status, detail, nil
@@ -274,7 +277,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 
 // unwrapSSE 读取首个信封帧：非 200 直接返回错误，否则返回持续输出 OpenAI SSE 的流。
 // 返回 (nil, status, body) 表示首帧即错误。
-func (c *Client) unwrapSSE(body io.ReadCloser) (io.ReadCloser, int, []byte) {
+func (c *Client) unwrapSSE(body io.ReadCloser, model string) (io.ReadCloser, int, []byte) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 64<<10), 8<<20)
 	// 首帧之前可能有心跳/空行，循环读到第一个可解析帧。
@@ -319,7 +322,7 @@ func (c *Client) unwrapSSE(body io.ReadCloser) (io.ReadCloser, int, []byte) {
 					_, _ = pw.Write([]byte("data: [DONE]\n\n"))
 					return false
 				}
-				_, err := pw.Write([]byte("data: " + frame.Body + "\n\n"))
+				_, err := pw.Write([]byte("data: " + rewriteFrameModel(frame.Body, model) + "\n\n"))
 				return err == nil
 			}
 			if !writeFrame(first) {
@@ -358,6 +361,49 @@ type envelopeFrame struct {
 	Headers    map[string]any `json:"headers"`
 	Body       string         `json:"body"`
 	StatusCode int            `json:"statusCodeValue"`
+}
+
+// rewriteFrameModel 把上游帧里的 model 改回本次请求的模型名，并把 Qoder 的
+// usage.credits 补成网关统一的 usage.credit。
+//
+// Qoder 上游不论请求哪个模型，SSE 帧里的 model 一律回 "auto"（实测
+// DeepSeek-Flash / DeepSeek-V4-Pro / Qwen3.8-Max 都是），客户端拿到的
+// 模型名跟请求对不上，会让按 model 字段做统计/路由的下游错乱。
+// usage 里 Qoder 用 credits（复数），WorkBuddy 用 credit（单数），网关的
+// 成本账本只认 credit，不补齐则 Qoder 的实测成本永远记不上。
+// 帧不是合法 JSON 时原样返回。
+func rewriteFrameModel(frameBody, model string) string {
+	needCredit := strings.Contains(frameBody, `"credits"`)
+	if model == "" && !needCredit {
+		return frameBody
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(frameBody), &m); err != nil {
+		return frameBody
+	}
+	changed := false
+	if model != "" {
+		if _, ok := m["model"]; ok {
+			m["model"] = model
+			changed = true
+		}
+	}
+	if usage, ok := m["usage"].(map[string]any); ok {
+		if _, has := usage["credit"]; !has {
+			if c, hasCredits := usage["credits"]; hasCredits {
+				usage["credit"] = c
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return frameBody
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return frameBody
+	}
+	return string(out)
 }
 
 func stripDataPrefix(line string) string {

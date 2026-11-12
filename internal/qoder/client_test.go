@@ -32,7 +32,7 @@ func TestUnwrapSSEEnvelope(t *testing.T) {
 		`data: {"headers":{},"body":"[DONE]","statusCodeValue":200}`,
 	}, "\n")
 
-	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader(in)))
+	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader(in)), "")
 	if rc == nil {
 		t.Fatalf("unwrapSSE returned error: %d %s", status, detail)
 	}
@@ -59,7 +59,7 @@ func TestUnwrapSSEEnvelope(t *testing.T) {
 func TestUnwrapSSEFirstFrameError(t *testing.T) {
 	c := New(Config{Timeout: time.Second})
 	in := `data: {"headers":{},"body":"{\"error\":\"bad token\"}","statusCodeValue":401}` + "\n"
-	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader(in)))
+	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader(in)), "")
 	if rc != nil {
 		t.Fatalf("expected error, got stream")
 	}
@@ -70,7 +70,7 @@ func TestUnwrapSSEFirstFrameError(t *testing.T) {
 
 func TestUnwrapSSEWithoutFrames(t *testing.T) {
 	c := New(Config{Timeout: time.Second})
-	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader("\n\n: ping\n")))
+	rc, status, detail := c.unwrapSSE(io.NopCloser(strings.NewReader("\n\n: ping\n")), "")
 	if rc != nil {
 		t.Fatalf("expected error, got stream")
 	}
@@ -103,6 +103,38 @@ func TestClassify(t *testing.T) {
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d, %q) = %v, want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+func TestRewriteFrameModel(t *testing.T) {
+	in := `{"id":"x","object":"chat.completion.chunk","model":"auto","choices":[]}`
+	got := rewriteFrameModel(in, "DeepSeek-Flash")
+	if !strings.Contains(got, `"model":"DeepSeek-Flash"`) {
+		t.Fatalf("model not rewritten: %s", got)
+	}
+	if strings.Contains(got, `"auto"`) {
+		t.Fatalf("auto leaked: %s", got)
+	}
+	// usage.credits（Qoder）补成 usage.credit（网关成本账本口径）。
+	withUsage := `{"id":"x","model":"auto","usage":{"credits":0.013,"total_tokens":7}}`
+	got = rewriteFrameModel(withUsage, "")
+	if !strings.Contains(got, `"credit":0.013`) || !strings.Contains(got, `"credits":0.013`) {
+		t.Fatalf("credit not backfilled: %s", got)
+	}
+	// 已有 credit 时不覆盖。
+	both := `{"id":"x","model":"auto","usage":{"credit":1,"credits":2}}`
+	if out := rewriteFrameModel(both, ""); !strings.Contains(out, `"credit":1`) {
+		t.Fatalf("existing credit overwritten: %s", out)
+	}
+	// 非 JSON / 无 model / 空模型名：原样返回。
+	for _, c := range []struct{ in, model string }{
+		{`{"firstTokenDuration":1}`, "DeepSeek-Flash"},
+		{`not json`, "DeepSeek-Flash"},
+		{in, ""},
+	} {
+		if out := rewriteFrameModel(c.in, c.model); out != c.in {
+			t.Errorf("rewriteFrameModel(%q,%q) = %q, want unchanged", c.in, c.model, out)
 		}
 	}
 }
