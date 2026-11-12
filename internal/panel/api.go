@@ -23,15 +23,37 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 	cooling := intOf(status["cooling"])
 	disabled := intOf(status["disabled"])
 
-	// auths 目录文件数（与池内账号数不一致时说明有孤儿文件或加载失败）
-	authFiles := 0
-	if ents, err := os.ReadDir(p.deps.AuthDir); err == nil {
-		for _, e := range ents {
-			if !e.IsDir() && filepath.Ext(e.Name()) == ".json" {
-				authFiles++
-			}
+	// 凭证文件数按 provider 分别统计，再与各自的池内账号数比较。
+	//
+	// 曾经的 bug：只数 auths/*.json（WorkBuddy），却拿去和 /status 的 total（WorkBuddy
+	// + Qoder 两个池之和）比。启用 Qoder 后差值恒等于 Qoder 账号数，概览页永久挂着
+	// 「凭证文件数与池内账号数不一致」的黄条，点「重载账号」也不会消失——因为
+	// 重载只同步 WorkBuddy 池，根本不改变 Qoder 那部分。
+	//
+	// 口径与两个 loader 完全一致（LoadDir 只看 workbuddy*.json，LoadQoderDir 只看
+	// qoder*.json）：数的是「候选文件」，因此文件解析失败导致没入池时，仍能被
+	// 检测出来（files > pool）。旧的 os.ReadDir(AuthDir) 连 qoder*.json / 备份
+	// 混放目录下的无关 .json 都会算进去，是另一个误报源。
+	wbFiles := countAuthFiles(p.deps.AuthDir, "workbuddy*.json")
+	qoderFiles := 0
+	if p.deps.QoderEnabled {
+		qoderFiles = countAuthFiles(p.deps.QoderAuthDir, "qoder*.json")
+	}
+	authFiles := wbFiles + qoderFiles
+
+	// /status 的 providers 按 provider 给出池内账号数；旧注入（测试/降级）没有该字段
+	// 时回落到 total（此时 Qoder 未启用，total 就等于 WorkBuddy 池）。
+	wbPool, qoderPool := total, 0
+	if pm, ok := status["providers"].(map[string]any); ok {
+		if wb, ok := pm[auth.ProviderWorkBuddy].(map[string]any); ok {
+			wbPool = intOf(wb["total"])
+		}
+		if q, ok := pm[auth.ProviderQoder].(map[string]any); ok {
+			qoderPool = intOf(q["total"])
 		}
 	}
+	// 按 provider 分别比较：两个方向的偏差若恰好抵消，只看总数会漏报。
+	mismatch := wbFiles != wbPool || qoderFiles != qoderPool
 
 	okJSON(w, map[string]any{
 		"ok":          true,
@@ -40,13 +62,18 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"gateway_ver": p.deps.GatewayVer,
 		"healthy":     healthy > 0,
 		"counts": map[string]any{
-			"total":      total,
-			"healthy":    healthy,
-			"cooling":    cooling,
-			"disabled":   disabled,
-			"in_flight":  status["in_flight_full"],
-			"auth_files": authFiles,
-			"sticky":     status["sticky_sessions"],
+			"total":                total,
+			"healthy":              healthy,
+			"cooling":              cooling,
+			"disabled":             disabled,
+			"in_flight":            status["in_flight_full"],
+			"auth_files":           authFiles,
+			"auth_files_workbuddy": wbFiles,
+			"auth_files_qoder":     qoderFiles,
+			"pool_workbuddy":       wbPool,
+			"pool_qoder":           qoderPool,
+			"credential_mismatch":  mismatch,
+			"sticky":               status["sticky_sessions"],
 		},
 		"realm_totals": status["realm_totals"],
 		"providers":    status["providers"],
@@ -383,14 +410,31 @@ func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request) {
 	okJSON(w, map[string]any{"ok": true, "lines": lines, "count": len(lines)})
 }
 
-// handleReload 重扫 auths 目录并对齐账号池（加/删凭证文件后免重启）。
+// handleReload 重扫全部启用的凭证目录并对齐各自的账号池（加/删凭证文件后免重启）。
+//
+// 概览的「凭证文件数」是两个 provider 之和，所以这里也必须两个池一起重载：
+// 只重载 WorkBuddy 时，Qoder 目录新增/删除的文件永远要等到登录、导入或删号才会
+// 被同步，黄条上「点重载账号重新对齐」的建议就不成立。
 func (p *Panel) handleReload(w http.ResponseWriter, r *http.Request) {
 	n, err := p.reload()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	okJSON(w, map[string]any{"ok": true, "accounts": n})
+	qoderN := 0
+	if p.deps.QoderEnabled {
+		qoderN, err = p.reloadQoder()
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	okJSON(w, map[string]any{
+		"ok":        true,
+		"accounts":  n + qoderN,
+		"workbuddy": n,
+		"qoder":     qoderN,
+	})
 }
 
 // handleCheckin 立即执行一轮全量签到 + 余额查询。
@@ -489,6 +533,20 @@ func (p *Panel) reload() (int, error) {
 		return 0, nil
 	}
 	return p.deps.ReloadAuths()
+}
+
+// countAuthFiles 只数 loader 会加载的候选文件（glob 与 LoadDir / LoadQoderDir 同口径）。
+// 解析失败的候选文件**仍计入**：正是要靠「文件数 > 池内账号数」把加载失败暴露出来；
+// 目录不可读 / glob 出错时返回 0（概览的其它字段照常渲染，不因一个目录报错而 500）。
+func countAuthFiles(dir, pattern string) int {
+	if dir == "" {
+		return 0
+	}
+	files, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil {
+		return 0
+	}
+	return len(files)
 }
 
 // ─── any 取值小工具（/status 是 map[string]any，数值是 float64）───

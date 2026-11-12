@@ -175,10 +175,10 @@ async function viewOverview() {
      <div class="stat-value">${value}</div><div class="stat-foot">${foot}</div></div>`;
 
   $('#view').innerHTML = `
-    ${ov.counts.auth_files !== ov.counts.total ? `
+    ${c.credential_mismatch ?? (c.auth_files !== c.total) ? `
       <div class="alert warn">
-        <b>凭证文件数（${ov.counts.auth_files}）与池内账号数（${ov.counts.total}）不一致。</b>
-        可能有凭证文件解析失败或未被加载。可点击右侧「重载账号」重新对齐。
+        <b>凭证文件数与池内账号数不一致（WorkBuddy ${c.auth_files_workbuddy ?? c.auth_files}/${c.pool_workbuddy ?? c.total}，Qoder ${c.auth_files_qoder ?? 0}/${c.pool_qoder ?? 0}）。</b>
+        可能有凭证文件解析失败或未被加载。点击下方「重载账号」重新对齐两个 Provider 的账号池。
         <button class="btn sm" style="margin-left:8px" id="reloadAcc">重载账号</button>
       </div>` : ''}
 
