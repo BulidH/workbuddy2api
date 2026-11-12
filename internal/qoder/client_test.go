@@ -89,7 +89,9 @@ func TestClassify(t *testing.T) {
 		want   upstream.ErrKind
 	}{
 		{401, "unauthorized", upstream.ErrSessionDead},
-		{403, "forbidden", upstream.ErrSessionDead},
+		// 403 不等于凭证失效：实测 Qoder 用它承载「排队 60 秒 / 资源限流」，
+		// 旧实现按 session_dead 处理会一次性永久禁用 token 仍有效的账号。
+		{403, "forbidden", upstream.ErrSoftRate},
 		{402, "payment required", upstream.ErrHardCredit},
 		{400, "insufficient credit balance", upstream.ErrHardCredit},
 		{429, "too many requests", upstream.ErrSoftRate},

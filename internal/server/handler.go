@@ -1079,6 +1079,13 @@ func (h *Handler) applyErrorPolicyOn(p *pool.Pool, uid string, kind upstream.Err
 			}
 			return
 		}
+		// Qoder 排队/资源限流：上游用 retryAfterSeconds / waitTime 表达重试时点
+		// （实测 HTTP 403 + RESOURCE_LIMIT + waitTime=60）。这不是账号故障，冷却到
+		// 它自己给出的时刻即可；解析不到退化为有界退避。
+		if retryAt, ok := qoder.ParseRetryAfter(body); ok {
+			p.CooldownSoftRate(uid, h.cfg.SoftCooldown, retryAt, "qoder queue/resource limit")
+			return
+		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			p.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
 			return
@@ -1087,6 +1094,17 @@ func (h *Handler) applyErrorPolicyOn(p *pool.Pool, uid string, kind upstream.Err
 		// 封顶 soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
 		p.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
+		// Qoder 的 401 是凭证失效，但它有 refresh 体系，401 也可能是刷新窗口/会话重建的
+		// 瞬态：一次就永久禁用会把健康号杀掉（与 keepalive/checkin 对 12153 的连续计数
+		// 口径不一致）。故 Qoder 走 NoteSessionDead 连续计数，WorkBuddy 维持既有语义
+		// （12153 是明确的 session 终态，且同样有 refresh 失败侧的连续计数保护）。
+		if h.cfg.QoderPool != nil && p == h.cfg.QoderPool {
+			if p.NoteSessionDead(uid) {
+				log.Printf("WARN: [server] qoder 连续 %d 次 401 session dead — 禁用 uid=%s",
+					pool.SessionDeadThreshold(), logfmt.UID8(uid))
+			}
+			return
+		}
 		p.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
