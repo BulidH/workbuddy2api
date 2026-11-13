@@ -180,13 +180,21 @@ func loomyAccountView(a *auth.Auth) map[string]any {
 	// 先在本包内取快照：Realm()/CreditsRemain() 自己会加同一把锁，不能持有 a.mu 再调。
 	a.Lock()
 	uid, nickname, loginID, expiresAt := a.UID, a.Nickname, a.LoginID, a.ExpiresAt
+	source, hasPassword := a.Source, a.Password != ""
 	a.Unlock()
+	// mode 只表达「到期后能否自动续期」：password 可重登，sms 免密需重新收验证码。
+	mode := "password"
+	if !hasPassword {
+		mode = "sms"
+	}
 	return map[string]any{
 		"uid":        uid,
 		"nickname":   nickname,
 		"loginid":    maskLoginID(loginID),
 		"provider":   auth.ProviderLoomy,
 		"realm":      a.Realm(),
+		"source":     source,
+		"mode":       mode,
 		"expires_at": expiresAt,
 		"credits":    a.CreditsRemain(),
 	}

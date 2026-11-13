@@ -131,6 +131,13 @@ type Deps struct {
 	LoomyAddAccount func(ctx context.Context, loginID, password, nickname string) (*auth.Auth, error)
 	// LoomyImportAccounts 导入粘贴的 loomy-*.json（单对象 / 数组 / {"accounts":[...]}）。
 	LoomyImportAccounts func(items [][]byte) ([]*auth.Auth, []error)
+	// ── Loomy 短信免密登录（一次性 ticket；面板弹窗与 /panel/loomy-login 共用）──
+	// Loomy 上游没有设备授权链接，只能用自己的短信登录；为了让「点链接→自己登录→
+	// 网关拿登录态」成立，这里把登录拆成 start/send/verify 三步，ticket 只存在服务端。
+	LoomySMSStart  func() (ticket string, expiresAt int64, err error)
+	LoomySMSSend   func(ctx context.Context, ticket, phone string) (loomyops.SMSSendResult, error)
+	LoomySMSVerify func(ctx context.Context, ticket, code, nickname string) (*auth.Auth, error)
+	LoomySMSStatus func(ticket string) loomyops.SMSLoginStatus
 	// ReloadLoomyAuths 重扫 Loomy 账号目录并对齐 Loomy 池。
 	ReloadLoomyAuths func() (int, error)
 	// SetLoomyAccountEnabled 手动启用/禁用 Loomy 账号。
@@ -228,6 +235,12 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("GET /panel/api/qoder/activity", p.handleQoderActivity)
 	p.mux.HandleFunc("POST /panel/api/loomy/login", p.handleLoomyLogin)
 	p.mux.HandleFunc("POST /panel/api/loomy/import", p.handleLoomyImport)
+	p.mux.HandleFunc("POST /panel/api/loomy/sms/start", p.handleLoomySMSStart)
+	p.mux.HandleFunc("POST /panel/api/loomy/sms/send", p.handleLoomySMSSend)
+	p.mux.HandleFunc("POST /panel/api/loomy/sms/verify", p.handleLoomySMSVerify)
+	p.mux.HandleFunc("GET /panel/api/loomy/sms/status", p.handleLoomySMSStatus)
+	// 一次性登录页：链接里的 ticket 才是一切（页面本身不含任何凭据）。
+	p.mux.HandleFunc("GET /panel/loomy-login", p.handleLoomyLoginPage)
 	p.mux.HandleFunc("POST /panel/api/loomy/checkin", p.handleLoomyCheckin)
 	p.mux.HandleFunc("POST /panel/api/loomy/balance", p.handleLoomyBalance)
 

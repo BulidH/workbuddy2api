@@ -295,6 +295,8 @@ function accountsTable(list, { compact = false } = {}) {
           <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div>
           ${qoder && (a.plan || a.last_checkin) ? `<div style="font-size:11px;color:var(--text-mute)">
             ${a.plan ? '套餐 ' + esc(a.plan) : ''}${a.plan && a.last_checkin ? ' · ' : ''}${a.last_checkin ? '签到 ' + esc(a.last_checkin) : ''}</div>` : ''}
+          ${loomy && a.mode === 'sms' ? `<div style="font-size:11px;color:var(--text-mute)"
+            title="免密（短信验证码）接入的账号没有密码，14 天会话到期后需要重新生成登录链接收一次验证码">免密登录 · 到期需重新验证</div>` : ''}
       </td>
       <td>${realm}</td>
       <td class="num">${a.credits ?? 0}<div class="bar ${a.credits > 0 ? 'ok' : ''}" style="margin-top:5px">
@@ -742,7 +744,7 @@ function addAccountFlow() {
         <div class="radio-card ${provider === 'qoder' ? 'sel' : ''}" data-pv="qoder">
           <strong>Qoder</strong><small>设备授权 / PAT / 账号 JSON 导入</small></div>
         <div class="radio-card ${provider === 'loomy' ? 'sel' : ''}" data-pv="loomy">
-          <strong>Loomy</strong><small>讯飞 · 手机号密码 / 账号 JSON 导入</small></div>
+          <strong>Loomy</strong><small>讯飞 · 验证码免密 / 登录链接 / 账号 JSON</small></div>
       </div>`,
       `<button class="btn" data-close>取消</button><button class="btn primary" id="next0">下一步</button>`);
     $$('[data-pv]').forEach(c => c.onclick = () => { provider = c.dataset.pv; renderProvider(); });
@@ -1007,32 +1009,47 @@ function addAccountFlow() {
     renderQoder();
   };
 
-  // loomyFlow：手机号 + 密码登录 / 账号 JSON 导入。
-  // Loomy 没有 refresh token，14 天续期靠重新登录，所以必须存密码（文件 0600），
-  // 面板这里不收验证码、也不接受"只给 session"的接入方式。
+  // loomyFlow：短信验证码免密登录（就地完成 / 生成一次性登录链接）+ 密码登录 + JSON 导入。
+  //
+  // Loomy 上游没有 WorkBuddy/Qoder 那种设备授权回调，只有自己的短信登录。
+  // 这里把登录拆成「发送验证码 / 校验」两步，并额外给出一条登录链接：
+  // 链接页（/panel/loomy-login?t=...）与弹窗共用同一份服务端会话，手机浏览器也能打开，
+  // 在那边完成验证码登录后，网关直接拿到 14 天 session 并入池。
   const loomyFlow = () => {
+    let smsTicket = '';
+    let smsURL = '';
+
     const renderLoomy = () => {
+      smsTicket = ''; smsURL = '';
       modal('添加 Loomy 账号', `
-        <p class="muted" style="margin-top:0">用 Loomy App 的手机号 + 密码登录。
-          密码会连同会话一起写入本机账号文件（权限 600），仅用于 14 天后的自动续期。</p>
+        <p class="muted" style="margin-top:0">不需要密码：用手机号收一条短信验证码即可接入。
+          也可以生成一条登录链接，在手机或其它浏览器里打开完成登录，网关会自己接住会话。</p>
+
         <div class="field">
           <label>手机号</label>
-          <input id="lPhone" inputmode="numeric" autocomplete="username" placeholder="13800000000">
-        </div>
-        <div class="field">
-          <label>密码</label>
-          <input type="password" id="lPwd" autocomplete="current-password" placeholder="登录密码">
-        </div>
-        <div class="field">
-          <label>备注（可选）</label>
-          <input id="lName" placeholder="缺省用脱敏手机号">
+          <input id="lPhone" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="13800000000">
         </div>
         <div class="row-flex" style="gap:8px">
-          <button class="btn primary sm" id="lLoginBtn">登录并添加</button>
-          <span class="muted" id="lLoginMsg" style="font-size:12px;align-self:center"></span>
+          <button class="btn primary sm" id="lSendBtn">发送验证码 / 生成登录链接</button>
+          <span class="muted" id="lSendMsg" style="font-size:12px;align-self:center"></span>
         </div>
+        <div id="lSmsBox" style="margin-top:12px"></div>
 
         <details class="form-section" style="margin-top:16px">
+          <summary>手机号 + 密码登录（可自动续期）</summary>
+          <p class="hint" style="margin:8px 0 10px">有密码时网关能在 14 天会话到期前自动重登；
+            免密账号到期后需要重新收一次验证码。</p>
+          <div class="field">
+            <label>密码</label>
+            <input type="password" id="lPwd" autocomplete="current-password" placeholder="登录密码">
+          </div>
+          <div class="row-flex" style="gap:8px">
+            <button class="btn sm" id="lPwdBtn">用密码登录</button>
+            <span class="muted" id="lPwdMsg" style="font-size:12px;align-self:center"></span>
+          </div>
+        </details>
+
+        <details class="form-section">
           <summary>账号文件导入（JSON）</summary>
           <div class="field" style="margin-top:8px">
             <label>粘贴 loomy-*.json 内容（单个对象 / 数组 / {"accounts":[...]}）</label>
@@ -1046,23 +1063,138 @@ function addAccountFlow() {
         </details>`,
         `<button class="btn" data-close>关闭</button>`);
 
-      $('#lLoginBtn').onclick = async () => {
+      const finish = (account) => {
+        closeModal();
+        const c = account || {};
+        toast(`已添加 Loomy 账号${c.nickname ? '：' + c.nickname : ''}${c.credits != null ? '（积分 ' + c.credits + '）' : ''}`, 'ok', 7000);
+        render();
+      };
+
+      // 发验证码成功后的第二屏：就地输码 + 一次性登录链接（可发到手机）。
+      const renderCode = (masked, resendIn) => {
+        const box = $('#lSmsBox');
+        box.innerHTML = `
+          <div class="alert info" style="margin-bottom:12px">验证码已发送至 <b>${esc(masked)}</b>。
+            若在别的设备打开下面的链接，登录状态同样会回到这里。</div>
+          <div class="field">
+            <label>验证码</label>
+            <input id="lCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8" class="mono" placeholder="6 位验证码">
+          </div>
+          <div class="field">
+            <label>备注（可选）</label>
+            <input id="lName" maxlength="32" placeholder="缺省用脱敏手机号">
+          </div>
+          <div class="row-flex" style="gap:8px">
+            <button class="btn primary sm" id="lVerifyBtn">登录并添加</button>
+            <button class="btn sm" id="lCheckBtn" title="如果你是在链接页完成的登录，点这里同步结果">检查登录结果</button>
+            <span class="muted" id="lVerifyMsg" style="font-size:12px;align-self:center"></span>
+          </div>
+          <div style="margin-top:14px">
+            <label style="font-size:12.5px;color:var(--text-dim)">一次性登录链接（15 分钟有效，只用于这一次登录）</label>
+            <div class="url-box" style="margin-top:6px">${esc(smsURL)}</div>
+            <div class="row-flex" style="gap:8px;margin-top:8px">
+              <button class="btn sm" id="lCopyBtn">复制链接</button>
+              <a class="btn sm" id="lOpenBtn" href="${esc(smsURL)}" target="_blank" rel="noopener">在新窗口打开</a>
+            </div>
+          </div>`;
+
+        const verifyBtn = $('#lVerifyBtn');
+        const msg = $('#lVerifyMsg');
+        $('#lCode').focus();
+        verifyBtn.onclick = async () => {
+          const code = $('#lCode').value.trim();
+          if (!code) { toast('请输入验证码', 'err'); return; }
+          verifyBtn.disabled = true; verifyBtn.textContent = '登录中…';
+          msg.textContent = '正在向上游换取会话…';
+          try {
+            const r = await api('/loomy/sms/verify', {
+              method: 'POST',
+              body: { ticket: smsTicket, code, nickname: $('#lName').value.trim() },
+            });
+            finish(r.account);
+          } catch (e) {
+            verifyBtn.disabled = false; verifyBtn.textContent = '重试';
+            msg.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+          }
+        };
+        $('#lCode').addEventListener('keydown', (e) => { if (e.key === 'Enter') verifyBtn.click(); });
+
+        $('#lCheckBtn').onclick = async () => {
+          try {
+            const r = await api('/loomy/sms/status?ticket=' + encodeURIComponent(smsTicket));
+            if (r.state === 'done') { finish(r.account); return; }
+            if (r.state === 'expired' || r.state === 'unknown') {
+              msg.innerHTML = `<span style="color:var(--err)">${esc(r.message || '登录链接已过期')}</span>`;
+              return;
+            }
+            msg.textContent = r.message || '尚未完成登录';
+          } catch (e) {
+            msg.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+          }
+        };
+
+        $('#lCopyBtn').onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(smsURL);
+            toast('登录链接已复制');
+          } catch (_) {
+            toast('复制失败，请手动选中上面的链接', 'warn');
+          }
+        };
+
+        let left = Math.max(0, Number(resendIn) || 0);
+        if (left > 0) {
+          const t = setInterval(() => {
+            left -= 1;
+            const b = $('#lSendBtn');
+            if (!b || !document.body.contains(b) || left <= 0) {
+              clearInterval(t);
+              if (b) { b.disabled = false; b.textContent = '重新发送验证码'; }
+              return;
+            }
+            b.disabled = true; b.textContent = `重新发送（${left}s）`;
+          }, 1000);
+        }
+      };
+
+      $('#lSendBtn').onclick = async () => {
+        const phone = $('#lPhone').value.trim();
+        if (!/^1\d{10}$/.test(phone)) { toast('请输入 11 位大陆手机号', 'err'); return; }
+        const b = $('#lSendBtn');
+        const msg = $('#lSendMsg');
+        const verifyUsed = smsTicket && $('#lCode');
+        b.disabled = true;
+        b.textContent = smsTicket ? '发送中…' : '生成链接并发送…';
+        msg.textContent = '正在向上游请求验证码…';
+        try {
+          if (!smsTicket) {
+            const s = await api('/loomy/sms/start', { method: 'POST', body: {} });
+            smsTicket = s.ticket;
+            smsURL = s.url || '';
+          }
+          const r = await api('/loomy/sms/send', { method: 'POST', body: { ticket: smsTicket, phone } });
+          msg.textContent = '';
+          renderCode(r.phone || phone, r.resend_in || 60);
+          if (verifyUsed) toast('验证码已重新发送');
+        } catch (e) {
+          msg.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+          b.disabled = false;
+          b.textContent = smsTicket ? '重新发送验证码' : '发送验证码 / 生成登录链接';
+        }
+      };
+
+      $('#lPwdBtn').onclick = async () => {
         const loginid = $('#lPhone').value.trim();
         const password = $('#lPwd').value;
-        const nickname = $('#lName').value.trim();
         if (!loginid || !password) { toast('请填写手机号与密码', 'err'); return; }
-        const b = $('#lLoginBtn');
+        const b = $('#lPwdBtn');
         b.disabled = true; b.textContent = '登录中…';
-        $('#lLoginMsg').textContent = '正在登录上游…';
+        $('#lPwdMsg').textContent = '正在登录上游…';
         try {
-          const r = await api('/loomy/login', { method: 'POST', body: { loginid, password, nickname } });
-          closeModal();
-          const c = r.account || {};
-          toast(`已添加 Loomy 账号${c.nickname ? '：' + c.nickname : ''}${c.credits ? '（积分 ' + c.credits + '）' : ''}`, 'ok', 7000);
-          render();
+          const r = await api('/loomy/login', { method: 'POST', body: { loginid, password, nickname: ($('#lName') || {}).value || '' } });
+          finish(r.account);
         } catch (e) {
-          // 错误留在弹窗里：toast 会被弹窗挡住，密码错这类问题需要当场看到
-          $('#lLoginMsg').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+          $('#lPwdMsg').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
           b.disabled = false; b.textContent = '重试';
         }
       };
@@ -1182,7 +1314,7 @@ const SCHEMA = [
   ]},
   { sec: 'Loomy 第三上游', desc: '可选；讯飞桌面 AI 助手，签到 + 新手任务 + 模型网关', fields: [
     { p: 'loomy.enabled', l: '启用 Loomy', t: 'bool', h: '关闭后 Loomy 账号与 loomy: 前缀均不可用' },
-    { p: 'loomy.auth_dir', l: 'Loomy 账号目录', t: 'text', h: '默认 ./loomy_auths；用 cmd/loomylogin 生成 loomy-*.json' },
+    { p: 'loomy.auth_dir', l: 'Loomy 账号目录', t: 'text', h: '默认 ./loomy_auths；面板「添加账号」可用验证码免密/登录链接写入' },
     { p: 'loomy.state_file', l: 'Loomy 状态文件', t: 'text', h: '冷却/熔断状态落盘路径' },
     { p: 'loomy.priority', l: '调度档位', t: 'int', h: '数值大者先试；默认 2 = 在裸名合并调度中最优先（用完自动回落其它上游）' },
     { p: 'loomy.weight', l: '同档位权重', t: 'float', h: '与其它上游同档位时的相对权重' },

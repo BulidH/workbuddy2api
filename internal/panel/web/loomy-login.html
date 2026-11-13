@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loomy 免密登录</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐱</text></svg>">
+<style>
+  .login-wrap { max-width: 430px; margin: 7vh auto 40px; padding: 0 16px; }
+  .login-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .login-head .logo { width: 38px; height: 38px; border-radius: 10px; background: var(--bg-soft);
+    border: 1px solid var(--border); display: grid; place-items: center; font-size: 20px; }
+  .login-head strong { display: block; font-size: 15px; }
+  .login-head small { color: var(--text-mute); font-size: 12px; }
+  .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 18px; }
+  .login-card h2 { font-size: 14px; margin-bottom: 4px; }
+  .login-card .lead { font-size: 12.5px; color: var(--text-dim); margin: 0 0 16px; line-height: 1.6; }
+  .login-card .field { margin-bottom: 12px; }
+  .login-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .login-foot { color: var(--text-mute); font-size: 11.5px; line-height: 1.6; margin-top: 14px; }
+  .login-done { text-align: center; padding: 8px 0 4px; }
+  .login-done .mark { font-size: 34px; line-height: 1; margin-bottom: 8px; }
+  .login-done dl { display: inline-grid; grid-template-columns: auto auto; gap: 6px 14px;
+    text-align: left; margin: 12px auto 4px; font-size: 12.5px; }
+  .login-done dt { color: var(--text-mute); }
+  .login-done dd { margin: 0; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-head">
+    <span class="logo">🌤️</span>
+    <div>
+      <strong>Loomy 免密登录</strong>
+      <small>短信验证码 · 由 workbuddy2api 代为建立账号</small>
+    </div>
+  </div>
+  <div class="login-card" id="card">
+    <div id="panelBody"><p class="muted" style="margin:0">正在读取登录会话…</p></div>
+  </div>
+  <p class="login-foot" id="foot">
+    登录成功后，会话会直接写入网关的 Loomy 账号目录并加入账号池，随后即可关闭本页。
+    本链接 15 分钟内有效、只能用于一次登录；页面里不会出现你的密码。
+  </p>
+</div>
+<script>
+(() => {
+  const ticket = (new URLSearchParams(location.search).get('t') || '').trim();
+  const body = document.getElementById('panelBody');
+  const foot = document.getElementById('foot');
+  let phone = '';
+  let masked = '';
+  let cooldownTimer = null;
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const showAlert = (tone, text) => `<div class="alert ${tone}">${esc(text)}</div>`;
+
+  async function call(path, payload, method = 'POST') {
+    const init = { method, headers: { 'Accept': 'application/json' } };
+    if (method === 'POST') {
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(payload || {});
+    }
+    const resp = await fetch(path, init);
+    let data = {};
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok || data.ok === false) {
+      throw new Error(data.error || ('请求失败（HTTP ' + resp.status + '）'));
+    }
+    return data;
+  }
+
+  function stopCooldown() {
+    if (cooldownTimer) { clearInterval(cooldownTimer); cooldownTimer = null; }
+  }
+
+  function renderFatal(msg) {
+    stopCooldown();
+    body.innerHTML = showAlert('err', msg);
+    foot.textContent = '请回到 WorkBuddy2API 控制台 → 账号管理 → 添加账号 → Loomy，重新生成一条登录链接。';
+  }
+
+  function renderPhone(errMsg) {
+    stopCooldown();
+    body.innerHTML = `
+      ${errMsg ? showAlert('err', errMsg) : ''}
+      <h2>输入 Loomy 绑定手机号</h2>
+      <p class="lead">我们会向这个号码发送一条登录短信验证码。不需要密码。</p>
+      <div class="field">
+        <label for="phone">手机号</label>
+        <input id="phone" type="tel" inputmode="numeric" autocomplete="tel"
+          maxlength="11" placeholder="13800000000" value="${esc(phone)}">
+      </div>
+      <div class="login-actions">
+        <button class="btn primary" id="sendBtn" type="button">发送验证码</button>
+        <span class="muted" id="sendMsg" style="font-size:12px"></span>
+      </div>`;
+    const btn = document.getElementById('sendBtn');
+    const phoneInput = document.getElementById('phone');
+    const doSend = async () => {
+      const value = phoneInput.value.trim();
+      if (!/^1\d{10}$/.test(value)) {
+        document.getElementById('sendMsg').innerHTML = '<span style="color:var(--err)">请输入 11 位大陆手机号</span>';
+        return;
+      }
+      btn.disabled = true; btn.textContent = '发送中…';
+      try {
+        const res = await call('/panel/api/loomy/sms/send', { ticket, phone: value });
+        phone = value;
+        renderCode(res.phone || value, res.resend_in || 60);
+      } catch (e) {
+        btn.disabled = false; btn.textContent = '重新发送';
+        document.getElementById('sendMsg').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+      }
+    };
+    btn.onclick = doSend;
+    phoneInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSend(); });
+    if (location.hash === '#sent') doSend();
+  }
+
+  function renderCode(phoneMasked, resendIn) {
+    stopCooldown();
+    masked = phoneMasked || masked;
+    body.innerHTML = `
+      <h2>输入短信验证码</h2>
+      <p class="lead">验证码已发送至 <strong>${esc(masked)}</strong>。若没收到，可稍后重新发送。</p>
+      <div class="field">
+        <label for="code">验证码</label>
+        <input id="code" type="tel" inputmode="numeric" autocomplete="one-time-code"
+          maxlength="8" placeholder="6 位验证码" class="mono">
+      </div>
+      <div class="field">
+        <label for="nickname">备注（可选）</label>
+        <input id="nickname" type="text" maxlength="32" placeholder="缺省用脱敏手机号">
+      </div>
+      <div class="login-actions">
+        <button class="btn primary" id="verifyBtn" type="button">登录并添加账号</button>
+        <button class="btn ghost sm" id="resendBtn" type="button">重新发送</button>
+        <span class="muted" id="codeMsg" style="font-size:12px"></span>
+      </div>`;
+    const verifyBtn = document.getElementById('verifyBtn');
+    const resendBtn = document.getElementById('resendBtn');
+    const codeInput = document.getElementById('code');
+    const codeMsg = document.getElementById('codeMsg');
+
+    const doVerify = async () => {
+      const code = codeInput.value.trim();
+      if (!code) { codeMsg.innerHTML = '<span style="color:var(--err)">请输入验证码</span>'; return; }
+      verifyBtn.disabled = true; verifyBtn.textContent = '登录中…';
+      codeMsg.textContent = '正在向上游换取会话…';
+      try {
+        const res = await call('/panel/api/loomy/sms/verify', {
+          ticket, code, nickname: document.getElementById('nickname').value.trim(),
+        });
+        renderDone(res.account || {});
+      } catch (e) {
+        verifyBtn.disabled = false; verifyBtn.textContent = '重试';
+        codeMsg.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+      }
+    };
+    verifyBtn.onclick = doVerify;
+    codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doVerify(); });
+    codeInput.focus();
+
+    let left = Math.max(0, Number(resendIn) || 0);
+    const paint = () => {
+      if (left > 0) {
+        resendBtn.disabled = true;
+        resendBtn.textContent = '重新发送（' + left + 's）';
+      } else {
+        resendBtn.disabled = false;
+        resendBtn.textContent = '重新发送';
+        stopCooldown();
+      }
+    };
+    resendBtn.onclick = async () => {
+      resendBtn.disabled = true;
+      try {
+        const res = await call('/panel/api/loomy/sms/send', { ticket, phone });
+        left = Math.max(0, Number(res.resend_in) || 60);
+        paint();
+        codeMsg.innerHTML = '<span style="color:var(--ok)">验证码已重新发送</span>';
+        if (left > 0) {
+          stopCooldown();
+          cooldownTimer = setInterval(() => { left -= 1; paint(); }, 1000);
+        }
+      } catch (e) {
+        left = 0; paint();
+        codeMsg.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+      }
+    };
+    paint();
+    if (left > 0) cooldownTimer = setInterval(() => { left -= 1; paint(); }, 1000);
+  }
+
+  function renderDone(account) {
+    stopCooldown();
+    const nickname = account.nickname || 'Loomy 账号';
+    const credits = account.credits == null ? '—' : account.credits;
+    body.innerHTML = `
+      <div class="login-done">
+        <div class="mark">✅</div>
+        <h2>登录成功</h2>
+        <p class="lead">账号已加入网关账号池，可以关闭此页面了。</p>
+        <dl>
+          <dt>账号</dt><dd>${esc(nickname)}</dd>
+          <dt>手机号</dt><dd>${esc(account.loginid || masked)}</dd>
+          <dt>积分</dt><dd>${esc(credits)}</dd>
+        </dl>
+        <div class="login-actions" style="justify-content:center;margin-top:14px">
+          <a class="btn primary sm" href="/panel/#accounts">回到控制台</a>
+        </div>
+      </div>`;
+    foot.textContent = '这是免密账号：14 天会话到期后需要再生成一条登录链接，重新收验证码登录。';
+  }
+
+  async function init() {
+    if (!ticket) { renderFatal('链接缺少登录票据（ticket），可能被截断了'); return; }
+    try {
+      const st = await call('/panel/api/loomy/sms/status?ticket=' + encodeURIComponent(ticket), null, 'GET');
+      if (st.state === 'done') { renderDone(st.account || {}); return; }
+      if (st.state === 'sent') { renderCode(st.phone_masked, st.resend_in); return; }
+      if (st.state === 'expired' || st.state === 'unknown') {
+        renderFatal(st.message || '登录链接已过期'); return;
+      }
+      renderPhone();
+    } catch (e) {
+      renderFatal(e.message);
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

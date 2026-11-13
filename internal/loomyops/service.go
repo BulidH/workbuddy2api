@@ -46,6 +46,10 @@ type Service struct {
 	mu          sync.Mutex
 	lastAt      time.Time
 	lastSummary string
+
+	// 短信免密登录的一次性会话（见 smslogin.go）。ticket → 暂存的手机号/msgid。
+	smsMu      sync.Mutex
+	smsTickets map[string]*smsTicket
 }
 
 // New 构造服务。
@@ -59,7 +63,7 @@ func New(cfg Config) *Service {
 	if cfg.TaskGap <= 0 {
 		cfg.TaskGap = time.Second
 	}
-	return &Service{cfg: cfg}
+	return &Service{cfg: cfg, smsTickets: map[string]*smsTicket{}}
 }
 
 // LastCheckin 最近一次批次签到的时刻与汇总（零值 = 本进程内尚未执行过）。

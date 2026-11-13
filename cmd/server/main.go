@@ -590,6 +590,40 @@ func main() {
 				}
 				return imported, errs
 			},
+			// ── Loomy 短信免密登录（一次性登录链接）──
+			LoomySMSStart: func() (string, int64, error) {
+				if lops == nil {
+					return "", 0, fmt.Errorf("Loomy 未启用")
+				}
+				ticket, exp := lops.StartSMSLogin()
+				if ticket == "" {
+					return "", 0, fmt.Errorf("登录会话过多，请稍后重试")
+				}
+				return ticket, exp, nil
+			},
+			LoomySMSSend: func(ctx context.Context, ticket, phone string) (loomyops.SMSSendResult, error) {
+				if lops == nil {
+					return loomyops.SMSSendResult{}, fmt.Errorf("Loomy 未启用")
+				}
+				return lops.SendSMS(ctx, ticket, phone)
+			},
+			LoomySMSVerify: func(ctx context.Context, ticket, code, nickname string) (*auth.Auth, error) {
+				if lops == nil {
+					return nil, fmt.Errorf("Loomy 未启用")
+				}
+				a, err := lops.VerifySMS(ctx, ticket, code, nickname)
+				if err != nil {
+					return nil, err
+				}
+				log.Printf("[panel] 已通过短信免密登录添加 Loomy 账号 %s", logfmt.UID8(a.UID))
+				return a, nil
+			},
+			LoomySMSStatus: func(ticket string) loomyops.SMSLoginStatus {
+				if lops == nil {
+					return loomyops.SMSLoginStatus{State: "unknown", Message: "Loomy 未启用"}
+				}
+				return lops.SMSLoginStatus(ticket)
+			},
 			ReloadLoomyAuths: func() (int, error) {
 				if lp == nil {
 					return 0, nil
