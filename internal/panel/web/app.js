@@ -325,7 +325,7 @@ function accountsTable(list, { compact = false } = {}) {
         ${disabledCount ? `<button class="btn sm warn" data-enable-all
           title="解禁所有被禁用的账号（包括当前被隐藏的；重新参与选号）">全部解禁（${disabledCount}）</button>` : ''}
         <button class="btn sm" data-balance
-          title="只读查询所有账号余额（含国际版）。不发签到请求，不触发任何自动调用">查询余额</button>
+          title="只读查询全部已启用上游（WorkBuddy / Qoder / Loomy）的账号余额；不发签到请求，不触发任何自动调用">查询余额</button>
         <button class="btn sm" data-checkin
           title="执行签到流程（上游只对国内版生效，国际版会被 D4 门控跳过）">签到</button>
         ${list.some(a => a.provider === 'qoder') ? `<button class="btn sm" data-qcheckin-all
@@ -425,6 +425,14 @@ async function enableAllDisabled(list, btn) {
   await render();
 }
 
+// PROVIDER_LABEL / providerTag 统一三种上游在提示与表格里的显示口径。
+const PROVIDER_LABEL = { workbuddy: 'WorkBuddy', qoder: 'Qoder', loomy: 'Loomy' };
+function providerTag(p) {
+  if (p === 'qoder') return '<span class="tag ok">Qoder</span>';
+  if (p === 'loomy') return '<span class="tag info">Loomy</span>';
+  return '<span class="tag purple">WorkBuddy</span>';
+}
+
 // runBalance 只读查询所有账号余额（含国际版）。
 // 与「签到」的分工：上游 D4 门控让 global 账号不参与签到任务、不对该域发起任何
 // 自动调用以免触发风控；这里保持门控不动，只做用户显式点击触发的一次只读查询。
@@ -436,17 +444,21 @@ async function runBalance() {
     const outs = r.outcomes || [];
     const got = outs.filter(o => o.credits !== null && o.credits !== undefined);
     const fail = outs.filter(o => o.error);
+    const byProv = r.summary?.by_provider || {};
+    const provText = Object.keys(byProv).length
+      ? '（' + Object.entries(byProv).map(([k, v]) => `${PROVIDER_LABEL[k] || k} ${v}`).join(' · ') + '）' : '';
     const detail = got.map(o => `${o.nickname || o.uid.slice(0, 8)} = ${o.credits}`).join('，');
-    toast(`余额查询完成：成功 ${got.length} · 失败 ${fail.length}` + (detail ? `；${detail}` : ''),
+    toast(`余额查询完成：成功 ${got.length} · 失败 ${fail.length}${provText}` + (detail ? `；${detail}` : ''),
       fail.length ? 'warn' : 'ok', 9000);
     if (fail.length) {
       modal('余额查询明细', `
         <div class="alert warn">以下账号未能取到余额：</div>
         <div class="table-wrap"><table class="tbl">
-          <thead><tr><th>账号</th><th>域</th><th>原因</th></tr></thead>
+          <thead><tr><th>账号</th><th>上游</th><th>域</th><th>原因</th></tr></thead>
           <tbody>${fail.map(o => `<tr>
             <td>${esc(o.nickname || o.uid.slice(0, 12))}</td>
-            <td><span class="tag ${o.realm === 'global' ? 'info' : 'purple'}">${esc(o.realm)}</span></td>
+            <td>${providerTag(o.provider)}</td>
+            <td><span class="tag ${o.realm === 'global' ? 'info' : 'purple'}">${esc(o.realm || '—')}</span></td>
             <td style="font-size:12px;color:var(--text-dim)">${esc(o.error)}</td>
           </tr>`).join('')}</tbody>
         </table></div>`, `<button class="btn primary" data-close>知道了</button>`);

@@ -161,6 +161,8 @@ type CheckinOutcome struct {
 type BalanceOutcome struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname,omitempty"`
+	// Provider 归属上游（workbuddy / qoder / loomy）；一次「查询余额」会查全部已启用上游。
+	Provider string `json:"provider,omitempty"`
 	Realm    string `json:"realm"`
 	Credits  *int64 `json:"credits,omitempty"`
 	Error    string `json:"error,omitempty"`

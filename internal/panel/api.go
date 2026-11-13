@@ -2,6 +2,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -568,13 +569,48 @@ func (p *Panel) handleBalance(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusServiceUnavailable, "余额查询入口不可用")
 		return
 	}
+	// 「查询余额」查全部已启用上游，而不是只查 WorkBuddy：账号页把三个上游的号
+	// 排在同一张表里，只刷一部分会让另两家的积分看起来永远不动。
 	outcomes, err := p.deps.QueryBalances()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "余额查询失败："+err.Error())
 		return
 	}
+	for i := range outcomes {
+		outcomes[i].Provider = auth.ProviderWorkBuddy
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	// Qoder / Loomy 是独立账号池，走各自的上游接口；单侧失败不应让整次查询报错。
+	if p.deps.QoderEnabled && p.deps.QoderBalance != nil {
+		if qs, err := p.deps.QoderBalance(ctx, nil); err == nil {
+			for _, o := range qs {
+				outcomes = append(outcomes, BalanceOutcome{
+					UID: o.UID, Nickname: o.Nickname, Provider: auth.ProviderQoder,
+					Realm: o.Realm, Credits: o.Credits, Error: o.Error,
+				})
+			}
+		} else {
+			outcomes = append(outcomes, BalanceOutcome{Provider: auth.ProviderQoder, Error: err.Error()})
+		}
+	}
+	if p.deps.LoomyEnabled && p.deps.LoomyBalance != nil {
+		if ls, err := p.deps.LoomyBalance(ctx, nil); err == nil {
+			for _, o := range ls {
+				outcomes = append(outcomes, BalanceOutcome{
+					UID: o.UID, Nickname: o.Nickname, Provider: auth.ProviderLoomy,
+					Realm: "cn", Credits: o.Credits, Error: o.Error,
+				})
+			}
+		} else {
+			outcomes = append(outcomes, BalanceOutcome{Provider: auth.ProviderLoomy, Error: err.Error()})
+		}
+	}
+
 	okN, failN := 0, 0
 	byRealm := map[string]int{}
+	byProvider := map[string]int{}
 	for _, o := range outcomes {
 		if o.Error != "" {
 			failN++
@@ -582,14 +618,26 @@ func (p *Panel) handleBalance(w http.ResponseWriter, r *http.Request) {
 		}
 		okN++
 		byRealm[o.Realm]++
+		byProvider[firstNonEmpty(o.Provider, auth.ProviderWorkBuddy)]++
 	}
 	okJSON(w, map[string]any{
 		"ok":       true,
 		"outcomes": outcomes,
 		"summary": map[string]any{
-			"total": len(outcomes), "ok": okN, "fail": failN, "by_realm": byRealm,
+			"total": len(outcomes), "ok": okN, "fail": failN,
+			"by_realm": byRealm, "by_provider": byProvider,
 		},
 	})
+}
+
+// firstNonEmpty 返回第一个非空字符串（汇总统计里给缺省 provider 兜底）。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // handleRestart 触发进程退出（依赖 docker restart 策略拉起，用于 listen 等装配期配置）。
