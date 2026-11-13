@@ -38,12 +38,12 @@ func (p *Panel) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	}
 	st, _ := os.Stat(p.deps.ConfigPath)
 	okJSON(w, map[string]any{
-		"ok":            true,
-		"config":        obj,
-		"path":          p.deps.ConfigPath,
-		"restart_keys":  RestartRequiredKeys,
-		"modified_at":   modTime(st),
-		"raw_size":      len(raw),
+		"ok":           true,
+		"config":       obj,
+		"path":         p.deps.ConfigPath,
+		"restart_keys": RestartRequiredKeys,
+		"modified_at":  modTime(st),
+		"raw_size":     len(raw),
 	})
 }
 

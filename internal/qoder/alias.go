@@ -11,6 +11,8 @@ import "strings"
 type ModelAlias struct {
 	WorkBuddy string `json:"workbuddy,omitempty"`
 	Qoder     string `json:"qoder,omitempty"`
+	// Loomy Loomy 侧模型名（如 deepseek-v4-flash-0731）。
+	Loomy string `json:"loomy,omitempty"`
 }
 
 // LookupAlias 按归一化模型名查别名（大小写、连字符差异都视为同一个名字）。
@@ -35,6 +37,8 @@ func (a ModelAlias) Target(provider string) string {
 		return strings.TrimSpace(a.Qoder)
 	case "workbuddy", "cn", "global":
 		return strings.TrimSpace(a.WorkBuddy)
+	case "loomy":
+		return strings.TrimSpace(a.Loomy)
 	}
 	return ""
 }

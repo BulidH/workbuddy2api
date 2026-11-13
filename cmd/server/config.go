@@ -151,10 +151,13 @@ type Config struct {
 	// Qoder 第二上游（账号池 + 模型目录 + COSY 协议客户端）。
 	// enabled=false 时完全不加载 Qoder 账号，模型路由退化为纯 WorkBuddy。
 	Qoder struct {
-		Enabled        bool                      `json:"enabled"`
-		AuthDir        string                    `json:"auth_dir"`
-		StateFile      string                    `json:"state_file"`
-		Weight         float64                   `json:"weight"`          // 裸名合并调度时的相对权重，默认 1.0
+		Enabled   bool    `json:"enabled"`
+		AuthDir   string  `json:"auth_dir"`
+		StateFile string  `json:"state_file"`
+		Weight    float64 `json:"weight"` // 裸名合并调度时的相对权重，默认 1.0
+		// Priority 裸名合并调度的档位：数值大者先试，同档内按 weight 加权。
+		// 缺省 1（与 WorkBuddy 平级）；Loomy 默认 2，因此「deepseek 优先走 Loomy」。
+		Priority       int                       `json:"priority"`
 		CosyVersion    string                    `json:"cosy_version"`    // 缺省 1.1.75
 		TimeoutSeconds int                       `json:"timeout_seconds"` // 聊天流总时长上限，默认 600
 		Endpoints      map[string]qoder.Endpoint `json:"endpoints"`       // 空 = 官方双区域默认
@@ -197,6 +200,51 @@ type Config struct {
 		// AnthropicThinking off（默认）/ empty。
 		AnthropicThinking string `json:"anthropic_thinking"`
 	} `json:"qoder"`
+
+	// Loomy 第三上游（讯飞桌面 AI 助手；账号池 + 模型网关）。
+	// enabled=false 时完全不加载 Loomy 账号，路由退化为 WorkBuddy/Qoder 两上游。
+	//
+	// Loomy 协议要点：账号服务用 HMAC-SHA1 签名 + RSA 加密口令换 14 天 session，
+	// 没有 refresh token（续期 = 用 loginid/password 重登）；模型网关是
+	// OpenAI 兼容 SSE，成本以 points_consumed 计。
+	Loomy struct {
+		Enabled   bool    `json:"enabled"`
+		AuthDir   string  `json:"auth_dir"`   // loomy*.json 目录，默认 ./loomy_auths
+		StateFile string  `json:"state_file"` // 池状态落盘，默认 ./data/loomy_state.json
+		Weight    float64 `json:"weight"`     // 同优先级上游之间的相对权重，默认 1.0
+		// Priority 裸名合并调度的上游优先级：数值大者先试（Loomy 用完后自动回落其它
+		// 上游）。缺省 2 = 永远排在最前（用户的「deepseek 优先走 loomy」要求）；
+		// 设 0/1 与 WorkBuddy/Qoder 平级，按 weight 加权抽签；负数 = 不参与裸名调度
+		// （仅 loomy: 前缀显式可用）。
+		Priority int `json:"priority"`
+
+		Version        string `json:"version"`         // loomy-version 头，默认 0.9.38
+		TimeoutSeconds int    `json:"timeout_seconds"` // 聊天流总时长上限，默认 600
+
+		// ModelBase / AccountBase 上游域名（空 = 官方地址）。
+		ModelBase   string `json:"model_base"`
+		AccountBase string `json:"account_base"`
+		// AccessKeyID/Secret 账号服务签名密钥（空 = 内置客户端密钥）。
+		AccessKeyID     string `json:"access_key_id"`
+		AccessKeySecret string `json:"access_key_secret"`
+		// RequestPurpose X-Loomy-Request-Purpose 头，默认 chat.message。
+		RequestPurpose string `json:"request_purpose"`
+
+		// CheckinHours/KeepaliveHours Loomy 独立排程；空 = [9,21] / [22]。
+		CheckinHours   []int `json:"checkin_hours"`
+		KeepaliveHours []int `json:"keepalive_hours"`
+		// 开关缺省 true；false = 停止该排程。
+		CheckinEnabled   bool `json:"checkin_enabled"`
+		KeepaliveEnabled bool `json:"keepalive_enabled"`
+		CheckinOnStartup bool `json:"checkin_on_startup"`
+		// OnboardingEnabled 签到同时领取 8 项新手任务（共 10000 分），默认 true。
+		OnboardingEnabled bool `json:"onboarding_enabled"`
+
+		// RequestGapSeconds 批量操作账号间间隔（秒），缺省 1.0，防风控。
+		RequestGapSeconds float64 `json:"request_gap_seconds"`
+		// SessionRenewBeforeDays 会话剩余不足几天时提前重登，缺省 3。
+		SessionRenewBeforeDays float64 `json:"session_renew_before_days"`
+	} `json:"loomy"`
 
 	// Panel 内置 Web 管理面板（/panel/）。缺省启用；显式 enabled=false 关闭。
 	// 面板无鉴权，仅供本机/内网运维使用——公网暴露前务必自行加反代鉴权。
@@ -262,6 +310,7 @@ func Default() *Config {
 	c.Qoder.AuthDir = "./qoder_auths"
 	c.Qoder.StateFile = "./data/qoder_state.json"
 	c.Qoder.Weight = 1.0
+	c.Qoder.Priority = 1
 	c.Qoder.CosyVersion = "1.1.75"
 	c.Qoder.TimeoutSeconds = 600
 	c.Qoder.DesktopVersion = "0.4.8"
@@ -275,6 +324,22 @@ func Default() *Config {
 	c.Qoder.Guard.MaxWaitMs = 20000
 	c.Qoder.Guard.JitterMs = 120
 	c.Qoder.AnthropicThinking = "off"
+
+	// Loomy 同样缺省关闭：没有 loomy_auths 目录时不引入第三上游。
+	c.Loomy.Enabled = false
+	c.Loomy.AuthDir = "./loomy_auths"
+	c.Loomy.StateFile = "./data/loomy_state.json"
+	c.Loomy.Weight = 1.0
+	c.Loomy.Priority = 2
+	c.Loomy.Version = "0.9.38"
+	c.Loomy.TimeoutSeconds = 600
+	c.Loomy.RequestPurpose = "chat.message"
+	c.Loomy.CheckinEnabled = true
+	c.Loomy.KeepaliveEnabled = true
+	c.Loomy.CheckinOnStartup = true
+	c.Loomy.OnboardingEnabled = true
+	c.Loomy.RequestGapSeconds = 1.0
+	c.Loomy.SessionRenewBeforeDays = 3
 	return c
 }
 
@@ -401,6 +466,27 @@ func applyEnv(c *Config) {
 			c.Qoder.Weight = f
 		}
 	}
+	if v := os.Getenv("WB2A_LOOMY_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Loomy.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_LOOMY_AUTH_DIR"); v != "" {
+		c.Loomy.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_LOOMY_STATE_FILE"); v != "" {
+		c.Loomy.StateFile = v
+	}
+	if v := os.Getenv("WB2A_LOOMY_WEIGHT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Loomy.Weight = f
+		}
+	}
+	if v := os.Getenv("WB2A_LOOMY_PRIORITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Loomy.Priority = n
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -457,6 +543,7 @@ func (c *Config) normalize() error {
 	}
 	if c.Qoder.Weight <= 0 {
 		c.Qoder.Weight = 1.0
+		c.Qoder.Priority = 1
 	}
 	if c.Qoder.CosyVersion == "" {
 		c.Qoder.CosyVersion = "1.1.75"
@@ -504,6 +591,43 @@ func (c *Config) normalize() error {
 	}
 	if c.Qoder.AnthropicThinking == "" {
 		c.Qoder.AnthropicThinking = "off"
+	}
+
+	// ── Loomy ──
+	if c.Loomy.AuthDir == "" {
+		c.Loomy.AuthDir = "./loomy_auths"
+	}
+	if c.Loomy.StateFile == "" {
+		c.Loomy.StateFile = "./data/loomy_state.json"
+	}
+	if c.Loomy.Weight <= 0 {
+		c.Loomy.Weight = 1.0
+	}
+	if c.Loomy.Version == "" {
+		c.Loomy.Version = "0.9.38"
+	}
+	if c.Loomy.TimeoutSeconds <= 0 {
+		c.Loomy.TimeoutSeconds = 600
+	}
+	if c.Loomy.RequestPurpose == "" {
+		c.Loomy.RequestPurpose = "chat.message"
+	}
+	if len(c.Loomy.CheckinHours) == 0 {
+		c.Loomy.CheckinHours = []int{9, 21}
+	}
+	if len(c.Loomy.KeepaliveHours) == 0 {
+		c.Loomy.KeepaliveHours = []int{22}
+	}
+	for _, h := range append(append([]int{}, c.Loomy.CheckinHours...), c.Loomy.KeepaliveHours...) {
+		if h < 0 || h > 23 {
+			return fmt.Errorf("loomy.checkin_hours/keepalive_hours: %d 不是合法小时（0-23）；如要关闭请用 loomy.checkin_enabled=false / keepalive_enabled=false", h)
+		}
+	}
+	if c.Loomy.RequestGapSeconds <= 0 {
+		c.Loomy.RequestGapSeconds = 1.0
+	}
+	if c.Loomy.SessionRenewBeforeDays <= 0 {
+		c.Loomy.SessionRenewBeforeDays = 3
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120

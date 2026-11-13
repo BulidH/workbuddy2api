@@ -88,8 +88,31 @@
     "aliases": {
       "deepseek-flash": {
         "workbuddy": "deepseek-v4.1-flash",
-        "qoder": "DeepSeek-Flash"
+        "qoder": "DeepSeek-Flash",
+        "loomy": "deepseek-v4-flash-0731"
       }
     }
+  },
+  "loomy": {
+    "enabled": false,
+    "auth_dir": "./loomy_auths",
+    "state_file": "./data/loomy_state.json",
+    "weight": 1.0,
+    "priority": 2,
+    "version": "0.9.38",
+    "timeout_seconds": 600,
+    "model_base": "https://loomyad.xunfei.cn/api/v1",
+    "account_base": "https://account.xfinfr.com",
+    "access_key_id": "",
+    "access_key_secret": "",
+    "request_purpose": "chat.message",
+    "checkin_hours": [9, 21],
+    "keepalive_hours": [22],
+    "checkin_enabled": true,
+    "keepalive_enabled": true,
+    "checkin_on_startup": true,
+    "onboarding_enabled": true,
+    "request_gap_seconds": 1.0,
+    "session_renew_before_days": 3
   }
 }

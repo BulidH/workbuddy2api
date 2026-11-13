@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/agentcfg"
+	"workbuddy2api/internal/loomyops"
 	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/qoderops"
 )
@@ -121,6 +122,20 @@ type Deps struct {
 	QoderLastCheckin    func() (time.Time, string)
 	QoderActivity       *qoder.ActivityLog
 
+	// ── Loomy 第三上游（可选；LoomyEnabled=false 时全部忽略）──
+	LoomyEnabled bool
+	LoomyAuthDir string
+	// ReloadLoomyAuths 重扫 Loomy 账号目录并对齐 Loomy 池。
+	ReloadLoomyAuths func() (int, error)
+	// SetLoomyAccountEnabled 手动启用/禁用 Loomy 账号。
+	SetLoomyAccountEnabled func(uid string, enabled bool) error
+	// LoomyCheckin 批量签到（每日积分 + 新手任务领取 + 余额刷新）。
+	LoomyCheckin func(ctx context.Context, uids []string) ([]loomyops.CheckinOutcome, error)
+	// LoomyBalance 批量刷新 Loomy 积分余额（只读）。
+	LoomyBalance func(ctx context.Context, uids []string) ([]loomyops.BalanceOutcome, error)
+	// LoomyLastCheckin 最近一次 Loomy 批次签到的时刻与汇总。
+	LoomyLastCheckin func() (time.Time, string)
+
 	// Agents 智能体一键配置（可选；nil 时相关接口返回 501）。
 	// 只读写本机客户端配置与 state 目录，密钥不落网关 state。
 	Agents *agentcfg.Service
@@ -203,6 +218,8 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("POST /panel/api/qoder/campaign/claim", p.handleQoderClaim)
 	p.mux.HandleFunc("POST /panel/api/qoder/prefs", p.handleQoderPrefs)
 	p.mux.HandleFunc("GET /panel/api/qoder/activity", p.handleQoderActivity)
+	p.mux.HandleFunc("POST /panel/api/loomy/checkin", p.handleLoomyCheckin)
+	p.mux.HandleFunc("POST /panel/api/loomy/balance", p.handleLoomyBalance)
 
 	// ── 智能体一键配置（本机客户端）──────────────────────
 	p.mux.HandleFunc("GET /panel/api/agents", p.handleAgentsOverview)
@@ -275,6 +292,25 @@ func (p *Panel) authFilePath(uid string) (string, bool) {
 	abs := filepath.Join(p.deps.AuthDir, "workbuddy-"+uid+".json")
 	// 二次确认：拼接结果必须仍在 AuthDir 内
 	if !strings.HasPrefix(filepath.Clean(abs), filepath.Clean(p.deps.AuthDir)) {
+		return "", false
+	}
+	return abs, true
+}
+
+// loomyFilePath 同 authFilePath，但定位 Loomy 账号目录（loomy-<uid>.json）。
+func (p *Panel) loomyFilePath(uid string) (string, bool) {
+	if !p.deps.LoomyEnabled || uid == "" || len(uid) > 128 {
+		return "", false
+	}
+	for _, c := range uid {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return "", false
+		}
+	}
+	abs := filepath.Join(p.deps.LoomyAuthDir, "loomy-"+uid+".json")
+	if !strings.HasPrefix(filepath.Clean(abs), filepath.Clean(p.deps.LoomyAuthDir)) {
 		return "", false
 	}
 	return abs, true

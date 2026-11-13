@@ -18,6 +18,8 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/guard"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/loomy"
+	"workbuddy2api/internal/loomyops"
 	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/qoder"
@@ -113,9 +115,47 @@ func main() {
 			Gap:      time.Duration(cfg.Qoder.RequestGapSeconds * float64(time.Second)),
 		})
 	}
+	// Loomy 第三上游：同样独立账号目录 + 独立池（冷却/熔断互不影响）。
+	var lp *pool.Pool
+	var lclient *loomy.Client
+	var lops *loomyops.Service
+	if cfg.Loomy.Enabled {
+		loomyAuths, lerr := auth.LoadLoomyDir(cfg.Loomy.AuthDir)
+		if lerr != nil {
+			log.Printf("WARN: load loomy auths from %s: %v", cfg.Loomy.AuthDir, lerr)
+		}
+		log.Printf("loaded %d loomy account(s) from %s", len(loomyAuths), cfg.Loomy.AuthDir)
+		lp = pool.New(cfg.Loomy.StateFile)
+		lp.RestoreFromSnapshot()
+		lp.SyncToDir(loomyAuths)
+		lp.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+		lp.SetMaxInFlight(cfg.Pool.MaxInFlight)
+		lp.SetSoftRateMax(cfg.SoftRateMaxDur)
+		lp.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+		lp.SetFreeTierBonus(cfg.Pool.FreeTierBonus)
+		lclient = loomy.New(loomy.Config{
+			ModelBase:       cfg.Loomy.ModelBase,
+			AccountBase:     cfg.Loomy.AccountBase,
+			AccessKeyID:     cfg.Loomy.AccessKeyID,
+			AccessKeySecret: cfg.Loomy.AccessKeySecret,
+			Version:         cfg.Loomy.Version,
+			RequestPurpose:  cfg.Loomy.RequestPurpose,
+			Timeout:         time.Duration(cfg.Loomy.TimeoutSeconds) * time.Second,
+		})
+		lops = loomyops.New(loomyops.Config{
+			Pool:            lp,
+			Client:          lclient,
+			Gap:             time.Duration(cfg.Loomy.RequestGapSeconds * float64(time.Second)),
+			ClaimOnboarding: cfg.Loomy.OnboardingEnabled,
+			TaskGap:         time.Duration(cfg.Loomy.RequestGapSeconds * float64(time.Second)),
+		})
+	}
 	closePools := func() {
 		if qp != nil {
 			qp.Close()
+		}
+		if lp != nil {
+			lp.Close()
 		}
 	}
 	defer closePools()
@@ -158,7 +198,7 @@ func main() {
 			// 而不是被钉在这个号上反复失败。
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
 			// 见 wiring.go）；裸名走 cn（现状零回归）。
-			AvailableForModel: realmAwareAvailableForModel(p, qp),
+			AvailableForModel: realmAwareAvailableForModel3(p, qp, lp),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -222,6 +262,12 @@ func main() {
 		QoderKeepaliveHours:    cfg.Qoder.KeepaliveHours,
 		QoderCheckinDisabled:   cfg.Qoder.CheckinEnabled == false,
 		QoderKeepaliveDisabled: cfg.Qoder.KeepaliveEnabled == false,
+		LoomyOps:               lops,
+		LoomyCheckinHours:      cfg.Loomy.CheckinHours,
+		LoomyKeepaliveHours:    cfg.Loomy.KeepaliveHours,
+		LoomyCheckinDisabled:   cfg.Loomy.CheckinEnabled == false,
+		LoomyKeepaliveDisabled: cfg.Loomy.KeepaliveEnabled == false,
+		LoomyRenewBefore:       time.Duration(cfg.Loomy.SessionRenewBeforeDays * float64(24*time.Hour)),
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -267,6 +313,21 @@ func main() {
 		} else {
 			log.Printf("Qoder token 保活已禁用（qoder.keepalive_enabled=false）")
 		}
+	}
+	if cfg.Loomy.Enabled {
+		if cfg.Loomy.CheckinEnabled {
+			log.Printf("Loomy 签到已启用：%v 点（每日积分%s）", cfg.Loomy.CheckinHours,
+				map[bool]string{true: " + 新手任务领取", false: ""}[cfg.Loomy.OnboardingEnabled])
+		} else {
+			log.Printf("Loomy 签到已禁用（loomy.checkin_enabled=false）")
+		}
+		if cfg.Loomy.KeepaliveEnabled {
+			log.Printf("Loomy 会话续期已启用：%v 点（剩余不足 %.0f 天时重登）",
+				cfg.Loomy.KeepaliveHours, cfg.Loomy.SessionRenewBeforeDays)
+		} else {
+			log.Printf("Loomy 会话续期已禁用（loomy.keepalive_enabled=false）")
+		}
+		log.Printf("Loomy 调度档位 priority=%d（裸名合并调度数值大者先试）", cfg.Loomy.Priority)
 	}
 
 	// ── 内置 Web 管理面板 ─────────────────────────────────────────────
@@ -503,6 +564,55 @@ func main() {
 				return qops.LastCheckin()
 			},
 			QoderActivity: qactivity,
+
+			// ── Loomy 第三上游 ──
+			LoomyEnabled: cfg.Loomy.Enabled,
+			LoomyAuthDir: cfg.Loomy.AuthDir,
+			ReloadLoomyAuths: func() (int, error) {
+				if lp == nil {
+					return 0, nil
+				}
+				auths, err := auth.LoadLoomyDir(cfg.Loomy.AuthDir)
+				if err != nil {
+					return 0, err
+				}
+				lp.SyncToDir(auths)
+				return len(auths), nil
+			},
+			SetLoomyAccountEnabled: func(uid string, enabled bool) error {
+				if lp == nil {
+					return fmt.Errorf("Loomy 未启用")
+				}
+				if _, ok := lp.Status(uid); !ok {
+					return fmt.Errorf("账号不在池内: %s", uid)
+				}
+				if enabled {
+					lp.ReviveDisabled(uid)
+					log.Printf("[panel] 手动解禁 Loomy 账号 %s", logfmt.UID8(uid))
+				} else {
+					lp.Disable(uid, "disabled manually via panel")
+					log.Printf("[panel] 手动禁用 Loomy 账号 %s", logfmt.UID8(uid))
+				}
+				return nil
+			},
+			LoomyCheckin: func(ctx context.Context, uids []string) ([]loomyops.CheckinOutcome, error) {
+				if lops == nil {
+					return nil, fmt.Errorf("Loomy 未启用")
+				}
+				return lops.CheckinAll(ctx, uids)
+			},
+			LoomyBalance: func(ctx context.Context, uids []string) ([]loomyops.BalanceOutcome, error) {
+				if lops == nil {
+					return nil, fmt.Errorf("Loomy 未启用")
+				}
+				return lops.RefreshBalances(ctx, uids)
+			},
+			LoomyLastCheckin: func() (time.Time, string) {
+				if lops == nil {
+					return time.Time{}, ""
+				}
+				return lops.LastCheckin()
+			},
 			// 智能体配置的 state/备份放在状态文件同目录，默认 ./accounts。
 			Agents: agentcfg.New(filepath.Dir(cfg.StateFile), ""),
 		})
@@ -536,11 +646,43 @@ func main() {
 		QoderWebTools:     cfg.Qoder.WebTools,
 		QoderAliases:      cfg.Qoder.Aliases,
 		AnthropicThinking: cfg.Qoder.AnthropicThinking,
+
+		// Loomy 第三上游（未启用时零值，路由自动忽略）。
+		Loomy:         lclient,
+		LoomyPool:     lp,
+		LoomyWeight:   cfg.Loomy.Weight,
+		LoomyPriority: cfg.Loomy.Priority,
+		// WorkBuddy 无独立档位（恒 1）；Qoder 可由 qoder.priority 调整。
+		QoderPriority: cfg.Qoder.Priority,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// Loomy 模型目录：启动即拉一次，之后每小时刷新（失败静默，保留内嵌兜底清单）。
+	// 目录决定「裸名合并调度时 Loomy 认不认识这个模型」，冷启动也必须有一份。
+	if lclient != nil && lp != nil {
+		go func() {
+			refresh := func() {
+				if a := lp.Pick(""); a != nil {
+					cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					lclient.EnsureCatalog(cctx, a)
+					ccancel()
+				}
+			}
+			refresh()
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					refresh()
+				}
+			}
+		}()
+	}
 	// 启动补跑签到（schedule.checkin_on_startup，缺省 true）。
 	// 调度器只在整点触发且启动时不跑，nextFire 对已过时点直接 +24h——容器在签到时点
 	// 未运行时当天那次就被整体跳过。签到幂等，补跑安全。
@@ -562,6 +704,20 @@ func main() {
 		log.Printf("已安排 Qoder 启动补跑签到（%s 后执行一次，可用 qoder.checkin_on_startup=false 关闭）",
 			scheduler.StartupCatchUpDelay)
 	}
+	// Loomy 启动补跑：签到按天幂等（当日重复签到上游返回 already），
+	// 新手任务领取也带前后回读，补跑安全。
+	if lops != nil && cfg.Loomy.CheckinEnabled && cfg.Loomy.CheckinOnStartup {
+		go func() {
+			time.Sleep(scheduler.StartupCatchUpDelay)
+			lctx, lcancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer lcancel()
+			if _, err := lops.CheckinAll(lctx, nil); err != nil {
+				log.Printf("loomy 启动补跑签到: %v", err)
+			}
+		}()
+		log.Printf("已安排 Loomy 启动补跑签到（%s 后执行一次，可用 loomy.checkin_on_startup=false 关闭）",
+			scheduler.StartupCatchUpDelay)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -580,6 +736,9 @@ func main() {
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		if qp != nil {
 			qp.Flush()
+		}
+		if lp != nil {
+			lp.Flush()
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

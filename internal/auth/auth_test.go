@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseNested(t *testing.T) {
@@ -262,5 +263,83 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		!strings.Contains(string(raw), "workbuddy-a-cn.json") ||
 		!strings.Contains(string(raw), "workbuddy-z-global.json") {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
+	}
+}
+
+// TestParseLoomyAndRoundTrip Loomy 账号文件解析 + 写回：手机号/密码必须原样保留
+// （无 refresh token，密码是唯一的续期依据），identity 内的设备号不丢。
+func TestParseLoomyAndRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte(`{
+	  "uid": "u-1001",
+	  "nickname": "138****8000",
+	  "loginid": "13800008000",
+	  "password": "secret-pwd",
+	  "accessToken": "session-abc",
+	  "expiresAt": 1800000000,
+	  "identity": {"devid": "web-1234", "campus_device_id": "loomy-campus-x"}
+	}`)
+	a, err := ParseLoomy(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !a.IsLoomy() || a.Provider() != ProviderLoomy {
+		t.Fatalf("provider=%q", a.Provider())
+	}
+	if a.Realm() != "cn" {
+		t.Errorf("Loomy 恒 cn，得 %q", a.Realm())
+	}
+	if a.LoginID != "13800008000" || a.Password != "secret-pwd" {
+		t.Errorf("凭证字段丢失: %+v", a)
+	}
+	if a.LoomyDevID != "web-1234" || a.LoomyCampusDeviceID != "loomy-campus-x" {
+		t.Errorf("identity 丢失: %q %q", a.LoomyDevID, a.LoomyCampusDeviceID)
+	}
+
+	a.FilePath = LoomyFilePath(dir, a.UID)
+	if err := a.UpdateLoomyCredits(map[string]any{"available": float64(1234)}); err != nil {
+		t.Fatalf("save credits: %v", err)
+	}
+	if err := a.UpdateCheckinState(ProviderLoomy, "2026-11-13T09:00:00+08:00"); err != nil {
+		t.Fatalf("save checkin: %v", err)
+	}
+	loaded, err := LoadLoomyDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("应加载 1 个账号，得 %d", len(loaded))
+	}
+	got := loaded[0]
+	if got.Password != "secret-pwd" || got.LoginID != "13800008000" {
+		t.Errorf("写回后凭证丢失: %+v", got)
+	}
+	if !got.CheckedInToday(time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)) {
+		t.Errorf("当天签到章丢失: %q", got.LastCheckin)
+	}
+	if got.Credits["available"] != float64(1234) {
+		t.Errorf("余额快照丢失: %v", got.Credits)
+	}
+}
+
+// TestParseLoomyRequiresCredentials 既无 session 也无密码的账号文件必须解析失败。
+func TestParseLoomyRequiresCredentials(t *testing.T) {
+	if _, err := ParseLoomy([]byte(`{"uid":"x"}`)); err == nil {
+		t.Fatal("缺凭证应当报错")
+	}
+	// 只有密码也能解析（首次启动未登录时手工预置，登录后补 session）。
+	if _, err := ParseLoomy([]byte(`{"loginid":"138","password":"p"}`)); err != nil {
+		t.Fatalf("只有密码应可解析: %v", err)
+	}
+}
+
+// TestNewLoomyAuthDefaults uid/昵称缺省派生，且不泄漏完整手机号。
+func TestNewLoomyAuthDefaults(t *testing.T) {
+	a := NewLoomyAuth("", "", "13800008000", "p", "s", 123)
+	if a.UID == "" {
+		t.Fatal("uid 应自动生成")
+	}
+	if a.Nickname != "138****8000" {
+		t.Errorf("昵称应脱敏手机号，得 %q", a.Nickname)
 	}
 }

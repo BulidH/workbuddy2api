@@ -169,6 +169,7 @@ async function viewOverview() {
   const rt = ov.realm_totals || {};
   const g = (rt.global || {}), n = (rt.cn || {});
   const qd = (ov.providers || {}).qoder;
+  const lm = (ov.providers || {}).loomy;
 
   const card = (label, value, foot, cls = '') =>
     `<div class="card stat ${cls}"><div class="stat-label">${label}</div>
@@ -177,8 +178,8 @@ async function viewOverview() {
   $('#view').innerHTML = `
     ${c.credential_mismatch ?? (c.auth_files !== c.total) ? `
       <div class="alert warn">
-        <b>凭证文件数与池内账号数不一致（WorkBuddy ${c.auth_files_workbuddy ?? c.auth_files}/${c.pool_workbuddy ?? c.total}，Qoder ${c.auth_files_qoder ?? 0}/${c.pool_qoder ?? 0}）。</b>
-        可能有凭证文件解析失败或未被加载。点击下方「重载账号」重新对齐两个 Provider 的账号池。
+        <b>凭证文件数与池内账号数不一致（WorkBuddy ${c.auth_files_workbuddy ?? c.auth_files}/${c.pool_workbuddy ?? c.total}，Qoder ${c.auth_files_qoder ?? 0}/${c.pool_qoder ?? 0}，Loomy ${c.auth_files_loomy ?? 0}/${c.pool_loomy ?? 0}）。</b>
+        可能有凭证文件解析失败或未被加载。点击下方「重载账号」重新对齐各 Provider 的账号池。
         <button class="btn sm" style="margin-left:8px" id="reloadAcc">重载账号</button>
       </div>` : ''}
 
@@ -209,6 +210,12 @@ async function viewOverview() {
                   <td>${qd.healthy > 0 ? '<span class="tag ok"><i class="tdot"></i>可服务</span>'
                                     : '<span class="tag gray">无可用账号</span>'}</td></tr>`
                   : `<tr><td><span class="tag gray">Qoder</span></td><td class="mono">qoder:</td>
+                  <td class="num">—</td><td class="num">—</td><td><span class="tag gray">未启用</span></td></tr>`}
+              ${lm ? `<tr><td><span class="tag info">Loomy</span></td><td class="mono">loomy:</td>
+                  <td class="num">${lm.total || 0}</td><td class="num">${lm.healthy || 0}</td>
+                  <td>${lm.healthy > 0 ? '<span class="tag ok"><i class="tdot"></i>可服务</span>'
+                                    : '<span class="tag gray">无可用账号</span>'}</td></tr>`
+                  : `<tr><td><span class="tag gray">Loomy</span></td><td class="mono">loomy:</td>
                   <td class="num">—</td><td class="num">—</td><td><span class="tag gray">未启用</span></td></tr>`}
             </tbody>
           </table>
@@ -271,10 +278,13 @@ function accountsTable(list, { compact = false } = {}) {
     else if (a.in_flight > 0) st = `<span class="tag info"><i class="tdot"></i>在途 ${a.in_flight}</span>`;
 
     const qoder = a.provider === 'qoder';
+    const loomy = a.provider === 'loomy';
     const realm = qoder
       ? `<span class="tag ok">Qoder ${a.realm === 'intl' ? '国际' : '国内'}</span>`
-      : (a.realm === 'global'
-        ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>');
+      : loomy
+        ? '<span class="tag info">Loomy 国内</span>'
+        : (a.realm === 'global'
+          ? '<span class="tag info">国际版</span>' : '<span class="tag purple">国内版</span>');
     const pct = Math.min(100, Math.round(((a.credits || 0) / maxCredit) * 100));
 
     return `<tr${a.disabled ? ' class="row-disabled"' : ''}>
@@ -320,6 +330,8 @@ function accountsTable(list, { compact = false } = {}) {
           title="执行签到流程（上游只对国内版生效，国际版会被 D4 门控跳过）">签到</button>
         ${list.some(a => a.provider === 'qoder') ? `<button class="btn sm" data-qcheckin-all
           title="对全部 Qoder 账号执行活动签到（活动领取 + Credits）">Qoder 签到</button>` : ''}
+        ${list.some(a => a.provider === 'loomy') ? `<button class="btn sm" data-lcheckin-all
+          title="对全部 Loomy 账号执行签到（每日积分 + 新手任务领取）">Loomy 签到</button>` : ''}
         <button class="btn primary sm" data-add>+ 添加账号</button>
       </div>
     </div>
@@ -364,6 +376,16 @@ function bindAccountActions(list) {
       const res = await api('/qoder/checkin', { method: 'POST', body: { only_daily: false } });
       const s = res.summary || {};
       toast(`Qoder 签到完成：${s.total || 0} 个账号，成功 ${(s.ok || 0) + (s.already || 0)}，失败 ${s.fail || 0}${s.earned_credit ? '，+' + s.earned_credit + ' 积分' : ''}`,
+        s.fail ? 'warn' : 'ok', 8000);
+      await render();
+    } catch (e) { toast(e.message, 'err', 7000); b.disabled = false; }
+  });
+  $$('[data-lcheckin-all]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const res = await api('/loomy/checkin', { method: 'POST', body: {} });
+      const s = res.summary || {};
+      toast(`Loomy 签到完成：${s.total || 0} 个账号，成功 ${(s.ok || 0) + (s.already || 0)}，失败 ${s.fail || 0}${s.earned_points ? '，+' + s.earned_points + ' 分' : ''}`,
         s.fail ? 'warn' : 'ok', 8000);
       await render();
     } catch (e) { toast(e.message, 'err', 7000); b.disabled = false; }
@@ -1059,6 +1081,23 @@ const SCHEMA = [
     { p: 'qoder.image_transcode', l: '内联 PNG 压缩', t: 'bool', h: '仅对能省 ≥20% 的大 PNG 生效，不联网' },
     { p: 'qoder.pricing_file', l: '价格覆盖文件', t: 'text', h: '可选 JSON：{"model":{"in":..,"cached":..,"out":..}}（USD/1M）' },
     { p: 'qoder.anthropic_thinking', l: 'Anthropic thinking 档位', t: 'text', h: 'off = 不启用（默认）；留空也按 off 处理' },
+    { p: 'qoder.priority', l: '调度档位', t: 'int', h: '数值大者先试；与 WorkBuddy 同为 1 = 平级加权' },
+  ]},
+  { sec: 'Loomy 第三上游', desc: '可选；讯飞桌面 AI 助手，签到 + 新手任务 + 模型网关', fields: [
+    { p: 'loomy.enabled', l: '启用 Loomy', t: 'bool', h: '关闭后 Loomy 账号与 loomy: 前缀均不可用' },
+    { p: 'loomy.auth_dir', l: 'Loomy 账号目录', t: 'text', h: '默认 ./loomy_auths；用 cmd/loomylogin 生成 loomy-*.json' },
+    { p: 'loomy.state_file', l: 'Loomy 状态文件', t: 'text', h: '冷却/熔断状态落盘路径' },
+    { p: 'loomy.priority', l: '调度档位', t: 'int', h: '数值大者先试；默认 2 = 在裸名合并调度中最优先（用完自动回落其它上游）' },
+    { p: 'loomy.weight', l: '同档位权重', t: 'float', h: '与其它上游同档位时的相对权重' },
+    { p: 'loomy.version', l: 'loomy-version', t: 'text', h: '上游请求头版本，留空 = 内置默认 0.9.38' },
+    { p: 'loomy.timeout_seconds', l: '请求超时 (秒)', t: 'int', h: '' },
+    { p: 'loomy.checkin_hours', l: '签到时点', t: 'hours', h: '每天在这些整点各签一次（上游按天幂等）' },
+    { p: 'loomy.checkin_enabled', l: '启用签到', t: 'bool', h: '关闭后不再自动签到' },
+    { p: 'loomy.onboarding_enabled', l: '领取新手任务', t: 'bool', h: '签到时领取 8 项新手任务（共 10000 分），默认开' },
+    { p: 'loomy.keepalive_hours', l: '会话续期时点', t: 'hours', h: 'Loomy 无 refresh token，续期 = 重新登录' },
+    { p: 'loomy.keepalive_enabled', l: '启用会话续期', t: 'bool', h: '' },
+    { p: 'loomy.session_renew_before_days', l: '提前续期天数', t: 'float', h: '会话剩余不足该天数时重登，默认 3' },
+    { p: 'loomy.request_gap_seconds', l: '账号间隔 (秒)', t: 'float', h: '批量签到/查询时账号之间的间隔（防风控），默认 1.0' },
   ]},
   { sec: '管理面板', desc: '本页面自身', fields: [
     { p: 'panel.enabled', l: '启用管理面板', t: 'bool', h: '关闭后 /panel/ 不再可用（需重启）' },
@@ -1182,12 +1221,13 @@ async function viewModels() {
   if (!list.length) { $('#view').innerHTML = `<div class="card"><div class="empty">暂无模型</div></div>`; return; }
   const rows = list.map(m => {
     const src = m.provider || m.owned_by || 'workbuddy';
-    const badge = src === 'qoder' ? '<span class="tag ok">Qoder</span>'
+    const badge = src === 'loomy' ? '<span class="tag info">Loomy</span>'
+      : src === 'qoder' ? '<span class="tag ok">Qoder</span>'
       : src === 'merged' ? '<span class="tag warn">混合</span>'
       : '<span class="tag purple">WorkBuddy</span>';
     return `<tr>
       <td class="mono">${esc(m.id)}</td>
-      <td>${badge}${m.qoder_key ? `<div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(m.qoder_key)}</div>` : ''}</td>
+      <td>${badge}${m.qoder_key || m.loomy_key ? `<div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(m.qoder_key || m.loomy_key)}</div>` : ''}</td>
       <td class="num">${m.context_length ? (m.context_length / 1024).toFixed(0) + 'K' : '—'}</td>
       <td>${(m.reasoning_supported_efforts || []).map(e => `<span class="tag gray">${esc(e)}</span>`).join(' ') || '—'}</td>
       <td>${m.reasoning_default_effort ? `<span class="tag info">${esc(m.reasoning_default_effort)}</span>` : '—'}</td>

@@ -83,6 +83,27 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 - **多协议入口** — 除 OpenAI `/v1/chat/completions` 外，原生支持 Anthropic `/v1/messages`（含 `count_tokens`）与 OpenAI Responses API `/v1/responses`，流式均逐事件转换
 - **附加能力** — 网关本地 `web_search` / `web_fetch`（SSRF 防护、TTL 缓存、多轮回灌）；内联大 PNG 无损重压；峰谷价 / 上下文窗口 / 思考档位元数据；面板「智能体配置」一键把 Claude Code、Codex、OpenCode、DSH、Crush 等客户端指向本网关（写入前备份、可 byte-exact 还原）
 
+### Loomy 第三上游（可选）
+
+- **混合调度 + 优先级** — 开启 `loomy.enabled` 后，同一 `/v1/chat/completions` 可在三个上游间调度。裸模型名按 `priority` 分档（数值大者先试），档内按 `weight` 加权；某一档的账号全部冷却/积分耗尽时，轮转循环自动落到下一档——这就是「deepseek 优先走 Loomy，Loomy 用完再走其它」的实现方式。`loomy:<model>` 强制 Loomy
+- **独立账号池** — Loomy 账号走独立池（`loomy.state_file`），冷却 / 熔断 / 在途租约与另外两池互不影响；账号文件为 `<auth_dir>/loomy-*.json`
+- **纯 Go 协议实现** — 账号服务 HMAC-SHA1 签名、RSA PKCS#1 v1.5 口令加密、14 天 session、模型网关 OpenAI 兼容 SSE，全部原生实现，无 Python 运行时依赖
+- **自动签到 + 自动任务** — 每日 `/points/first-login` 刷新日赠送积分，并按 `loomy.onboarding_enabled`（默认开）领取 8 项新手任务（共 10000 分）；领取前后各回读一次状态，未确认的进 `pending` 而不是假装成功
+- **会话续期** — Loomy 没有 refresh token，续期等价于重新登录：账号文件保存手机号 + 密码（0600），签到前与会话剩余不足 `session_renew_before_days` 天时自动重登
+- **成本记账** — 上游 SSE 里的 `usage.points_consumed` 就地映射为 `usage.credit`，面板积分/成本账本与另两个上游同一口径
+
+接入账号：
+
+```bash
+# 首次登录（手机号 + 密码 → loomy-<uid>.json）
+LOOMY_PASSWORD='***' go run ./cmd/loomylogin --phone 13800000000 --dir ./loomy_auths
+
+# 已有账号文件续期（按 loginid 匹配，覆盖 session）
+go run ./cmd/loomylogin --refresh --phone 13800000000 --dir ./loomy_auths --password '***'
+```
+
+`/v1/models` 合并三侧目录：同名模型只保留一条裸名（`owned_by: "merged"`），Loomy 独有模型以 `loomy:<id>` 暴露（`loomy_key` 可作为别名调用）；`/status` 的 `providers` 段分别给出各上游 total / healthy / cooling / disabled。
+
 `/v1/models` 合并两侧目录：两侧同名模型只保留一条裸名（`owned_by: "merged"`），Qoder 独有模型以裸 display_name 暴露（`owned_by: "qoder"`，`qoder_key` 可作为别名调用）；`/status` 新增 `providers` 段分别给出两侧 total / healthy / cooling / disabled。
 
 ### 辅助工具
@@ -162,11 +183,33 @@ cp config.example.json config.json
 
 ```json
 "aliases": {
-  "deepseek-flash": { "workbuddy": "deepseek-v4.1-flash", "qoder": "DeepSeek-Flash" }
+  "deepseek-flash": {
+    "workbuddy": "deepseek-v4.1-flash",
+    "qoder": "DeepSeek-Flash",
+    "loomy": "deepseek-v4-flash-0731"
+  }
 }
 ```
 
-配置后请求 `model: "deepseek-flash"` 即可：裸名按 `qoder.weight` 加权选择 Provider，选中 Qoder 时出站改写为 `DeepSeek-Flash`，选中 WorkBuddy 时改写为 `deepseek-v4.1-flash`；一侧无可用账号/模型时自动降级。`/v1/models` 也会以 `owned_by: "merged"` 暴露该裸名。强制路由 `qoder:` / `cn:` / `global:` 仍然有效。
+配置后请求 `model: "deepseek-flash"` 即可：裸名按调度档位选择 Provider（`loomy.priority` 默认 2 → Loomy 先试），选中 Loomy 时出站改写为 `deepseek-v4-flash-0731`，Qoder 改写为 `DeepSeek-Flash`，WorkBuddy 改写为 `deepseek-v4.1-flash`；一侧无可用账号/模型/积分时自动降级到下一档。`/v1/models` 也会以 `owned_by: "merged"` 暴露该裸名。强制路由 `qoder:` / `loomy:` / `cn:` / `global:` 仍然有效。
+
+Loomy 段配置（`config.example.json` 有完整示例）：
+
+```json
+"loomy": {
+  "enabled": true,
+  "auth_dir": "./loomy_auths",
+  "state_file": "./data/loomy_state.json",
+  "priority": 2,
+  "weight": 1.0,
+  "checkin_hours": [9, 21],
+  "onboarding_enabled": true
+}
+```
+
+- `priority`：裸名调度的档位，数值大者先试；缺省 2 = 永远优先。设 0/1 与其它上游平级按 `weight` 抽签，负数 = 不参与裸名调度（仅 `loomy:` 前缀可用）。
+- `checkin_hours` / `keepalive_hours`：Loomy 独立排程，默认 9/21 点签到、22 点会话续期；`checkin_enabled` / `keepalive_enabled` 分别关闭。
+- `onboarding_enabled`：签到同时领取新手任务（共 10000 分），默认开。
 
 Anthropic / Responses 入口与 OpenAI 入口共用同一鉴权（`Authorization: Bearer` 或 `x-api-key`）与账号轮转：
 

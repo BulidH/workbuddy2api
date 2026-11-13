@@ -22,6 +22,7 @@ import (
 const (
 	ProviderWorkBuddy = "workbuddy"
 	ProviderQoder     = "qoder"
+	ProviderLoomy     = "loomy"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -67,6 +68,17 @@ type Auth struct {
 	// VpcEndpoint 企业 VPC 专属实例（qoder*.json 的 vpcEndpoint 键）。
 	// 空 = 跟随区域公网端点；非空时该账号的所有 openapi 请求走实例域名。
 	VpcEndpoint string
+
+	// ── Loomy 账号（loomy*.json）：手机号 + 密码换 14 天 session ──
+	// LoginID 登录手机号（Loomy 账号服务 loginid），Password 明文口令（仅本地 600 文件）。
+	// Loomy 无 refresh token，续期等价于用这两个字段重新登录，因此必须落盘。
+	LoginID             string `json:"loginid,omitempty"`
+	Password            string `json:"password,omitempty"`
+	LoomyDevID          string `json:"loomyDevID,omitempty"`
+	LoomyCampusDeviceID string `json:"loomyCampusDeviceID,omitempty"`
+	// LoomyOnboardingDone 8 项新手任务已全部确认领取（落盘 onboardingDone）。
+	// 用途：签到排程每天跑两趟，已领完后不必每趟再打两次「读状态 + 上报」的往返。
+	LoomyOnboardingDone bool `json:"loomyOnboardingDone,omitempty"`
 
 	// ── Qoder 运营状态（与 qoder2api-hub 账号文件字段一一对应）──
 	LastCheckin          string            `json:"lastCheckin,omitempty"`
@@ -149,7 +161,64 @@ func (a *Auth) UpdateQoderState(mut func(*QoderState)) error {
 	if a.FilePath == "" {
 		return nil
 	}
-	return a.saveQoderLocked()
+	return a.saveByProviderLocked()
+}
+
+// UpdateCheckinState 把签到盖章时间写回账号文件（provider 仅用于日志与语义标注，落盘
+// 形状由账号自身的 provider 决定）。Loomy 与 Qoder 共用 LastCheckin 字段与
+// CheckedInToday 判定，因此「当天是否已签到」在两类账号上是同一口径。
+func (a *Auth) UpdateCheckinState(provider, ts string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if provider != "" && provider != a.Provider() {
+		// 上游归类不一致不阻断（配置换代时的历史账号），仍按账号自身形状落盘。
+		log.Printf("WARN: auth %s checkin provider mismatch: want=%s have=%s", logfmt.UID8(a.UID), provider, a.Provider())
+	}
+	a.LastCheckin = ts
+	if a.FilePath == "" {
+		return nil
+	}
+	return a.saveByProviderLocked()
+}
+
+// UpdateLoomyCredits 更新 Loomy 账号的积分快照并落盘（面板展示 + 冷却恢复依据）。
+func (a *Auth) UpdateLoomyCredits(m map[string]any) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Credits = m
+	if a.FilePath == "" {
+		return nil
+	}
+	return a.saveByProviderLocked()
+}
+
+// OnboardingComplete 报告 Loomy 新手任务是否已全部确认领取。
+func (a *Auth) OnboardingComplete() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.LoomyOnboardingDone
+}
+
+// SetOnboardingComplete 记录新手任务领取进度并落盘。
+func (a *Auth) SetOnboardingComplete(v bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LoomyOnboardingDone = v
+	if a.FilePath == "" {
+		return nil
+	}
+	return a.saveByProviderLocked()
+}
+
+// saveByProviderLocked 按账号上游选择落盘形状（调用方已持 a.mu）。
+func (a *Auth) saveByProviderLocked() error {
+	switch a.Provider() {
+	case ProviderQoder:
+		return a.saveQoderLocked()
+	case ProviderLoomy:
+		return a.saveLoomyLocked()
+	}
+	return a.saveWorkBuddyLocked()
 }
 
 // CheckedInToday 报告本地是否已为 now 所在自然日盖章签到。
@@ -220,6 +289,9 @@ func (a *Auth) SetProvider(p string) { a.provider = p }
 // IsQoder 报告账号是否为 Qoder 上游。
 func (a *Auth) IsQoder() bool { return a.Provider() == ProviderQoder }
 
+// IsLoomy 报告账号是否为 Loomy 上游。
+func (a *Auth) IsLoomy() bool { return a.Provider() == ProviderLoomy }
+
 // Realm 返回账号的归一化域：
 //   - Qoder：cn / intl（来自 qoder*.json 的 realm 字段，缺省 cn），不受 global 逃生门影响；
 //   - WorkBuddy：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，否则 "cn"。
@@ -227,6 +299,10 @@ func (a *Auth) IsQoder() bool { return a.Provider() == ProviderQoder }
 // 显式 global 优先于 domain 回落（D1）。WorkBuddy 全局开关 SetGlobalEnabled(false)
 // 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。空 realm + 空 domain → "cn"。
 func (a *Auth) Realm() string {
+	// Loomy 只有国内站（loomyad.xunfei.cn），恒 cn，不受 global 逃生门影响。
+	if a.Provider() == ProviderLoomy {
+		return "cn"
+	}
 	if a.Provider() == ProviderQoder {
 		if strings.EqualFold(strings.TrimSpace(a.realm), "intl") ||
 			strings.EqualFold(strings.TrimSpace(a.realm), "global") {
@@ -382,9 +458,14 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
-	if a.Provider() == ProviderQoder {
-		return a.saveQoderLocked()
+	if a.Provider() == ProviderQoder || a.Provider() == ProviderLoomy {
+		return a.saveByProviderLocked()
 	}
+	return a.saveWorkBuddyLocked()
+}
+
+// saveWorkBuddyLocked 以嵌套形写回（调用方已持 a.mu）。
+func (a *Auth) saveWorkBuddyLocked() error {
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
@@ -601,22 +682,6 @@ func NewQoderAuth(uid, nickname, accessToken, refreshToken, personalToken, realm
 	}
 }
 
-// QoderFilePath 返回账号在 dir 下的落盘路径（qoder-<safe uid>.json）。
-func QoderFilePath(dir, uid string) string {
-	safe := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			return r
-		}
-		return '_'
-	}, uid)
-	safe = strings.Trim(safe, "_")
-	if safe == "" {
-		safe = shortHash(uid)
-	}
-	return filepath.Join(dir, "qoder-"+safe+".json")
-}
-
 // LoadQoderDir 扫描 dir 下 qoder*.json；解析失败的文件静默跳过。
 func LoadQoderDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "qoder*.json"))
@@ -638,6 +703,226 @@ func LoadQoderDir(dir string) ([]*Auth, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// loomyFile Loomy 账号文件形状（loomy*.json）。
+//
+// 与 Qoder/WorkBuddy 不同，Loomy 没有 refresh token：14 天 session 到期只能重新登录，
+// 所以 loginid + password 必须与 session 一起落盘（文件权限 600，与其它账号文件一致）。
+type loomyFile struct {
+	UID         string         `json:"uid"`
+	Nickname    string         `json:"nickname"`
+	LoginID     string         `json:"loginid"`
+	Password    string         `json:"password"`
+	Session     string         `json:"accessToken"`
+	ExpiresAt   int64          `json:"expiresAt"`
+	AddedAt     float64        `json:"addedAt"`
+	Source      string         `json:"source"`
+	Enabled     *bool          `json:"enabled"`
+	LastCheckin string         `json:"lastCheckin"`
+	Credits     map[string]any `json:"credits"`
+	// OnboardingDone 记录 8 项新手任务是否已全部确认领取，避免已领完还反复打上游。
+	OnboardingDone bool `json:"onboardingDone"`
+	Identity       struct {
+		DevID          string `json:"devid"`
+		CampusDeviceID string `json:"campus_device_id"`
+	} `json:"identity"`
+	// 兼容 loomy2api 的扁平写法（devid / campus_device_id 直接在顶层）。
+	DevID          string `json:"devid"`
+	CampusDeviceID string `json:"campus_device_id"`
+}
+
+// ParseLoomy 解析 Loomy 账号文件：必须有 session 或有可重登的 loginid+password。
+func ParseLoomy(raw []byte) (*Auth, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty loomy auth file")
+	}
+	var f loomyFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("storage_parse_error: %w", err)
+	}
+	session := strings.TrimSpace(f.Session)
+	loginID := strings.TrimSpace(f.LoginID)
+	password := f.Password
+	if session == "" && (loginID == "" || password == "") {
+		return nil, fmt.Errorf("parse_error: missing accessToken or loginid/password")
+	}
+	a := &Auth{
+		AccessToken:         session,
+		ExpiresAt:           f.ExpiresAt,
+		provider:            ProviderLoomy,
+		realm:               "cn",
+		UID:                 strings.TrimSpace(f.UID),
+		Nickname:            f.Nickname,
+		LoginID:             loginID,
+		Password:            password,
+		LoomyDevID:          firstNonEmptyStr(f.Identity.DevID, f.DevID),
+		LoomyCampusDeviceID: firstNonEmptyStr(f.Identity.CampusDeviceID, f.CampusDeviceID),
+		Source:              f.Source,
+		AddedAt:             f.AddedAt,
+		LastCheckin:         f.LastCheckin,
+		Credits:             f.Credits,
+		LoomyOnboardingDone: f.OnboardingDone,
+	}
+	if a.LoomyDevID == "" {
+		a.LoomyDevID = "web-" + shortHash(session+loginID)
+	}
+	if a.Source == "" {
+		a.Source = "login"
+	}
+	if a.AddedAt == 0 {
+		a.AddedAt = float64(time.Now().UnixNano()) / 1e9
+	}
+	if a.UID == "" {
+		a.UID = "l-" + shortHash(loginID+session)
+	}
+	if a.Nickname == "" {
+		a.Nickname = shortUIDName(loginID, a.UID)
+	}
+	return a, nil
+}
+
+// shortUIDName 昵称缺省值：优先脱敏手机号（138****8000），否则 uid 尾 8 位。
+func shortUIDName(loginID, uid string) string {
+	if len(loginID) == 11 {
+		for _, r := range loginID {
+			if r < '0' || r > '9' {
+				return "u" + tail(uid, 8)
+			}
+		}
+		return loginID[:3] + "****" + loginID[7:]
+	}
+	return "u" + tail(uid, 8)
+}
+
+// NewLoomyAuth 构造一个新 Loomy 账号（登录 / 手工导入路径使用）。
+func NewLoomyAuth(uid, nickname, loginID, password, session string, expireAt int64) *Auth {
+	if uid == "" {
+		uid = "l-" + shortHash(loginID+session)
+	}
+	if nickname == "" {
+		nickname = shortUIDName(loginID, uid)
+	}
+	return &Auth{
+		AccessToken: session,
+		ExpiresAt:   expireAt,
+		provider:    ProviderLoomy,
+		realm:       "cn",
+		UID:         uid,
+		Nickname:    nickname,
+		LoginID:     loginID,
+		Password:    password,
+		Source:      "login",
+		AddedAt:     float64(time.Now().UnixNano()) / 1e9,
+	}
+}
+
+// LoomyFilePath 返回账号在 dir 下的落盘路径（loomy-<safe uid>.json）。
+func LoomyFilePath(dir, uid string) string {
+	return filepath.Join(dir, "loomy-"+safeFilename(uid)+".json")
+}
+
+// LoadLoomyDir 扫描 dir 下 loomy*.json；解析失败的文件静默告警跳过。
+func LoadLoomyDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "loomy*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Auth
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		a, err := ParseLoomy(raw)
+		if err != nil {
+			log.Printf("WARN: loomy auth %s skipped: %v", f, err)
+			continue
+		}
+		a.FilePath = f
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// saveLoomyLocked 以 Loomy 账号文件形状写回（调用方已持 a.mu）。
+// 读回原文件再覆盖本网关管理的键，保留人工加的注释性字段（如 remark）。
+func (a *Auth) saveLoomyLocked() error {
+	doc := map[string]any{}
+	if old, err := os.ReadFile(a.FilePath); err == nil {
+		_ = json.Unmarshal(old, &doc)
+	}
+	for k, v := range map[string]any{
+		"uid":         a.UID,
+		"nickname":    a.Nickname,
+		"loginid":     a.LoginID,
+		"password":    a.Password,
+		"accessToken": a.AccessToken,
+		"expiresAt":   a.ExpiresAt,
+		"addedAt":     a.AddedAt,
+		"source":      a.Source,
+		"enabled":     true,
+		"lastCheckin": a.LastCheckin,
+	} {
+		doc[k] = v
+	}
+	if a.LoomyOnboardingDone {
+		doc["onboardingDone"] = true
+	}
+	ident, _ := doc["identity"].(map[string]any)
+	if ident == nil {
+		ident = map[string]any{}
+	}
+	if a.LoomyDevID != "" {
+		ident["devid"] = a.LoomyDevID
+	}
+	if a.LoomyCampusDeviceID != "" {
+		ident["campus_device_id"] = a.LoomyCampusDeviceID
+	}
+	doc["identity"] = ident
+	if a.Credits != nil {
+		doc["credits"] = a.Credits
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := a.FilePath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.FilePath)
+}
+
+// safeFilename 把 uid 归一化成可做文件名的短标识。
+func safeFilename(uid string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, uid)
+	safe = strings.Trim(safe, "_")
+	if safe == "" {
+		safe = shortHash(uid)
+	}
+	return safe
+}
+
+// QoderFilePath 返回账号在 dir 下的落盘路径（qoder-<safe uid>.json）。
+func QoderFilePath(dir, uid string) string {
+	return filepath.Join(dir, "qoder-"+safeFilename(uid)+".json")
+}
+
+// firstNonEmptyStr 返回第一个非空字符串。
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // detectQoderRealm 按 domain 推断 Qoder 区域（qoder.com.cn / 其它 CN 域 → cn）。

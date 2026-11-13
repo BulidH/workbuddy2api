@@ -12,6 +12,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/loomyops"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/qoderops"
 	"workbuddy2api/internal/upstream"
@@ -59,6 +60,15 @@ type Config struct {
 	QoderKeepaliveHours    []int // 默认 [22]
 	QoderCheckinDisabled   bool
 	QoderKeepaliveDisabled bool
+
+	// ── Loomy 第三上游（LoomyOps=nil 表示未启用，全部排程忽略）──
+	LoomyOps               *loomyops.Service
+	LoomyCheckinHours      []int // 默认 [9, 21]
+	LoomyKeepaliveHours    []int // 默认 [22]
+	LoomyCheckinDisabled   bool
+	LoomyKeepaliveDisabled bool
+	// LoomyRenewBefore 会话续期提前量（Loomy 无 refresh token，续期 = 重登）。
+	LoomyRenewBefore time.Duration
 }
 
 // Scheduler 调度器。
@@ -114,6 +124,12 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.QoderKeepaliveHours) == 0 {
 		cfg.QoderKeepaliveHours = []int{22}
+	}
+	if len(cfg.LoomyCheckinHours) == 0 {
+		cfg.LoomyCheckinHours = []int{9, 21}
+	}
+	if len(cfg.LoomyKeepaliveHours) == 0 {
+		cfg.LoomyKeepaliveHours = []int{22}
 	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
@@ -175,6 +191,8 @@ const (
 	taskCat
 	taskQoderCheckin
 	taskQoderKeepalive
+	taskLoomyCheckin
+	taskLoomyKeepalive
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -210,6 +228,14 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		}
 		if !s.cfg.QoderKeepaliveDisabled {
 			slots = append(slots, slot{nextFire(now, s.cfg.QoderKeepaliveHours), taskQoderKeepalive})
+		}
+	}
+	if s.cfg.LoomyOps != nil {
+		if !s.cfg.LoomyCheckinDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.LoomyCheckinHours), taskLoomyCheckin})
+		}
+		if !s.cfg.LoomyKeepaliveDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.LoomyKeepaliveHours), taskLoomyKeepalive})
 		}
 	}
 	var earliest time.Time
@@ -276,6 +302,10 @@ func (s *Scheduler) dispatch(k taskKind) {
 		s.RunQoderCheckinNow()
 	case taskQoderKeepalive:
 		s.RunQoderKeepaliveNow()
+	case taskLoomyCheckin:
+		s.RunLoomyCheckinNow()
+	case taskLoomyKeepalive:
+		s.RunLoomyKeepaliveNow()
 	}
 }
 
@@ -299,6 +329,28 @@ func (s *Scheduler) RunQoderKeepaliveNow() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	s.cfg.QoderOps.Keepalive(ctx)
+}
+
+// RunLoomyCheckinNow 定时触发的 Loomy 全量签到（每日积分 + 新手任务领取 + 余额刷新）。
+func (s *Scheduler) RunLoomyCheckinNow() {
+	if s.cfg.LoomyOps == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	if _, err := s.cfg.LoomyOps.CheckinAll(ctx, nil); err != nil {
+		log.Printf("scheduled loomy checkin skipped: %v", err)
+	}
+}
+
+// RunLoomyKeepaliveNow 定时续期 Loomy 会话（临近 14 天到期前重登）。
+func (s *Scheduler) RunLoomyKeepaliveNow() {
+	if s.cfg.LoomyOps == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	s.cfg.LoomyOps.Keepalive(ctx, s.cfg.LoomyRenewBefore)
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。

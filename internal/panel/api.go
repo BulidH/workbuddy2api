@@ -39,11 +39,15 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 	if p.deps.QoderEnabled {
 		qoderFiles = countAuthFiles(p.deps.QoderAuthDir, "qoder*.json")
 	}
-	authFiles := wbFiles + qoderFiles
+	loomyFiles := 0
+	if p.deps.LoomyEnabled {
+		loomyFiles = countAuthFiles(p.deps.LoomyAuthDir, "loomy*.json")
+	}
+	authFiles := wbFiles + qoderFiles + loomyFiles
 
 	// /status 的 providers 按 provider 给出池内账号数；旧注入（测试/降级）没有该字段
 	// 时回落到 total（此时 Qoder 未启用，total 就等于 WorkBuddy 池）。
-	wbPool, qoderPool := total, 0
+	wbPool, qoderPool, loomyPool := total, 0, 0
 	if pm, ok := status["providers"].(map[string]any); ok {
 		if wb, ok := pm[auth.ProviderWorkBuddy].(map[string]any); ok {
 			wbPool = intOf(wb["total"])
@@ -51,9 +55,12 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 		if q, ok := pm[auth.ProviderQoder].(map[string]any); ok {
 			qoderPool = intOf(q["total"])
 		}
+		if l, ok := pm[auth.ProviderLoomy].(map[string]any); ok {
+			loomyPool = intOf(l["total"])
+		}
 	}
 	// 按 provider 分别比较：两个方向的偏差若恰好抵消，只看总数会漏报。
-	mismatch := wbFiles != wbPool || qoderFiles != qoderPool
+	mismatch := wbFiles != wbPool || qoderFiles != qoderPool || loomyFiles != loomyPool
 
 	okJSON(w, map[string]any{
 		"ok":          true,
@@ -70,8 +77,10 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 			"auth_files":           authFiles,
 			"auth_files_workbuddy": wbFiles,
 			"auth_files_qoder":     qoderFiles,
+			"auth_files_loomy":     loomyFiles,
 			"pool_workbuddy":       wbPool,
 			"pool_qoder":           qoderPool,
+			"pool_loomy":           loomyPool,
 			"credential_mismatch":  mismatch,
 			"sticky":               status["sticky_sessions"],
 		},
@@ -126,6 +135,8 @@ type accountView struct {
 	OrgName             string         `json:"org_name,omitempty"`
 	VpcEndpoint         string         `json:"vpc_endpoint,omitempty"`
 	HasPAT              bool           `json:"has_pat,omitempty"`
+	// HasPassword 仅 Loomy：账号文件里存了手机号+密码（可自动续期 14 天 session）。
+	HasPassword bool `json:"has_password,omitempty"`
 }
 
 // statusMap 取 /status 载荷并规整为通用 JSON 结构（map[string]any / []any / float64）。
@@ -166,6 +177,16 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Loomy 账号 UID 集合（同上：池状态不带 provider 字段）。
+	loomyUIDs := map[string]bool{}
+	if p.deps.LoomyEnabled {
+		if auths, err := auth.LoadLoomyDir(p.deps.LoomyAuthDir); err == nil {
+			for _, a := range auths {
+				loomyUIDs[a.UID] = true
+			}
+		}
+	}
+
 	// 1) 池内账号（statusMap 已规整，此处断言必定成功）
 	if list, ok := status["accounts"].([]any); ok {
 		for _, it := range list {
@@ -180,6 +201,8 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			provider := auth.ProviderWorkBuddy
 			if qoderUIDs[uid] {
 				provider = auth.ProviderQoder
+			} else if loomyUIDs[uid] {
+				provider = auth.ProviderLoomy
 			}
 			v := &accountView{
 				UID:         uid,
@@ -266,6 +289,36 @@ func (p *Panel) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 4) Loomy 凭证目录
+	if p.deps.LoomyEnabled {
+		if auths, err := auth.LoadLoomyDir(p.deps.LoomyAuthDir); err == nil {
+			for _, a := range auths {
+				v, ok := byUID[a.UID]
+				if !ok {
+					v = &accountView{UID: a.UID}
+					byUID[a.UID] = v
+					order = append(order, a.UID)
+				}
+				v.Provider = auth.ProviderLoomy
+				v.ExpiresAt = a.ExpiresAt
+				v.Domain = a.Domain
+				v.File = filepath.Base(a.FilePath)
+				if v.Nickname == "" {
+					v.Nickname = a.Nickname
+				}
+				if v.Realm == "" {
+					v.Realm = a.Realm()
+				}
+				v.LastCheckin = a.LastCheckin
+				v.CreditsDetail = a.Credits
+				v.HasPassword = a.Password != ""
+				if v.Credits == 0 && v.CreditsAt == "" {
+					v.Credits = a.CreditsRemain()
+				}
+			}
+		}
+	}
+
 	out := make([]*accountView, 0, len(order))
 	for _, uid := range order {
 		out = append(out, byUID[uid])
@@ -299,11 +352,19 @@ func (p *Panel) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "Qoder 未启用")
 		return
 	}
+	loomyAcct := body.Provider == auth.ProviderLoomy
+	if loomyAcct && !p.deps.LoomyEnabled {
+		errJSON(w, http.StatusBadRequest, "Loomy 未启用")
+		return
+	}
 	var path string
 	var ok bool
-	if qoder {
+	switch {
+	case qoder:
 		path, ok = p.qoderFilePath(body.UID)
-	} else {
+	case loomyAcct:
+		path, ok = p.loomyFilePath(body.UID)
+	default:
 		path, ok = p.authFilePath(body.UID)
 	}
 	if !ok {
@@ -365,6 +426,16 @@ func (p *Panel) handleAccountEnable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setEnabled = p.deps.SetQoderAccountEnabled
+	} else if body.Provider == auth.ProviderLoomy {
+		if !p.deps.LoomyEnabled {
+			errJSON(w, http.StatusBadRequest, "Loomy 未启用")
+			return
+		}
+		if _, ok := p.loomyFilePath(body.UID); !ok {
+			errJSON(w, http.StatusBadRequest, "非法 uid")
+			return
+		}
+		setEnabled = p.deps.SetLoomyAccountEnabled
 	} else if _, ok := p.authFilePath(body.UID); !ok {
 		// 复用与删除相同的 uid 校验，防路径穿越 / 非法取值。
 		errJSON(w, http.StatusBadRequest, "非法 uid")
@@ -429,11 +500,20 @@ func (p *Panel) handleReload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	loomyN := 0
+	if p.deps.LoomyEnabled {
+		loomyN, err = p.reloadLoomy()
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	okJSON(w, map[string]any{
 		"ok":        true,
-		"accounts":  n + qoderN,
+		"accounts":  n + qoderN + loomyN,
 		"workbuddy": n,
 		"qoder":     qoderN,
+		"loomy":     loomyN,
 	})
 }
 

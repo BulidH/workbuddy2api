@@ -17,6 +17,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/guard"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/loomy"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/qoder"
@@ -75,6 +76,17 @@ type Config struct {
 	QoderWebTools bool
 	// QoderAliases 对外裸名 → 各上游模型名（nil = 不做别名映射）。
 	QoderAliases map[string]qoder.ModelAlias
+
+	// ── Loomy 第三上游（可选；nil = 关闭）──
+	// 与 Qoder 一样独立账号池，冷却/熔断/在途租约互不影响。
+	Loomy         *loomy.Client
+	LoomyPool     *pool.Pool
+	LoomyWeight   float64 // 与其它上游同档位时的相对权重（默认 1.0）
+	LoomyPriority int     // 裸名调度的档位：数值大者先试（Loomy 默认 2 = 最优先）
+
+	// WorkBuddyPriority / QoderPriority 另两家的调度档位（默认 1）。
+	WorkBuddyPriority int
+	QoderPriority     int
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -105,6 +117,13 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	// 调度档位缺省：WorkBuddy/Qoder 平级（1），Loomy 由配置给（默认 2 = 最优先）。
+	if cfg.WorkBuddyPriority <= 0 {
+		cfg.WorkBuddyPriority = 1
+	}
+	if cfg.QoderPriority <= 0 {
+		cfg.QoderPriority = 1
 	}
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
@@ -176,6 +195,10 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		qt, qh, qc, qd, qi := h.cfg.QoderPool.CountsDetailed()
 		payload["qoder"] = countsMapFrom(qt, qh, qc, qd, qi)
 	}
+	if h.cfg.LoomyPool != nil {
+		lt, lh, lc, ld, li := h.cfg.LoomyPool.CountsDetailed()
+		payload["loomy"] = countsMapFrom(lt, lh, lc, ld, li)
+	}
 	writeJSON(w, status, payload)
 }
 
@@ -210,6 +233,16 @@ func (h *Handler) StatusPayload() map[string]any {
 		cooling += qc
 		disabled += qd
 		inFlightFull += qi
+	}
+	if h.cfg.LoomyPool != nil {
+		lt, lh, lc, ld, li := h.cfg.LoomyPool.CountsDetailed()
+		providers[auth.ProviderLoomy] = countsMapFrom(lt, lh, lc, ld, li)
+		accounts = append(accounts, h.cfg.LoomyPool.List()...)
+		total += lt
+		healthy += lh
+		cooling += lc
+		disabled += ld
+		inFlightFull += li
 	}
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
@@ -370,6 +403,9 @@ func (h *Handler) modelList() []map[string]any {
 	if h.cfg.Qoder != nil {
 		out = h.appendQoderModels(out)
 	}
+	if h.cfg.Loomy != nil {
+		out = h.appendLoomyModels(out)
+	}
 	out = h.appendAliasModels(out)
 	return out
 }
@@ -399,30 +435,44 @@ func (h *Handler) appendAliasModels(out []map[string]any) []map[string]any {
 	for _, alias := range names {
 		a := h.cfg.QoderAliases[alias]
 		id := strings.TrimSpace(alias)
-		if id == "" || (a.WorkBuddy == "" && a.Qoder == "") {
+		if id == "" || (a.WorkBuddy == "" && a.Qoder == "" && a.Loomy == "") {
 			continue
 		}
 		key := qoder.NormalizeModelName(id)
 		if idx, ok := seen[key]; ok {
 			e := out[idx]
-			if e["provider"] == string(auth.ProviderQoder) || e["owned_by"] == string(auth.ProviderQoder) {
+			// 已存在同名条目：把上游专属条目升级为 merged（同一个裸名可落到多个上游）。
+			if p, _ := e["provider"].(string); p != "" && p != "merged" {
 				e["owned_by"], e["provider"] = "merged", "merged"
-				if a.WorkBuddy != "" {
-					e["workbuddy_model"] = a.WorkBuddy
-				}
-				if a.Qoder != "" {
-					e["qoder_model"] = a.Qoder
-				}
+			}
+			if a.WorkBuddy != "" {
+				e["workbuddy_model"] = a.WorkBuddy
+			}
+			if a.Qoder != "" {
+				e["qoder_model"] = a.Qoder
+			}
+			if a.Loomy != "" {
+				e["loomy_model"] = a.Loomy
 			}
 			continue
 		}
 		seen[key] = len(out)
 		owner, provider := "merged", "merged"
-		switch {
-		case a.WorkBuddy == "":
-			owner, provider = "qoder", "qoder"
-		case a.Qoder == "":
-			owner, provider = "workbuddy", "workbuddy"
+		n := 0
+		for _, v := range []string{a.WorkBuddy, a.Qoder, a.Loomy} {
+			if v != "" {
+				n++
+			}
+		}
+		if n == 1 {
+			switch {
+			case a.WorkBuddy != "":
+				owner, provider = string(auth.ProviderWorkBuddy), string(auth.ProviderWorkBuddy)
+			case a.Qoder != "":
+				owner, provider = string(auth.ProviderQoder), string(auth.ProviderQoder)
+			case a.Loomy != "":
+				owner, provider = string(auth.ProviderLoomy), string(auth.ProviderLoomy)
+			}
 		}
 		entry := map[string]any{
 			"id": id, "object": "model", "created": time.Now().Unix(),
@@ -433,6 +483,9 @@ func (h *Handler) appendAliasModels(out []map[string]any) []map[string]any {
 		}
 		if a.Qoder != "" {
 			entry["qoder_model"] = a.Qoder
+		}
+		if a.Loomy != "" {
+			entry["loomy_model"] = a.Loomy
 		}
 		out = append(out, entry)
 	}
@@ -495,6 +548,58 @@ func (h *Handler) appendQoderModels(out []map[string]any) []map[string]any {
 			}
 			out = append(out, entry)
 		}
+	}
+	return out
+}
+
+// appendLoomyModels 把 Loomy 目录合并进模型清单。
+//
+// Loomy 侧模型名（deepseek-v4-flash-0731 / qwen-3.8-max …）与 WorkBuddy 命名体系
+// 不同，裸名直接归一化几乎不会撞名，因此这里统一以 loomy:<id> 显式前缀暴露；
+// 想用同一个裸名在多家之间调度，走 aliases（loomy 字段），别名条目会带 loomy_model。
+// 归一化同名时（如 Loomy 的 deepseek-v4-flash 与已有裸名等价）升级为 merged，
+// 避免清单里出现两条等价模型。
+func (h *Handler) appendLoomyModels(out []map[string]any) []map[string]any {
+	bareByNorm := map[string]string{}
+	for _, e := range out {
+		id, _ := e["id"].(string)
+		bare := id
+		if idx := strings.IndexByte(bare, ':'); idx > 0 {
+			bare = bare[idx+1:]
+		}
+		if n := qoder.NormalizeModelName(bare); n != "" {
+			bareByNorm[n] = bare
+		}
+	}
+	seen := map[string]bool{}
+	for _, mi := range h.cfg.Loomy.Catalog.Models() {
+		if strings.TrimSpace(mi.ID) == "" {
+			continue
+		}
+		norm := qoder.NormalizeModelName(mi.ID)
+		if norm == "" || seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		entry := map[string]any{
+			"id":        auth.ProviderLoomy + ":" + mi.ID,
+			"object":    "model",
+			"created":   time.Now().Unix(),
+			"owned_by":  auth.ProviderLoomy,
+			"provider":  auth.ProviderLoomy,
+			"loomy_key": mi.ID,
+		}
+		if mi.ContextLength > 0 {
+			entry["context_length"] = mi.ContextLength
+		}
+		if mi.MaxOutput > 0 {
+			entry["max_output_tokens"] = mi.MaxOutput
+		}
+		if merged, ok := bareByNorm[norm]; ok {
+			// 同名已在列（别名或另一上游）：标 merged，调用方可用裸名跨上游调度。
+			entry["merged_with"] = merged
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -619,6 +724,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q is not available on qoder", bareModel))
 		return
 	}
+	if forced == auth.ProviderLoomy && !h.loomySupports(bareModel) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_not_found",
+			fmt.Sprintf("model %q is not available on loomy", bareModel))
+		return
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -634,6 +744,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]map[string]bool{
 		auth.ProviderWorkBuddy: {},
 		auth.ProviderQoder:     {},
+		auth.ProviderLoomy:     {},
 	}
 	providerIdx := 0
 	var lastErr error
@@ -748,7 +859,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			providerIdx++
 			continue
 		}
-		triedThis := tried[provider]
+		triedThis, ok := tried[provider]
+		if !ok {
+			triedThis = map[string]bool{}
+			tried[provider] = triedThis
+		}
 
 		// 选号：粘性号优先（仅当绑定号属于当前 Provider），否则普通轮换。
 		var acct *auth.Auth
@@ -769,7 +884,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。Qoder 账号 cn/intl 双区
 			// 由模型目录做跨区匹配，此处不按 realm 过滤。
-			if provider == auth.ProviderQoder {
+			if provider == auth.ProviderQoder || provider == auth.ProviderLoomy {
+				// 两家都不按 realm 过滤：Qoder 由模型目录跨区匹配，Loomy 只有国内站。
 				acct = ap.PickExcludingForRealm(triedThis, bareModel, "")
 			} else {
 				acct = ap.PickExcludingForRealm(triedThis, bareModel, realm)
@@ -800,9 +916,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			var rerr error
-			if provider == auth.ProviderQoder {
+			switch provider {
+			case auth.ProviderQoder:
 				rerr = h.cfg.Qoder.RefreshToken(r.Context(), acct) // 内部落盘并失效 COSY 会话
-			} else {
+			case auth.ProviderLoomy:
+				// Loomy 无 refresh token：续期 = 用落盘的手机号 + 密码重新登录（内部落盘）。
+				rerr = h.cfg.Loomy.RefreshSession(r.Context(), acct)
+			default:
 				rerr = h.cfg.Upstream.RefreshToken(acct)
 			}
 			if rerr != nil {
@@ -818,7 +938,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				continue
 			}
-			if provider != auth.ProviderQoder {
+			if provider == auth.ProviderWorkBuddy {
 				acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := acct.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
@@ -848,7 +968,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var respBody []byte
 		var terr error
 		var gateLease *guard.Lease
-		if provider == auth.ProviderQoder {
+		switch provider {
+		case auth.ProviderLoomy:
+			// Loomy 上游本身就是 OpenAI 兼容 SSE：直接透传，usage 已在 client 内
+			// 把 points_consumed 映射为 credit，复用同一 Stream/Aggregate 出口。
+			rc, status, respBody, terr = h.cfg.Loomy.ChatStreamContext(r.Context(), acct, outbound,
+				loomy.ChatMeta{SessionKey: sessKey, RequestID: chatMeta.ConversationRequestID})
+		case auth.ProviderQoder:
 			if h.cfg.QoderGuard != nil {
 				gateLease, _ = h.cfg.QoderGuard.Acquire(r.Context(), acct.UID)
 			}
@@ -863,7 +989,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					gateLease = nil
 				}
 			}
-		} else {
+		default:
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, outbound, clientIP, chatMeta)
 		}
 		if terr != nil {
@@ -877,8 +1003,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
-			if provider == auth.ProviderQoder {
+			switch provider {
+			case auth.ProviderQoder:
 				kind = qoder.Classify(status, string(respBody))
+			case auth.ProviderLoomy:
+				kind = loomy.Classify(status, string(respBody))
 			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
@@ -1098,7 +1227,11 @@ func (h *Handler) applyErrorPolicyOn(p *pool.Pool, uid string, kind upstream.Err
 		// 瞬态：一次就永久禁用会把健康号杀掉（与 keepalive/checkin 对 12153 的连续计数
 		// 口径不一致）。故 Qoder 走 NoteSessionDead 连续计数，WorkBuddy 维持既有语义
 		// （12153 是明确的 session 终态，且同样有 refresh 失败侧的连续计数保护）。
-		if h.cfg.QoderPool != nil && p == h.cfg.QoderPool {
+		//
+		// Loomy 同理：走到这里说明客户端「落盘密码重登」也失败了（ChatStreamContext
+		// 内已重试过一次），401/020002 仍可能是风控瞬态，不该一次杀号。
+		if (h.cfg.QoderPool != nil && p == h.cfg.QoderPool) ||
+			(h.cfg.LoomyPool != nil && p == h.cfg.LoomyPool) {
 			if p.NoteSessionDead(uid) {
 				log.Printf("WARN: [server] qoder 连续 %d 次 401 session dead — 禁用 uid=%s",
 					pool.SessionDeadThreshold(), logfmt.UID8(uid))
