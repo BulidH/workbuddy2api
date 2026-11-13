@@ -16,7 +16,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildVersion=${BUIL
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/loomylogin ./cmd/loomylogin
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
@@ -33,6 +34,7 @@ COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
 COPY --from=build /out/trial_bin /app/trial_bin
 COPY --from=build /out/activity_bin /app/activity_bin
+COPY --from=build /out/loomylogin /app/loomylogin
 COPY login.sh signin.sh credit.sh trial.sh /app/
 # 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
 COPY scripts/global_region.py /app/scripts/global_region.py
