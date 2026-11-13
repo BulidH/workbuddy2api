@@ -1,6 +1,7 @@
 # Auth & secrets
 auths/
 loomy_auths/
+qoder_auths/
 data/
 *.key
 *.pem
