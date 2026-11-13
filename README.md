@@ -92,14 +92,15 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 - **会话续期** — Loomy 没有 refresh token，续期等价于重新登录：账号文件保存手机号 + 密码（0600），签到前与会话剩余不足 `session_renew_before_days` 天时自动重登
 - **成本记账** — 上游 SSE 里的 `usage.points_consumed` 就地映射为 `usage.credit`，面板积分/成本账本与另两个上游同一口径
 
-接入账号：
+接入账号（Web 面板）：打开 `/panel/` → 账号页「+ 添加账号」→ 选 **Loomy** → 填手机号、密码（可选备注）→「登录并添加」。登录成功后账号立即落盘、入池，并顺手查一次余额；同一手机号再添加一次即为重新登录（沿用设备指纹，不会产生重复账号）。该页也支持粘贴 `loomy-*.json`（单个对象 / 数组 / `{"accounts":[...]}`）批量导入。
+
+Loomy 没有 refresh token，14 天后靠这对手机号 + 密码重新登录续期，所以密码会写入账号文件（权限 0600），面板只回显脱敏手机号。
+
+面板不可达的服务器可用 CLI（与面板同一条实现）：
 
 ```bash
-# 首次登录（手机号 + 密码 → loomy-<uid>.json）
+# 首次登录 / 重复运行即续期（手机号 + 密码 → loomy-<uid>.json）
 LOOMY_PASSWORD='***' go run ./cmd/loomylogin --phone 13800000000 --dir ./loomy_auths
-
-# 已有账号文件续期（按 loginid 匹配，覆盖 session）
-go run ./cmd/loomylogin --refresh --phone 13800000000 --dir ./loomy_auths --password '***'
 ```
 
 `/v1/models` 合并三侧目录：同名模型只保留一条裸名（`owned_by: "merged"`），Loomy 独有模型以 `loomy:<id>` 暴露（`loomy_key` 可作为别名调用）；`/status` 的 `providers` 段分别给出各上游 total / healthy / cooling / disabled。

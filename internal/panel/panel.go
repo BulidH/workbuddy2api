@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/agentcfg"
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/loomyops"
 	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/qoderops"
@@ -125,6 +126,11 @@ type Deps struct {
 	// ── Loomy 第三上游（可选；LoomyEnabled=false 时全部忽略）──
 	LoomyEnabled bool
 	LoomyAuthDir string
+	// LoomyAddAccount 手机号 + 密码登录一个 Loomy 账号（落盘 + 入池 + 查余额）。
+	// 面板不直接持有 Loomy 客户端，登录流程由 cmd/server 注入的 loomyops 实现。
+	LoomyAddAccount func(ctx context.Context, loginID, password, nickname string) (*auth.Auth, error)
+	// LoomyImportAccounts 导入粘贴的 loomy-*.json（单对象 / 数组 / {"accounts":[...]}）。
+	LoomyImportAccounts func(items [][]byte) ([]*auth.Auth, []error)
 	// ReloadLoomyAuths 重扫 Loomy 账号目录并对齐 Loomy 池。
 	ReloadLoomyAuths func() (int, error)
 	// SetLoomyAccountEnabled 手动启用/禁用 Loomy 账号。
@@ -218,6 +224,8 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("POST /panel/api/qoder/campaign/claim", p.handleQoderClaim)
 	p.mux.HandleFunc("POST /panel/api/qoder/prefs", p.handleQoderPrefs)
 	p.mux.HandleFunc("GET /panel/api/qoder/activity", p.handleQoderActivity)
+	p.mux.HandleFunc("POST /panel/api/loomy/login", p.handleLoomyLogin)
+	p.mux.HandleFunc("POST /panel/api/loomy/import", p.handleLoomyImport)
 	p.mux.HandleFunc("POST /panel/api/loomy/checkin", p.handleLoomyCheckin)
 	p.mux.HandleFunc("POST /panel/api/loomy/balance", p.handleLoomyBalance)
 

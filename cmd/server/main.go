@@ -145,6 +145,7 @@ func main() {
 		lops = loomyops.New(loomyops.Config{
 			Pool:            lp,
 			Client:          lclient,
+			AuthDir:         cfg.Loomy.AuthDir,
 			Gap:             time.Duration(cfg.Loomy.RequestGapSeconds * float64(time.Second)),
 			ClaimOnboarding: cfg.Loomy.OnboardingEnabled,
 			TaskGap:         time.Duration(cfg.Loomy.RequestGapSeconds * float64(time.Second)),
@@ -568,6 +569,27 @@ func main() {
 			// ── Loomy 第三上游 ──
 			LoomyEnabled: cfg.Loomy.Enabled,
 			LoomyAuthDir: cfg.Loomy.AuthDir,
+			LoomyAddAccount: func(ctx context.Context, loginID, password, nickname string) (*auth.Auth, error) {
+				if lops == nil {
+					return nil, fmt.Errorf("Loomy 未启用")
+				}
+				a, err := lops.AddAccount(ctx, loginID, password, nickname)
+				if err != nil {
+					return nil, err
+				}
+				log.Printf("[panel] 已添加 Loomy 账号 %s", logfmt.UID8(a.UID))
+				return a, nil
+			},
+			LoomyImportAccounts: func(items [][]byte) ([]*auth.Auth, []error) {
+				if lops == nil {
+					return nil, []error{fmt.Errorf("Loomy 未启用")}
+				}
+				imported, errs := lops.ImportAccounts(items)
+				for _, a := range imported {
+					log.Printf("[panel] 已导入 Loomy 账号 %s", logfmt.UID8(a.UID))
+				}
+				return imported, errs
+			},
 			ReloadLoomyAuths: func() (int, error) {
 				if lp == nil {
 					return 0, nil

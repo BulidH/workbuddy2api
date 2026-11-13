@@ -1,15 +1,14 @@
-// loomylogin — Loomy 账号登录 / 写入凭证文件。
+// loomylogin — Loomy 账号登录 / 写入凭证文件（无界面场景用）。
+//
+// 注意：正常加号请走 Web 面板「添加账号 · Loomy」，那里同样调用 loomyops.AddAccount，
+// 两条路径的落盘与入池语义完全一致。本 CLI 只用于面板不可达的服务器 / 脚本场景。
 //
 // Loomy 没有 refresh token：14 天 session 到期后只能重新登录，所以账号文件里必须
-// 同时保存手机号与密码（文件权限 0600）。本 CLI 做两件事：
-//
-//  1. 首次登录：手机号 + 密码 → 调账号服务换 session → 写 loomy-<uid>.json；
-//  2. 续期：对已存在的账号文件重新登录并覆盖 accessToken/expiresAt。
+// 同时保存手机号与密码（文件权限 0600）。再次运行（同一手机号）即为续期。
 //
 // 用法：
 //
 //	loomylogin --phone 13800000000 --password 'xxx' [--dir ./loomy_auths] [--name 备注]
-//	loomylogin --refresh 13800000000      # 按 loginid 找到已有账号文件并重登
 //
 // 密码也可以走环境变量 LOOMY_PASSWORD，避免出现在 shell 历史与进程列表里。
 package main
@@ -23,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/loomy"
+	"workbuddy2api/internal/loomyops"
 )
 
 func main() {
@@ -32,7 +31,6 @@ func main() {
 	phone := flag.String("phone", "", "登录手机号（loginid）")
 	password := flag.String("password", "", "登录密码（也可用环境变量 LOOMY_PASSWORD）")
 	nickname := flag.String("name", "", "昵称（缺省 = 脱敏手机号）")
-	refresh := flag.Bool("refresh", false, "只对已有账号重新登录续期（按 --phone 匹配 loginid）")
 	flag.Parse()
 
 	loginID := strings.TrimSpace(*phone)
@@ -53,55 +51,14 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	client := loomy.New(loomy.Config{})
+	svc := loomyops.New(loomyops.Config{Client: client, AuthDir: *authDir})
 
-	var existing *auth.Auth
-	if *refresh {
-		auths, err := auth.LoadLoomyDir(*authDir)
-		if err != nil {
-			log.Fatalf("读取账号目录: %v", err)
-		}
-		for _, a := range auths {
-			if a.LoginID == loginID {
-				existing = a
-				break
-			}
-		}
-		if existing == nil {
-			log.Fatalf("目录 %s 下没有 loginid=%s 的账号", *authDir, maskPhone(loginID))
-		}
-	}
-
-	ident := loomy.NewIdentity()
-	if existing != nil {
-		ident.DevID = existing.LoomyDevID
-		ident.CampusDeviceID = existing.LoomyCampusDeviceID
-	}
-	res, err := client.LoginByPassword(ctx, ident, loginID, pwd)
+	// Pool 为 nil：CLI 只负责写文件，入池交给网关进程重载。
+	a, err := svc.AddAccount(ctx, loginID, pwd, *nickname)
 	if err != nil {
 		log.Fatalf("登录失败: %v", err)
 	}
 
-	a := existing
-	if a == nil {
-		a = auth.NewLoomyAuth(res.UserID, *nickname, loginID, pwd, res.Session, res.ExpireAt)
-		a.LoomyDevID = ident.DevID
-		a.LoomyCampusDeviceID = ident.CampusDeviceID
-		a.FilePath = auth.LoomyFilePath(*authDir, a.UID)
-	} else {
-		a.Lock()
-		a.AccessToken = res.Session
-		a.ExpiresAt = res.ExpireAt
-		a.Password = pwd
-		if *nickname != "" {
-			a.Nickname = *nickname
-		}
-		a.Unlock()
-	}
-	if err := a.SaveAtomic(); err != nil {
-		log.Fatalf("写入账号文件: %v", err)
-	}
-
-	// 顺带查一次余额，既验证 session 可用，也让面板首屏就有数字。
 	quotaText := "（余额查询失败，可稍后在面板手动刷新）"
 	if q, err := client.Quota(ctx, a); err == nil {
 		parts := []string{}

@@ -265,7 +265,7 @@ function accountsTable(list, { compact = false } = {}) {
   if (!shown.length) {
     const empty = S.hideDisabled && list.some(a => a.disabled)
       ? `<div class="empty">当前没有可显示的账号（已隐藏 ${list.filter(a => a.disabled).length} 个已禁用账号）。关闭「隐藏已禁用」即可查看。</div>`
-      : `<div class="empty">还没有任何账号，点击「添加账号」选择 WorkBuddy 或 Qoder 接入。</div>`;
+      : `<div class="empty">还没有任何账号，点击「添加账号」选择 WorkBuddy、Qoder 或 Loomy 接入。</div>`;
     return `<div class="card"><div class="card-head"><h3>账号池</h3>
       <div class="row-flex">${hideDisabledToggleHTML()}<button class="btn primary sm" data-add>+ 添加账号</button></div></div>
       ${empty}</div>`;
@@ -717,22 +717,24 @@ async function viewQoder() {
 }
 
 
-/* ── 添加账号（WorkBuddy OAuth / Qoder 三种接入）──────── */
+/* ── 添加账号（WorkBuddy OAuth / Qoder / Loomy）──────── */
 function addAccountFlow() {
   let provider = 'workbuddy';
 
   const renderProvider = () => {
     modal('添加账号 · 选择类型', `
-      <p class="muted" style="margin-top:0">选择要接入的上游。同名模型会在两个上游之间混合调度。</p>
+      <p class="muted" style="margin-top:0">选择要接入的上游。同名模型会在多个上游之间混合调度。</p>
       <div class="radio-row">
         <div class="radio-card ${provider === 'workbuddy' ? 'sel' : ''}" data-pv="workbuddy">
           <strong>WorkBuddy</strong><small>国内版 / 国际版 · OAuth 登录</small></div>
         <div class="radio-card ${provider === 'qoder' ? 'sel' : ''}" data-pv="qoder">
           <strong>Qoder</strong><small>设备授权 / PAT / 账号 JSON 导入</small></div>
+        <div class="radio-card ${provider === 'loomy' ? 'sel' : ''}" data-pv="loomy">
+          <strong>Loomy</strong><small>讯飞 · 手机号密码 / 账号 JSON 导入</small></div>
       </div>`,
       `<button class="btn" data-close>取消</button><button class="btn primary" id="next0">下一步</button>`);
     $$('[data-pv]').forEach(c => c.onclick = () => { provider = c.dataset.pv; renderProvider(); });
-    $('#next0').onclick = () => (provider === 'qoder' ? qoderFlow() : workbuddyFlow());
+    $('#next0').onclick = () => (provider === 'qoder' ? qoderFlow() : provider === 'loomy' ? loomyFlow() : workbuddyFlow());
   };
 
   const workbuddyFlow = () => {
@@ -991,6 +993,89 @@ function addAccountFlow() {
     };
 
     renderQoder();
+  };
+
+  // loomyFlow：手机号 + 密码登录 / 账号 JSON 导入。
+  // Loomy 没有 refresh token，14 天续期靠重新登录，所以必须存密码（文件 0600），
+  // 面板这里不收验证码、也不接受"只给 session"的接入方式。
+  const loomyFlow = () => {
+    const renderLoomy = () => {
+      modal('添加 Loomy 账号', `
+        <p class="muted" style="margin-top:0">用 Loomy App 的手机号 + 密码登录。
+          密码会连同会话一起写入本机账号文件（权限 600），仅用于 14 天后的自动续期。</p>
+        <div class="field">
+          <label>手机号</label>
+          <input id="lPhone" inputmode="numeric" autocomplete="username" placeholder="13800000000">
+        </div>
+        <div class="field">
+          <label>密码</label>
+          <input type="password" id="lPwd" autocomplete="current-password" placeholder="登录密码">
+        </div>
+        <div class="field">
+          <label>备注（可选）</label>
+          <input id="lName" placeholder="缺省用脱敏手机号">
+        </div>
+        <div class="row-flex" style="gap:8px">
+          <button class="btn primary sm" id="lLoginBtn">登录并添加</button>
+          <span class="muted" id="lLoginMsg" style="font-size:12px;align-self:center"></span>
+        </div>
+
+        <details class="form-section" style="margin-top:16px">
+          <summary>账号文件导入（JSON）</summary>
+          <div class="field" style="margin-top:8px">
+            <label>粘贴 loomy-*.json 内容（单个对象 / 数组 / {"accounts":[...]}）</label>
+            <textarea id="lJson" rows="6" class="mono"
+              placeholder='{"uid":"...","loginid":"138...","password":"...","accessToken":"..."}'></textarea>
+          </div>
+          <div class="row-flex" style="gap:8px">
+            <button class="btn sm" id="lImpBtn">导入</button>
+            <span class="muted" id="lImpMsg" style="font-size:12px;align-self:center"></span>
+          </div>
+        </details>`,
+        `<button class="btn" data-close>关闭</button>`);
+
+      $('#lLoginBtn').onclick = async () => {
+        const loginid = $('#lPhone').value.trim();
+        const password = $('#lPwd').value;
+        const nickname = $('#lName').value.trim();
+        if (!loginid || !password) { toast('请填写手机号与密码', 'err'); return; }
+        const b = $('#lLoginBtn');
+        b.disabled = true; b.textContent = '登录中…';
+        $('#lLoginMsg').textContent = '正在登录上游…';
+        try {
+          const r = await api('/loomy/login', { method: 'POST', body: { loginid, password, nickname } });
+          closeModal();
+          const c = r.account || {};
+          toast(`已添加 Loomy 账号${c.nickname ? '：' + c.nickname : ''}${c.credits ? '（积分 ' + c.credits + '）' : ''}`, 'ok', 7000);
+          render();
+        } catch (e) {
+          // 错误留在弹窗里：toast 会被弹窗挡住，密码错这类问题需要当场看到
+          $('#lLoginMsg').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+          b.disabled = false; b.textContent = '重试';
+        }
+      };
+
+      $('#lImpBtn').onclick = async () => {
+        const raw = $('#lJson').value.trim();
+        if (!raw) { toast('请粘贴账号 JSON', 'err'); return; }
+        let payload;
+        try { payload = JSON.parse(raw); } catch (e) { toast('JSON 解析失败：' + e.message, 'err'); return; }
+        const b = $('#lImpBtn');
+        b.disabled = true; b.textContent = '导入中…';
+        try {
+          const r = await api('/loomy/import', { method: 'POST', body: payload });
+          closeModal();
+          const n = (r.imported || []).length, bad = (r.errors || []).length;
+          toast(`已导入 ${n} 个${bad ? `，失败 ${bad} 个` : ''}`, bad ? 'warn' : 'ok', 8000);
+          render();
+        } catch (e) {
+          toast(e.message, 'err', 8000);
+          b.disabled = false; b.textContent = '导入';
+        }
+      };
+    };
+
+    renderLoomy();
   };
 
   renderProvider();

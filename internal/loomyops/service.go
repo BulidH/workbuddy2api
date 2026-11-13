@@ -27,6 +27,8 @@ var ErrBusy = errors.New("loomy checkin already running")
 type Config struct {
 	Pool   *pool.Pool
 	Client *loomy.Client
+	// AuthDir Loomy 账号文件目录（登录 / 导入时写 loomy-<uid>.json）。
+	AuthDir string
 	// Gap 账号之间的间隔（防风控）；<=0 用默认 1s。
 	Gap time.Duration
 	// RefreshSkew 批次开始前判定会话将过期的窗口；0 用默认 1h。
