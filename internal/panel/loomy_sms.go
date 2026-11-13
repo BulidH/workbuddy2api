@@ -66,7 +66,7 @@ func (p *Panel) handleLoomySMSSend(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	res, err := p.deps.LoomySMSSend(ctx, strings.TrimSpace(body.Ticket), strings.TrimSpace(body.Phone))
 	if err != nil {
-		smsErrJSON(w, r, err)
+		smsErrJSON(w, err)
 		return
 	}
 	okJSON(w, map[string]any{
@@ -98,7 +98,7 @@ func (p *Panel) handleLoomySMSVerify(w http.ResponseWriter, r *http.Request) {
 	a, err := p.deps.LoomySMSVerify(ctx, strings.TrimSpace(body.Ticket),
 		strings.TrimSpace(body.Code), strings.TrimSpace(body.Nickname))
 	if err != nil {
-		smsErrJSON(w, r, err)
+		smsErrJSON(w, err)
 		return
 	}
 	n, _ := p.reloadLoomy()
@@ -140,7 +140,7 @@ func (p *Panel) handleLoomyLoginPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // smsErrJSON 把短信登录会话错误映射为合适的 HTTP 状态；上游错误统一 502。
-func smsErrJSON(w http.ResponseWriter, r *http.Request, err error) {
+func smsErrJSON(w http.ResponseWriter, err error) {
 	kind, ok := loomyops.IsSMSLoginError(err)
 	if !ok {
 		errJSON(w, http.StatusBadGateway, "登录上游失败: "+err.Error())
