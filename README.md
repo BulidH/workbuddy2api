@@ -5,8 +5,8 @@
 <h1 align="center">WorkBuddy2API</h1>
 
 <p align="center">
-  <b>把 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关</b><br>
-  OAuth 登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 积分补充
+  <b>把 WorkBuddy / Qoder / Loomy 账号变成 OpenAI 兼容 API 的多上游网关</b><br>
+  三上游混合调度 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 积分签到
 </p>
 
 <p align="center">
@@ -21,13 +21,14 @@
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ```CodeBuddy``` 账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，把 ```WorkBuddy（CodeBuddy）```、```Qoder```、```Loomy（讯飞）``` 三类账号统一包装成 `/v1/chat/completions` 服务。
 
-- 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（`login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
-- 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
-- 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**。
+- 三家的官方形态都不开放标准 OpenAI API，本项目在网关侧原生实现各自的登录协议，并做 token 自动刷新（Loomy 无 refresh token，用手机号+密码重登续期）、账号池调度与流量治理；
+- **同一入口混合调度**：裸模型名先按 `priority` 分档（数值大者先试，Loomy 默认 2），档内按 `weight` 加权；某档账号全部冷却 / 积分耗尽时自动回落到下一档——所以「deepseek 先走 Loomy，用完了再走其它」只是一份别名配置；
+- 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；每个上游有独立账号池与独立状态文件，互不影响；
+- 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**；同一套 Web 面板管理三家的加号、签到、余额与成本账本。
 
-> ⚠️ 合规须知：本项目是**非官方**网关，使用 ```CodeBuddy``` 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
+> ⚠️ 合规须知：本项目是**非官方**网关，使用自有授权账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
 📖 完整文档见 [GitHub Wiki](https://github.com/Sliverkiss/workbuddy2api/wiki)。
 
@@ -74,7 +75,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 
 ### Qoder 第二上游（可选）
 
-- **同一入口混合调度** — 开启 `qoder.enabled` 后，同一 `/v1/chat/completions` 可按模型在两个上游间调度：裸模型名（如 `deepseek-v4-pro`）在两侧目录归一化匹配后加权随机选择 Provider，一侧全不可用时自动降级到另一侧；`qoder:<model>` 强制 Qoder、`cn:<model>` / `global:<model>` 强制 WorkBuddy 对应域
+- **同一入口混合调度** — 开启 `qoder.enabled` 后，同一 `/v1/chat/completions` 可按模型在多个上游间调度：裸模型名（如 `deepseek-v4-pro`）在各方目录归一化匹配后按调度档位（`priority` 分档 + 档内 `weight` 加权）选择 Provider，某档全不可用时自动降级到下一档；`qoder:<model>` 强制 Qoder、`cn:<model>` / `global:<model>` 强制 WorkBuddy 对应域
 - **独立账号池** — Qoder 账号走独立池（`qoder.state_file`），冷却 / 熔断 / 在途租约与 WorkBuddy 池互不影响；账号文件为 `<auth_dir>/qoder-*.json`，与 qoder2api-hub 账号文件同形状、可直接互读
 - **三种接入** — 面板内可设备授权登录（PKCE）、导入 `pt-` 个人访问令牌、粘贴/上传账号 JSON；token 过期自动刷新（`drt-` / `jrt-` / `pt-` 分别走 deviceToken / jobToken 刷新与交换）
 - **纯 Go 协议实现** — COSY 签名（AES-128-CBC + RSA PKCS#1 v1.5 + MD5）、设备指纹、SSE 信封解包全部原生实现，无 Python 运行时依赖
@@ -103,9 +104,7 @@ Loomy 没有 refresh token，14 天后靠这对手机号 + 密码重新登录续
 LOOMY_PASSWORD='***' go run ./cmd/loomylogin --phone 13800000000 --dir ./loomy_auths
 ```
 
-`/v1/models` 合并三侧目录：同名模型只保留一条裸名（`owned_by: "merged"`），Loomy 独有模型以 `loomy:<id>` 暴露（`loomy_key` 可作为别名调用）；`/status` 的 `providers` 段分别给出各上游 total / healthy / cooling / disabled。
-
-`/v1/models` 合并两侧目录：两侧同名模型只保留一条裸名（`owned_by: "merged"`），Qoder 独有模型以裸 display_name 暴露（`owned_by: "qoder"`，`qoder_key` 可作为别名调用）；`/status` 新增 `providers` 段分别给出两侧 total / healthy / cooling / disabled。
+`/v1/models` 合并三侧目录：同名模型只保留一条裸名（`owned_by: "merged"`，附带 `workbuddy_model` / `qoder_key` / `loomy_key` 说明实际落点），各家独有模型分别以 `qoder:<display_name>`、`loomy:<id>` 暴露；`/status` 的 `providers` 段分别给出各上游 total / healthy / cooling / disabled。
 
 ### 辅助工具
 
