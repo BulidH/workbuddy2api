@@ -219,6 +219,13 @@ html:not([data-theme="light"]) .topbar-title h1 {
 .auto-refresh input { accent-color: var(--accent); }
 .auto-refresh em { font-style: normal; color: var(--text-mute); font-family: var(--mono); font-size: 11px; }
 
+/* 隐私模式：勾选时整条胶囊高亮，并给页面顶部加一道提示光，
+   截图前一眼就能确认「现在确实是隐藏状态」。 */
+#hideNames:checked + span { color: var(--accent-2); }
+#hideNames:checked + span em { color: var(--accent-2); }
+#hideNames:checked + span em::before { content: "● "; }
+html[data-hide-names="1"] .topbar { box-shadow: inset 0 -1px 0 rgba(34,211,238,.35); }
+
 .content { padding: 22px 24px 48px; flex: 1; }
 .loading { color: var(--text-mute); padding: 40px; text-align: center; }
 

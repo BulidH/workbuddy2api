@@ -11,6 +11,41 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// 隐私模式：截图分享时隐藏账号名 / UID。
+//
+// 只做展示层遮蔽，接口与账号文件里的真实数据一律不动——关掉开关立刻恢复，
+// 也不会影响网关路由（选号靠 uid，不靠昵称）。
+// 遮蔽值由 uid 做短哈希得到：同一账号在任何页面、任何次刷新后都是同一个编号，
+// 截图里仍然能对照「这一行是哪个号」，但看不出原始名称。
+const HIDE_NAMES_KEY = 'wb2a-hide-names';
+
+function shortHash(s) {
+  let h = 5381;
+  const str = String(s || '');
+  for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h.toString(36).padStart(7, '0').slice(-4).toUpperCase();
+}
+
+// dispName 账号显示名：隐私模式下变成稳定的「账号 #XXXX」。
+function dispName(a) {
+  const nick = (a && a.nickname) || '（无昵称）';
+  if (!S || !S.hideNames) return nick;
+  return '账号 #' + shortHash((a && (a.uid || a.loginid)) || nick);
+}
+
+// dispUID 账号 UID 显示：隐私模式下同样换成短哈希，保留可区分的编号。
+function dispUID(uid) {
+  const raw = String(uid || '');
+  if (!S || !S.hideNames) return raw.slice(0, 18) + '…';
+  return 'uid #' + shortHash(raw);
+}
+
+// maskLogText 日志里的 uid=... 也要压掉，否则截日志页照样泄号。
+function maskLogText(text) {
+  if (!S || !S.hideNames) return String(text ?? '');
+  return String(text ?? '').replace(/\buid=([0-9a-f]{6,})/gi, (_, id) => 'uid=#' + shortHash(id));
+}
+
 async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(API + path, {
     method,
@@ -96,6 +131,8 @@ const HIDE_DISABLED_KEY = 'wb2a-hide-disabled';
 const S = {
   route: 'overview', overview: null, accounts: [], config: null, timer: null,
   hideDisabled: localStorage.getItem(HIDE_DISABLED_KEY) !== '0',
+  // 隐私模式：隐藏账号名 / UID，方便直接截图分享。默认关，用户主动打开才生效。
+  hideNames: localStorage.getItem(HIDE_NAMES_KEY) === '1',
 };
 
 // accountsDisplayList 账号表的「展示序」：
@@ -291,8 +328,8 @@ function accountsTable(list, { compact = false } = {}) {
       <td>${st}
           ${a.disabled && a.disabled_at ? `<div style="font-size:10.5px;color:var(--text-mute);margin-top:3px"
             title="禁用时刻；已禁用账号沉底，组内按此时间由近到远排上边">${esc(fmtTime(a.disabled_at))}</div>` : ''}</td>
-      <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
-          <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div>
+      <td><div style="font-weight:500">${esc(dispName(a))}</div>
+          <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(dispUID(a.uid))}</div>
           ${qoder && (a.plan || a.last_checkin) ? `<div style="font-size:11px;color:var(--text-mute)">
             ${a.plan ? '套餐 ' + esc(a.plan) : ''}${a.plan && a.last_checkin ? ' · ' : ''}${a.last_checkin ? '签到 ' + esc(a.last_checkin) : ''}</div>` : ''}
           ${loomy && a.mode === 'sms' ? `<div style="font-size:11px;color:var(--text-mute)"
@@ -309,11 +346,11 @@ function accountsTable(list, { compact = false } = {}) {
       <td style="white-space:nowrap">
         <button class="btn xs ${a.disabled ? 'primary' : 'warn'}" data-toggle-enable="${esc(a.uid)}"
           data-provider="${esc(a.provider || 'workbuddy')}"
-          data-enabled="${a.disabled ? '0' : '1'}" data-nick="${esc(a.nickname || a.uid)}"
+          data-enabled="${a.disabled ? '0' : '1'}" data-nick="${esc(dispName(a))}"
           title="${a.disabled ? '解禁后重新参与选号（若上游仍在拦截会被再次禁用）' : '禁用后不再参与选号，重启后仍保持'}">
           ${a.disabled ? '解禁' : '禁用'}</button>
         <button class="btn xs danger" data-del="${esc(a.uid)}" data-provider="${esc(a.provider || 'workbuddy')}"
-          data-nick="${esc(a.nickname || a.uid)}">移除</button>
+          data-nick="${esc(dispName(a))}">移除</button>
       </td>
     </tr>`;
   }).join('');
@@ -449,7 +486,7 @@ async function runBalance() {
     const byProv = r.summary?.by_provider || {};
     const provText = Object.keys(byProv).length
       ? '（' + Object.entries(byProv).map(([k, v]) => `${PROVIDER_LABEL[k] || k} ${v}`).join(' · ') + '）' : '';
-    const detail = got.map(o => `${o.nickname || o.uid.slice(0, 8)} = ${o.credits}`).join('，');
+    const detail = got.map(o => `${dispName(o)} = ${o.credits}`).join('，');
     toast(`余额查询完成：成功 ${got.length} · 失败 ${fail.length}${provText}` + (detail ? `；${detail}` : ''),
       fail.length ? 'warn' : 'ok', 9000);
     if (fail.length) {
@@ -458,7 +495,7 @@ async function runBalance() {
         <div class="table-wrap"><table class="tbl">
           <thead><tr><th>账号</th><th>上游</th><th>域</th><th>原因</th></tr></thead>
           <tbody>${fail.map(o => `<tr>
-            <td>${esc(o.nickname || o.uid.slice(0, 12))}</td>
+            <td>${esc(dispName(o))}</td>
             <td>${providerTag(o.provider)}</td>
             <td><span class="tag ${o.realm === 'global' ? 'info' : 'purple'}">${esc(o.realm || '—')}</span></td>
             <td style="font-size:12px;color:var(--text-dim)">${esc(o.error)}</td>
@@ -485,7 +522,7 @@ async function runCheckin() {
     const s = r.summary || {};
     const outs = r.outcomes || [];
     const balance = outs.filter(o => o.credits !== null && o.credits !== undefined)
-      .map(o => `${o.nickname || o.uid.slice(0, 8)} = ${o.credits}`).join('，');
+      .map(o => `${dispName(o)} = ${o.credits}`).join('，');
     toast(`签到完成：成功 ${s.ok || 0} · 已签到 ${s.already || 0} · 失败 ${s.fail || 0} · 跳过 ${s.skipped || 0}`
       + (balance ? `；余额：${balance}` : '；未取到余额'), s.fail ? 'warn' : 'ok', 9000);
 
@@ -497,7 +534,7 @@ async function runCheckin() {
         <div class="table-wrap"><table class="tbl">
           <thead><tr><th>账号</th><th>结果</th><th>原因</th></tr></thead>
           <tbody>${bad.map(o => `<tr>
-            <td>${esc(o.nickname || o.uid.slice(0, 12))}</td>
+            <td>${esc(dispName(o))}</td>
             <td><span class="tag ${o.status === 'fail' ? 'err' : 'gray'}">${esc(o.status)}</span></td>
             <td style="font-size:12px;color:var(--text-dim)">${esc(o.detail || '—')}</td>
           </tr>`).join('')}</tbody>
@@ -517,7 +554,7 @@ function confirmDelete(uid, nick, provider = 'workbuddy') {
   modal('移除账号', `
     <div class="alert warn">将从 <code>${dir}</code> 删除该账号的凭证文件，并立即从账号池移除。
       删除前会自动备份到 <code>backups/</code>。</div>
-    <dl class="kv"><dt>昵称</dt><dd>${esc(nick)}</dd><dt>UID</dt><dd>${esc(uid)}</dd>
+    <dl class="kv"><dt>昵称</dt><dd>${esc(nick)}</dd><dt>UID</dt><dd>${esc(S.hideNames ? dispUID(uid) : uid)}</dd>
       <dt>上游</dt><dd>${provider === 'qoder' ? 'Qoder' : 'WorkBuddy'}</dd></dl>`,
     `<button class="btn" data-close>取消</button>
      <button class="btn danger" id="doDel">确认移除</button>`);
@@ -598,7 +635,7 @@ async function viewQoder() {
 
   const actRows = (act.entries || []).slice().reverse().map(e => `<tr>
     <td class="mono" style="font-size:11.5px">${esc(e.time ? fmtTime(e.time) : '—')}</td>
-    <td>${esc(e.nickname || e.uid || '')}</td>
+    <td>${esc(e.nickname ? dispName(e) : (e.uid ? dispUID(e.uid) : ''))}</td>
     <td>${esc(e.kind || '')}${e.campaign ? ' · ' + esc(e.campaign) : ''}</td>
     <td class="num">${e.credits ? '+' + e.credits : '—'}</td>
     <td>${statusTag(e.status)}</td>
@@ -606,7 +643,7 @@ async function viewQoder() {
   </tr>`).join('');
 
   const opts = qs.map(a => `<option value="${esc(a.uid)}" ${a.uid === uid ? 'selected' : ''}>
-    ${esc(a.nickname || a.uid.slice(0, 12))} · ${a.realm === 'intl' ? '国际' : '国内'}${a.disabled ? '（已禁用）' : ''}
+    ${esc(dispName(a))} · ${a.realm === 'intl' ? '国际' : '国内'}${a.disabled ? '（已禁用）' : ''}
   </option>`).join('');
 
   $('#view').innerHTML = `
@@ -876,8 +913,8 @@ function addAccountFlow() {
       </div>
       <div class="alert ok">账号已添加并加入账号池。</div>
       <dl class="kv">
-        <dt>昵称</dt><dd>${esc(r.nickname || '—')}</dd>
-        <dt>UID</dt><dd>${esc(r.uid)}</dd>
+        <dt>昵称</dt><dd>${esc(r.nickname ? dispName(r) : '—')}</dd>
+        <dt>UID</dt><dd>${esc(dispUID(r.uid))}</dd>
         <dt>版本</dt><dd>${esc(r.realm)}</dd>
         ${reg}${trial}
         <dt>账号总数</dt><dd>${r.accounts}</dd>
@@ -961,7 +998,7 @@ function addAccountFlow() {
         try {
           const r = await api('/qoder/pat', { method: 'POST', body: { pat, realm } });
           closeModal();
-          toast(`已添加 Qoder 账号${r.account?.nickname ? '：' + r.account.nickname : ''}`);
+          toast(`已添加 Qoder 账号${r.account?.nickname ? '：' + dispName(r.account) : ''}`);
           render();
         } catch (e) {
           toast(e.message, 'err', 8000);
@@ -1066,7 +1103,7 @@ function addAccountFlow() {
       const finish = (account) => {
         closeModal();
         const c = account || {};
-        toast(`已添加 Loomy 账号${c.nickname ? '：' + c.nickname : ''}${c.credits != null ? '（积分 ' + c.credits + '）' : ''}`, 'ok', 7000);
+        toast(`已添加 Loomy 账号${c.nickname ? '：' + dispName(c) : ''}${c.credits != null ? '（积分 ' + c.credits + '）' : ''}`, 'ok', 7000);
         render();
       };
 
@@ -1521,7 +1558,7 @@ async function viewUsage(force = false) {
     <div class="alert warn" style="margin-bottom:16px">
       <b>${d.errors.length} 个账号的明细拉取失败</b>（其余账号数据正常）：
       <div style="margin-top:6px;font-size:12px">
-        ${d.errors.map(e => `${esc(e.nickname || e.uid.slice(0, 8))}（${esc(e.realm)}）: ${esc(e.error)}`).join('<br>')}
+        ${d.errors.map(e => `${esc(dispName(e))}（${esc(e.realm)}）: ${esc(e.error)}`).join('<br>')}
       </div>
     </div>` : '';
 
@@ -1638,8 +1675,8 @@ function usageAccountTable(rows, detail) {
     const pct = Math.round(((a.credit || 0) / max) * 100);
     return `<tr class="usage-row" data-uid="${esc(a.uid)}" style="cursor:pointer">
         <td>${realm}</td>
-        <td><div style="font-weight:500">${esc(a.nickname || '（无昵称）')}</div>
-            <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc((a.uid || '').slice(0, 18))}…</div></td>
+        <td><div style="font-weight:500">${esc(dispName(a))}</div>
+            <div class="mono" style="font-size:11px;color:var(--text-mute)">${esc(dispUID(a.uid))}</div></td>
         <td class="num">${a.calls}</td>
         <td class="num">${(a.credit || 0).toFixed(2)}
           <div class="bar ${a.credit > 0 ? 'warn' : 'ok'}" style="margin-top:5px"><i style="width:${pct}%"></i></div></td>
@@ -1745,7 +1782,7 @@ async function refreshLogs(getSince) {
     box.innerHTML = lines.map(l => {
       const t = new Date(l.t).toLocaleTimeString('zh-CN', { hour12: false });
       return `<div class="logline ${esc(l.level)}"><span class="lt">${t}</span>
-        <span class="lv">${esc(l.level)}</span><span class="lm">${esc(l.text)}</span></div>`;
+        <span class="lv">${esc(l.level)}</span><span class="lm">${esc(maskLogText(l.text))}</span></div>`;
     }).join('') || '<div class="muted">暂无日志</div>';
     box.scrollTop = box.scrollHeight;
   } catch { /* 静默：日志刷新失败不打扰 */ }
@@ -1771,6 +1808,29 @@ async function doRestart() {
 }
 
 /* ── 主题 ───────────────────────────────────────────── */
+// initPrivacy 顶栏「隐私模式」开关：勾选后全站隐藏账号名 / UID，状态存 localStorage。
+//
+// 为什么放在顶栏而不是账号页：截图通常截的是概览或用量页，开关必须随手可达；
+// 而且隐私开关要覆盖所有页面，放在全局位置语义更准。
+function initPrivacy() {
+  const cb = $('#hideNames');
+  const hint = $('#hideNamesHint');
+  if (!cb) return;
+  const paint = () => {
+    cb.checked = S.hideNames;
+    if (hint) hint.textContent = S.hideNames ? '已隐藏' : '';
+    document.documentElement.dataset.hideNames = S.hideNames ? '1' : '0';
+  };
+  cb.onchange = () => {
+    S.hideNames = cb.checked;
+    localStorage.setItem(HIDE_NAMES_KEY, S.hideNames ? '1' : '0');
+    paint();
+    toast(S.hideNames ? '已开启隐私模式：账号名已隐藏' : '已关闭隐私模式：恢复显示账号名');
+    render(); // 立刻重绘当前页（含已缓存的表格）
+  };
+  paint();
+}
+
 function initTheme() {
   const saved = localStorage.getItem('wb2a-theme') || 'dark';
   document.documentElement.dataset.theme = saved;
@@ -1928,6 +1988,7 @@ $('#restartBtn').onclick = () => {
 };
 
 initTheme();
+initPrivacy();
 initAutoRefresh();
 S.route = ROUTES[location.hash.replace('#', '')] ? location.hash.replace('#', '') : 'overview';
 render();
