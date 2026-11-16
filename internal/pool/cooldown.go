@@ -4,7 +4,10 @@
 package pool
 
 import (
+	"log"
 	"time"
+
+	"workbuddy2api/internal/logfmt"
 )
 
 // setCreditsLocked 以**上游权威快照**改写余额：同时记快照时刻（creditsAt，面板据此
@@ -63,6 +66,10 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		// （否则换模型请求会错误绕过本次冷却）。
 		e.modelCooldowns = nil
 		p.dirty.Store(true)
+		// 审计留痕：面板上"冷却"是结果，日志里必须能查到原因与截止时刻，
+		// 否则排查"为什么老冷却"只能靠猜（上游错误日志与冷却动作此前互不相关）。
+		log.Printf("WARN: [pool] cooldown uid=%s kind=%s until=%s reason=%s",
+			logfmt.UID8(uid), kind, e.until.Format(time.RFC3339), reason)
 	}
 }
 
@@ -101,6 +108,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
+			log.Printf("WARN: [pool] cooldown_model uid=%s model=%s until=%s reason=%s",
+				logfmt.UID8(uid), model, until.Format(time.RFC3339), reason)
 		} else if model != "" {
 			// 无解析时间的 6004：模型级有界退避（base 起按 softStreak 翻倍、封顶
 			// softRateMax）。仍只锁触发模型，账号可继续服务其他模型；同模型冷却中
@@ -115,6 +124,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 					Until:  now.Add(d),
 					Reason: reason,
 				}
+				log.Printf("WARN: [pool] cooldown_model uid=%s model=%s until=%s streak=%d reason=%s",
+					logfmt.UID8(uid), model, e.modelCooldowns[model].Until.Format(time.RFC3339), e.softStreak, reason)
 			}
 		} else {
 			// model 为空：账号级有界退避（旧调用方兼容）。注意：**在软冷却中**
@@ -123,6 +134,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++
 				e.until = now.Add(d)
+				log.Printf("WARN: [pool] cooldown_soft uid=%s until=%s streak=%d reason=%s",
+					logfmt.UID8(uid), e.until.Format(time.RFC3339), e.softStreak, reason)
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
@@ -153,11 +166,15 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		now := time.Now()
 		if !resetAt.IsZero() {
 			e.until = p.cappedSoftUntilLocked(now, resetAt)
+			log.Printf("WARN: [pool] cooldown_soft uid=%s until=%s reason=%s",
+				logfmt.UID8(uid), e.until.Format(time.RFC3339), reason)
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 			d := p.softDurationLocked(base, e.softStreak+1)
 			e.softStreak++
 			e.until = now.Add(d)
+			log.Printf("WARN: [pool] cooldown_soft uid=%s until=%s streak=%d reason=%s",
+				logfmt.UID8(uid), e.until.Format(time.RFC3339), e.softStreak, reason)
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason

@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 // Config 客户端配置。
@@ -410,11 +412,19 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 
 	resp, err := c.chatHTTP.Do(httpReq)
 	if err != nil {
+		// 与 upstream 客户端同口径：传输层错误只换号、不罚账号，但必须留痕，
+		// 否则账号被跳过/冷却时面板与日志双双无据可查。
+		log.Printf("ERR: [loomy] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		// 上游错误响应原样返回给上层做错误分类（429 软冷却、402 硬冷却等都依赖
+		// status+body），此前这里完全不打日志——账号冷却时面板看得见、日志查不到，
+		// 排查"为什么老冷却"只能靠猜。此处与 upstream 客户端对齐：WARN 一行留痕。
+		log.Printf("WARN: [loomy] chat_stream uid=%s: upstream %d %s body=%s",
+			logfmt.UID8(a.UID), resp.StatusCode, Classify(resp.StatusCode, string(detail)), truncate(string(detail), 200))
 		// 会话失效（401/403 或业务码 020002/100002）且有密码：重新登录后重试一次。
 		if isAuthFailure(resp.StatusCode, string(detail)) && a.LoginID != "" && a.Password != "" {
 			if rerr := c.RefreshSession(ctx, a); rerr == nil {
@@ -439,11 +449,14 @@ func (c *Client) chatOnce(ctx context.Context, a *auth.Auth, raw []byte, meta Ch
 	httpReq.Header.Set("X-Loomy-Request-Purpose", firstNonEmpty(meta.Purpose, c.cfg.RequestPurpose))
 	resp, err := c.chatHTTP.Do(httpReq)
 	if err != nil {
+		log.Printf("ERR: [loomy] chat_stream uid=%s: transport error (retry after re-login): %v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		log.Printf("WARN: [loomy] chat_stream uid=%s: upstream %d %s body=%s (retry after re-login)",
+			logfmt.UID8(a.UID), resp.StatusCode, Classify(resp.StatusCode, string(detail)), truncate(string(detail), 200))
 		return nil, resp.StatusCode, detail, nil
 	}
 	return rewriteUsageFrames(resp.Body), http.StatusOK, nil, nil
