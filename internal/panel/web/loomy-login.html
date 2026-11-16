@@ -3,46 +3,162 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Loomy 免密登录</title>
+<title>Loomy 免密登录 · workbuddy2api</title>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐱</text></svg>">
 <style>
-  .login-wrap { max-width: 430px; margin: 7vh auto 40px; padding: 0 16px; }
-  .login-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-  .login-head .logo { width: 38px; height: 38px; border-radius: 10px; background: var(--bg-soft);
-    border: 1px solid var(--border); display: grid; place-items: center; font-size: 20px; }
-  .login-head strong { display: block; font-size: 15px; }
-  .login-head small { color: var(--text-mute); font-size: 12px; }
-  .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    box-shadow: var(--shadow); padding: 18px; }
-  .login-card h2 { font-size: 14px; margin-bottom: 4px; }
-  .login-card .lead { font-size: 12.5px; color: var(--text-dim); margin: 0 0 16px; line-height: 1.6; }
-  .login-card .field { margin-bottom: 12px; }
+  /* 登录页独立于控制台，这里只做「单页科技感」的增量样式，
+     配色与控制台共用 style.css 的 token，保证一套视觉。 */
+  .login-wrap {
+    max-width: 440px; margin: 0 auto; padding: 7vh 16px 48px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 16px;
+    animation: rise .32s ease-out;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+
+  /* ── 头部 ────────────────────────────────────────── */
+  .login-head { display: flex; align-items: center; gap: 13px; }
+  .login-logo {
+    width: 46px; height: 46px; flex: 0 0 46px; border-radius: 14px;
+    display: grid; place-items: center; font-size: 22px;
+    background: linear-gradient(180deg, rgba(79,151,255,.24), rgba(34,211,238,.1));
+    border: 1px solid rgba(79,151,255,.42);
+    box-shadow: 0 0 26px -8px var(--glow), 0 0 0 1px rgba(34,211,238,.12) inset;
+  }
+  .login-head .titles { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .login-head strong {
+    font-size: 17px; letter-spacing: .4px;
+    background: var(--accent-grad); -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; color: var(--accent-2);
+  }
+  .login-head small { color: var(--text-mute); font-size: 12px; font-family: var(--mono); letter-spacing: .04em; }
+
+  /* 会话状态条：票据有效期倒计时 */
+  .session-bar {
+    display: flex; align-items: center; gap: 9px; justify-content: space-between;
+    font-family: var(--mono); font-size: 11px; color: var(--text-mute);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 8px 12px; background: var(--bg-soft);
+  }
+  .session-bar .chip { display: inline-flex; align-items: center; gap: 7px; letter-spacing: .1em; text-transform: uppercase; }
+  .session-bar .chip .tdot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2);
+    box-shadow: 0 0 10px var(--glow-2); animation: pulse 1.8s ease-in-out infinite;
+  }
+  .session-bar .chip.done .tdot { background: var(--ok); box-shadow: 0 0 10px rgba(46,230,165,.55); animation: none; }
+  .session-bar .chip.bad .tdot { background: var(--err); box-shadow: 0 0 10px rgba(255,111,107,.55); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
+  .session-bar .ttl { color: var(--accent-2); letter-spacing: .08em; }
+  .session-bar .ttl.dead { color: var(--err); }
+
+  /* ── 玻璃卡片 ────────────────────────────────────── */
+  .login-card {
+    position: relative; border-radius: var(--radius); padding: 20px;
+    background: linear-gradient(180deg, rgba(26,33,48,.92), rgba(14,19,28,.95));
+    border: 1px solid rgba(79,151,255,.28);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.06),
+      0 22px 50px -34px var(--glow),
+      0 0 0 1px rgba(34,211,238,.06);
+    overflow: hidden;
+  }
+  .login-card::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
+    background: var(--accent-line); opacity: .85;
+  }
+  .login-card h2 {
+    font-size: 15.5px; letter-spacing: .3px; margin-bottom: 6px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .login-card h2::before {
+    content: ""; width: 3px; height: 15px; border-radius: 2px; background: var(--accent-grad);
+    box-shadow: 0 0 12px -1px var(--glow);
+  }
+  .login-card .lead { font-size: 12.5px; color: var(--text-dim); margin: 0 0 16px; line-height: 1.65; }
+  .login-card .lead strong { color: var(--accent-2); font-family: var(--mono); letter-spacing: .05em; }
+  .login-card .field { margin-bottom: 14px; }
+  .login-card .field > label { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; }
+  .login-card input { font-size: 14px; }
+  .login-card input.mono { letter-spacing: .32em; font-size: 17px; }
   .login-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
-  .login-foot { color: var(--text-mute); font-size: 11.5px; line-height: 1.6; margin-top: 14px; }
-  .login-done { text-align: center; padding: 8px 0 4px; }
-  .login-done .mark { font-size: 34px; line-height: 1; margin-bottom: 8px; }
-  .login-done dl { display: inline-grid; grid-template-columns: auto auto; gap: 6px 14px;
-    text-align: left; margin: 12px auto 4px; font-size: 12.5px; }
-  .login-done dt { color: var(--text-mute); }
-  .login-done dd { margin: 0; font-family: var(--mono); }
+  .login-actions .btn.primary { min-width: 148px; }
+  .msg { font-size: 12px; font-family: var(--mono); letter-spacing: .04em; }
+
+  /* ── 步骤轨道 ────────────────────────────────────── */
+  .step-rail { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; }
+  .step-rail .seg { flex: 1; height: 1px; background: var(--border); }
+  .step-rail .seg.on { background: var(--accent-line); box-shadow: 0 0 10px -2px var(--glow-2); }
+  .step-node {
+    flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 10.5px; font-family: var(--mono);
+    color: var(--text-mute); border: 1px solid var(--border); background: var(--bg-soft);
+    transition: all .2s;
+  }
+  .step-node.on {
+    color: #fff; border-color: transparent; background: var(--accent-grad);
+    box-shadow: 0 0 16px -2px var(--glow);
+  }
+  .step-node.done {
+    color: #06251a; border-color: transparent;
+    background: linear-gradient(135deg, #2ee6a5, #5cf0c0);
+    box-shadow: 0 0 14px -2px rgba(46,230,165,.6);
+  }
+
+  /* ── 成功态 ──────────────────────────────────────── */
+  .login-done { text-align: center; padding: 6px 0 2px; animation: rise .3s ease-out; }
+  .login-done .mark {
+    width: 62px; height: 62px; margin: 0 auto 12px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 30px; color: #06251a;
+    background: linear-gradient(135deg, #2ee6a5, #5cf0c0);
+    box-shadow: 0 0 30px -4px rgba(46,230,165,.6);
+    animation: pop .4s cubic-bezier(.2,1.4,.5,1);
+  }
+  @keyframes pop { from { opacity: 0; transform: scale(.5); } to { opacity: 1; transform: none; } }
+  .login-done dl {
+    display: inline-grid; grid-template-columns: auto 1fr; gap: 9px 22px;
+    text-align: left; margin: 16px auto 4px; font-size: 12.5px;
+    padding: 14px 20px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--bg-soft);
+  }
+  .login-done dt { color: var(--text-mute); font-family: var(--mono); font-size: 11px; letter-spacing: .1em; }
+  .login-done dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+
+  .login-foot {
+    color: var(--text-mute); font-size: 11.5px; line-height: 1.75;
+    font-family: var(--mono); letter-spacing: .03em; text-align: center;
+  }
+  .login-foot code { color: var(--accent-2); }
 </style>
 </head>
 <body>
 <div class="login-wrap">
-  <div class="login-head">
-    <span class="logo">🌤️</span>
-    <div>
+  <header class="login-head">
+    <span class="login-logo">🌤️</span>
+    <div class="titles">
       <strong>Loomy 免密登录</strong>
-      <small>短信验证码 · 由 workbuddy2api 代为建立账号</small>
+      <small>SMS · PASSWORDLESS · workbuddy2api</small>
+    </div>
+  </header>
+
+  <div class="session-bar">
+    <span class="chip" id="chip"><i class="tdot"></i><span id="chipText">会话初始化</span></span>
+    <span class="ttl" id="ttl">--:--</span>
+  </div>
+
+  <div class="login-card" id="card">
+    <div id="panelBody">
+      <div class="step-rail">
+        <div class="step-node">1</div><div class="seg" id="seg1"></div>
+        <div class="step-node">2</div><div class="seg" id="seg2"></div>
+        <div class="step-node">3</div>
+      </div>
+      <p class="muted" style="margin:0">正在读取登录会话…</p>
     </div>
   </div>
-  <div class="login-card" id="card">
-    <div id="panelBody"><p class="muted" style="margin:0">正在读取登录会话…</p></div>
-  </div>
+
   <p class="login-foot" id="foot">
     登录成功后，会话会直接写入网关的 Loomy 账号目录并加入账号池，随后即可关闭本页。
-    本链接 15 分钟内有效、只能用于一次登录；页面里不会出现你的密码。
+    链接 <code>15 分钟</code> 内有效、仅可用于一次登录，页面不会要求你输入密码。
   </p>
 </div>
 <script>
@@ -50,8 +166,15 @@
   const ticket = (new URLSearchParams(location.search).get('t') || '').trim();
   const body = document.getElementById('panelBody');
   const foot = document.getElementById('foot');
+  const chip = document.getElementById('chip');
+  const chipText = document.getElementById('chipText');
+  const ttl = document.getElementById('ttl');
+  const stepNodes = document.querySelectorAll('.step-node');
+  const seg1 = document.getElementById('seg1');
+  const seg2 = document.getElementById('seg2');
   let phone = '';
   let masked = '';
+  let expiresAt = 0;
   let cooldownTimer = null;
 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
@@ -77,26 +200,64 @@
     if (cooldownTimer) { clearInterval(cooldownTimer); cooldownTimer = null; }
   }
 
+  // 步骤轨道：1 手机号 → 2 验证码 → 3 完成
+  function setStep(n) {
+    stepNodes.forEach((el, i) => el.classList.toggle('on', i + 1 === n));
+    stepNodes.forEach((el, i) => { if (i + 1 < n) el.classList.add('done'); else el.classList.remove('done'); });
+    seg1.classList.toggle('on', n >= 2);
+    seg2.classList.toggle('on', n >= 3);
+  }
+
+  // 会话倒计时：到期后把状态条标红并提示重新生成链接
+  function paintTTL() {
+    if (!expiresAt) { ttl.textContent = '--:--'; ttl.classList.remove('dead'); return; }
+    const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+    const mm = String(Math.floor(left / 60)).padStart(2, '0');
+    const ss = String(left % 60).padStart(2, '0');
+    ttl.textContent = mm + ':' + ss;
+    ttl.classList.toggle('dead', left <= 0);
+    if (left <= 0) {
+      chip.className = 'chip bad';
+      chipText.textContent = '链接已过期';
+      stopCooldown();
+      setTimeout(() => { if (expiresAt && Date.now() >= expiresAt) renderFatal('登录链接已过期'); }, 400);
+    }
+  }
+  setInterval(paintTTL, 1000);
+
+  function chipOf(state, text) {
+    chip.className = 'chip';
+    if (state === 'done') { chip.className = 'chip done'; }
+    if (state === 'expired' || state === 'unknown') { chip.className = 'chip bad'; }
+    chipText.textContent = text;
+  }
+
   function renderFatal(msg) {
     stopCooldown();
+    chipOf('expired', '会话终止');
+    ttl.textContent = '--:--';
+    ttl.classList.add('dead');
     body.innerHTML = showAlert('err', msg);
     foot.textContent = '请回到 WorkBuddy2API 控制台 → 账号管理 → 添加账号 → Loomy，重新生成一条登录链接。';
   }
 
   function renderPhone(errMsg) {
     stopCooldown();
+    setStep(1);
+    chipOf('new', '等待手机号');
+    expiresAt = 0;
     body.innerHTML = `
       ${errMsg ? showAlert('err', errMsg) : ''}
       <h2>输入 Loomy 绑定手机号</h2>
-      <p class="lead">我们会向这个号码发送一条登录短信验证码。不需要密码。</p>
+      <p class="lead">向该号码发送一条<strong>登录短信验证码</strong>。全程无需密码。</p>
       <div class="field">
-        <label for="phone">手机号</label>
+        <label for="phone">PHONE</label>
         <input id="phone" type="tel" inputmode="numeric" autocomplete="tel"
           maxlength="11" placeholder="13800000000" value="${esc(phone)}">
       </div>
       <div class="login-actions">
         <button class="btn primary" id="sendBtn" type="button">发送验证码</button>
-        <span class="muted" id="sendMsg" style="font-size:12px"></span>
+        <span class="msg muted" id="sendMsg"></span>
       </div>`;
     const btn = document.getElementById('sendBtn');
     const phoneInput = document.getElementById('phone');
@@ -110,7 +271,7 @@
       try {
         const res = await call('/panel/api/loomy/sms/send', { ticket, phone: value });
         phone = value;
-        renderCode(res.phone || value, res.resend_in || 60);
+        renderCode(res.phone || value, res.resend_in || 60, res.expires_at);
       } catch (e) {
         btn.disabled = false; btn.textContent = '重新发送';
         document.getElementById('sendMsg').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
@@ -121,25 +282,28 @@
     if (location.hash === '#sent') doSend();
   }
 
-  function renderCode(phoneMasked, resendIn) {
+  function renderCode(phoneMasked, resendIn, expAt) {
     stopCooldown();
     masked = phoneMasked || masked;
+    setStep(2);
+    chipOf('sent', '验证码已下发');
+    if (expAt) { expiresAt = Number(expAt) * 1000 || expiresAt; }
     body.innerHTML = `
       <h2>输入短信验证码</h2>
-      <p class="lead">验证码已发送至 <strong>${esc(masked)}</strong>。若没收到，可稍后重新发送。</p>
+      <p class="lead">验证码已发送至 <strong>${esc(masked)}</strong>，未收到可稍后重新发送。</p>
       <div class="field">
-        <label for="code">验证码</label>
+        <label for="code">VERIFY CODE</label>
         <input id="code" type="tel" inputmode="numeric" autocomplete="one-time-code"
           maxlength="8" placeholder="6 位验证码" class="mono">
       </div>
       <div class="field">
         <label for="nickname">备注（可选）</label>
-        <input id="nickname" type="text" maxlength="32" placeholder="缺省用脱敏手机号">
+        <input id="nickname" type="text" maxlength="32" placeholder="缺省使用脱敏手机号">
       </div>
       <div class="login-actions">
         <button class="btn primary" id="verifyBtn" type="button">登录并添加账号</button>
         <button class="btn ghost sm" id="resendBtn" type="button">重新发送</button>
-        <span class="muted" id="codeMsg" style="font-size:12px"></span>
+        <span class="msg muted" id="codeMsg"></span>
       </div>`;
     const verifyBtn = document.getElementById('verifyBtn');
     const resendBtn = document.getElementById('resendBtn');
@@ -181,6 +345,7 @@
       try {
         const res = await call('/panel/api/loomy/sms/send', { ticket, phone });
         left = Math.max(0, Number(res.resend_in) || 60);
+        if (res.expires_at) { expiresAt = Number(res.expires_at) * 1000; }
         paint();
         codeMsg.innerHTML = '<span style="color:var(--ok)">验证码已重新发送</span>';
         if (left > 0) {
@@ -198,31 +363,37 @@
 
   function renderDone(account) {
     stopCooldown();
+    setStep(3);
+    chipOf('done', '会话已建立');
+    ttl.textContent = '已入池';
+    ttl.classList.remove('dead');
+    expiresAt = 0;
     const nickname = account.nickname || 'Loomy 账号';
     const credits = account.credits == null ? '—' : account.credits;
     body.innerHTML = `
       <div class="login-done">
-        <div class="mark">✅</div>
+        <div class="mark">✓</div>
         <h2>登录成功</h2>
-        <p class="lead">账号已加入网关账号池，可以关闭此页面了。</p>
+        <p class="lead">账号已写入网关账号池，可以关闭此页面了。</p>
         <dl>
           <dt>账号</dt><dd>${esc(nickname)}</dd>
           <dt>手机号</dt><dd>${esc(account.loginid || masked)}</dd>
           <dt>积分</dt><dd>${esc(credits)}</dd>
         </dl>
-        <div class="login-actions" style="justify-content:center;margin-top:14px">
+        <div class="login-actions" style="justify-content:center;margin-top:16px">
           <a class="btn primary sm" href="/panel/#accounts">回到控制台</a>
         </div>
       </div>`;
-    foot.textContent = '这是免密账号：14 天会话到期后需要再生成一条登录链接，重新收验证码登录。';
+    foot.textContent = '这是免密账号：14 天会话到期后，需要再生成一条登录链接重新收验证码登录。';
   }
 
   async function init() {
     if (!ticket) { renderFatal('链接缺少登录票据（ticket），可能被截断了'); return; }
     try {
       const st = await call('/panel/api/loomy/sms/status?ticket=' + encodeURIComponent(ticket), null, 'GET');
+      if (st.expires_at) { expiresAt = Number(st.expires_at) * 1000; }
       if (st.state === 'done') { renderDone(st.account || {}); return; }
-      if (st.state === 'sent') { renderCode(st.phone_masked, st.resend_in); return; }
+      if (st.state === 'sent') { renderCode(st.phone_masked, st.resend_in, st.expires_at); return; }
       if (st.state === 'expired' || st.state === 'unknown') {
         renderFatal(st.message || '登录链接已过期'); return;
       }
@@ -230,6 +401,7 @@
     } catch (e) {
       renderFatal(e.message);
     }
+    paintTTL();
   }
 
   init();
