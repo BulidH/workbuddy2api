@@ -1027,7 +1027,7 @@ function addAccountFlow() {
 
         <div class="field">
           <label>手机号</label>
-          <input id="lPhone" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="13800000000">
+          <input id="lPhone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="13800000000">
         </div>
         <div class="row-flex" style="gap:8px">
           <button class="btn primary sm" id="lSendBtn">发送验证码 / 生成登录链接</button>
@@ -1078,11 +1078,11 @@ function addAccountFlow() {
             若在别的设备打开下面的链接，登录状态同样会回到这里。</div>
           <div class="field">
             <label>验证码</label>
-            <input id="lCode" inputmode="numeric" autocomplete="one-time-code" maxlength="8" class="mono" placeholder="6 位验证码">
+            <input id="lCode" type="tel" inputmode="numeric" autocomplete="one-time-code" maxlength="8" class="mono" placeholder="6 位验证码">
           </div>
           <div class="field">
             <label>备注（可选）</label>
-            <input id="lName" maxlength="32" placeholder="缺省用脱敏手机号">
+            <input id="lName" type="text" maxlength="32" placeholder="缺省用脱敏手机号">
           </div>
           <div class="row-flex" style="gap:8px">
             <button class="btn primary sm" id="lVerifyBtn">登录并添加</button>
@@ -1834,11 +1834,11 @@ async function viewAgents() {
     <div class="card">
       <div class="row-flex" style="gap:10px;align-items:end">
         <div class="field" style="flex:2;min-width:240px"><label>网关地址</label>
-          <input id="agBase" value="${esc(baseURL)}" placeholder="http://127.0.0.1:8787"></div>
+          <input id="agBase" type="text" value="${esc(baseURL)}" placeholder="http://127.0.0.1:8787"></div>
         <div class="field" style="flex:2;min-width:200px"><label>API Key</label>
           <input id="agKey" type="password" placeholder="面板/网关的 API Key"></div>
         <div class="field" style="flex:1;min-width:160px"><label>默认模型</label>
-          <input id="agModel" value="${esc(S.agentModel || '')}" placeholder="如 qoder:DeepSeek-V4-Pro"></div>
+          <input id="agModel" type="text" value="${esc(S.agentModel || '')}" placeholder="如 qoder:DeepSeek-V4-Pro"></div>
       </div>
       <p class="muted" style="margin:8px 0 0">Key 只写入客户端本地配置；网关 state 仅保存 sha256。写入前会备份原件，还原回到首次接入前。</p>
     </div>

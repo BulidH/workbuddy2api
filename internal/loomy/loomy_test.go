@@ -1,6 +1,7 @@
 package loomy
 
 import (
+	"strings"
 	"testing"
 
 	"workbuddy2api/internal/upstream"
@@ -94,5 +95,31 @@ func TestOnboardingTaskTable(t *testing.T) {
 	}
 	if sum != OnboardingTotalPoints {
 		t.Errorf("任务总积分 %d != %d", sum, OnboardingTotalPoints)
+	}
+}
+
+// TestTruncateStripsHTMLErrorPage 上游故障时返回整页 HTML，错误文案不应把标签带进面板。
+func TestTruncateStripsHTMLErrorPage(t *testing.T) {
+	raw := "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>xunfei</center>\r\n</body>\r\n</html>"
+	got := truncate(raw, 200)
+	if strings.ContainsAny(got, "<>") {
+		t.Fatalf("仍含 HTML 标签: %q", got)
+	}
+	if !strings.Contains(got, "502 Bad Gateway") {
+		t.Fatalf("丢失关键信息: %q", got)
+	}
+	if strings.Contains(got, "\n") || strings.Contains(got, "\r") {
+		t.Fatalf("未折叠换行: %q", got)
+	}
+}
+
+// TestTruncateKeepsPlainAndLimitsLength 纯文本原样保留关键内容，并按上限截断。
+func TestTruncateKeepsPlainAndLimitsLength(t *testing.T) {
+	if got := truncate(`{"code":"000000"}`, 200); got != `{"code":"000000"}` {
+		t.Fatalf("纯文本被改写: %q", got)
+	}
+	long := strings.Repeat("a", 500)
+	if got := truncate(long, 20); len(got) != 20 {
+		t.Fatalf("长度=%d, want 20", len(got))
 	}
 }

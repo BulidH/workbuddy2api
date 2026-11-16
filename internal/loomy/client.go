@@ -714,7 +714,31 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// truncate 截断上游响应体用于错误提示。
+//
+// 上游网关故障时会直接回整页 HTML（如讯飞的 `<html><title>502 Bad Gateway</title>`），
+// 原样塞进面板的错误文案既读不出重点、又会把它自己的报错再淹没一遍。这里把 HTML
+// 标签剥掉、空白折叠成单空格，再按 n 截断；纯文本响应同样受益（原本会把换行带进 UI）。
 func truncate(s string, n int) string {
+	if strings.Contains(s, "<") && strings.Contains(s, ">") {
+		var b strings.Builder
+		inTag := false
+		for _, r := range s {
+			switch r {
+			case '<':
+				inTag = true
+				b.WriteByte(' ')
+			case '>':
+				inTag = false
+			default:
+				if !inTag {
+					b.WriteRune(r)
+				}
+			}
+		}
+		s = b.String()
+	}
+	s = strings.Join(strings.Fields(s), " ")
 	if len(s) <= n {
 		return s
 	}

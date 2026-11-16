@@ -78,8 +78,13 @@
   .login-card .lead strong { color: var(--accent-2); font-family: var(--mono); letter-spacing: .05em; }
   .login-card .field { margin-bottom: 14px; }
   .login-card .field > label { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; }
-  .login-card input { font-size: 14px; }
-  .login-card input.mono { letter-spacing: .32em; font-size: 17px; }
+  /* 手机端是主要使用场景，输入框再放大一档；只覆盖非 focus 态，
+     焦点光晕仍交给 style.css，避免两层样式互相压掉。 */
+  .login-card .field input:not(:focus) {
+    background: #0c121c; color: #f2f6ff; border-color: #3a4a66;
+    font-size: 16px; padding: 12px 14px; min-height: 46px;
+  }
+  .login-card .field input.mono { letter-spacing: .3em; font-size: 19px; font-weight: 500; }
   .login-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
   .login-actions .btn.primary { min-width: 148px; }
   .msg { font-size: 12px; font-family: var(--mono); letter-spacing: .04em; }

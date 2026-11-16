@@ -77,6 +77,11 @@ html:not([data-theme="light"]) body::before {
 
 * { box-sizing: border-box; }
 
+/* 让浏览器把原生控件（下拉面板、滚动条、日期选择器）按深色渲染，
+   否则暗色主题下 select 的弹层仍是白底黑字。 */
+html:not([data-theme="light"]) { color-scheme: dark; }
+html[data-theme="light"] { color-scheme: light; }
+
 html, body {
   margin: 0; padding: 0; height: 100%;
   background: var(--bg);
@@ -410,11 +415,33 @@ html:not([data-theme="light"]) .tag .tdot {
 .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .field > label { font-size: 12.5px; color: var(--text-dim); display: flex; align-items: center; gap: 7px; }
 .field .hint { font-size: 11.5px; color: var(--text-mute); line-height: 1.45; }
-.field input[type=text], .field input[type=number], .field input[type=password], .field input[type=tel], .field select, .field textarea {
-  background: var(--bg); border: 1px solid var(--border-2); color: var(--text);
-  border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px;
-  font-family: inherit; width: 100%;
+/* 表单控件：用 :not() 排除法匹配，避免依赖 input 上是否写了 type 属性。
+   早期写法是 input[type=text] 这类精确属性选择器，一旦 markup 里漏写 type，
+   浏览器就回退成原生控件（深底深字、宽度按默认 char 尺寸），在暗色主题下
+   表现为「字和底色一样、输入框很窄」。 */
+.field input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=file]),
+.field select,
+.field textarea {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  font-size: 14px;
+  line-height: 1.45;
+  font-family: inherit;
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  caret-color: var(--accent-2);
   transition: border-color .15s, box-shadow .15s, background .15s;
+}
+.field textarea { min-height: 96px; resize: vertical; }
+html:not([data-theme="light"]) .field input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=file]),
+html:not([data-theme="light"]) .field select,
+html:not([data-theme="light"]) .field textarea {
+  background: linear-gradient(180deg, rgba(20,27,39,.96), rgba(13,18,27,.96));
+  border-color: #33405a;
 }
 .field input:focus, .field select:focus, .field textarea:focus {
   outline: none; border-color: var(--accent);
@@ -422,12 +449,20 @@ html:not([data-theme="light"]) .tag .tdot {
 html:not([data-theme="light"]) .field input:focus,
 html:not([data-theme="light"]) .field select:focus,
 html:not([data-theme="light"]) .field textarea:focus {
-  background: rgba(15,21,32,.9);
-  border-color: rgba(79,151,255,.75);
-  box-shadow: 0 0 0 3px rgba(79,151,255,.14), 0 0 18px -6px var(--glow);
+  background: linear-gradient(180deg, rgba(18,26,40,.98), rgba(12,18,28,.98));
+  border-color: rgba(79,151,255,.8);
+  box-shadow: 0 0 0 3px rgba(79,151,255,.16), 0 0 20px -8px var(--glow);
 }
-.field input::placeholder, .field textarea::placeholder { color: var(--text-mute); opacity: .8; }
-.field input.mono { font-family: var(--mono); font-size: 12.5px; }
+/* 自动填充：Chrome 默认给白底 + 黑字，暗色主题下会闪成刺眼的白块，这里压住。 */
+.field input:-webkit-autofill,
+.field input:-webkit-autofill:hover,
+.field input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  -webkit-box-shadow: 0 0 0 1000px var(--bg-soft) inset;
+  caret-color: var(--text);
+}
+.field input::placeholder, .field textarea::placeholder { color: var(--text-mute); opacity: 1; }
+.field input.mono { font-family: var(--mono); font-size: 13.5px; letter-spacing: .06em; }
 .field.row { flex-direction: row; align-items: center; gap: 9px; }
 .field.row > label { color: var(--text); font-size: 13px; }
 
