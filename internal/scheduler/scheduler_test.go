@@ -14,24 +14,34 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
 
+// slots 把整点小时转成 config.HourSlot（分钟数），供测试字面量使用。
+func slots(hours ...int) []config.HourSlot {
+	out := make([]config.HourSlot, 0, len(hours))
+	for _, h := range hours {
+		out = append(out, config.HourSlot(h*60))
+	}
+	return out
+}
+
 func TestNextFire(t *testing.T) {
 	loc := time.Local
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
-	next := nextFire(now, []int{9, 21})
+	next := nextFire(now, slots(9, 21))
 	if next.Hour() != 21 || next.Day() != 27 {
 		t.Errorf("next=%v want 21:00 same day", next)
 	}
 	now = time.Date(2026, 7, 27, 22, 0, 0, 0, loc)
-	next = nextFire(now, []int{9, 21})
+	next = nextFire(now, slots(9, 21))
 	if next.Hour() != 9 || next.Day() != 28 {
 		t.Errorf("next=%v want 09:00 next day", next)
 	}
 	now = time.Date(2026, 7, 27, 9, 0, 0, 0, loc)
-	next = nextFire(now, []int{9})
+	next = nextFire(now, slots(9))
 	if next.Day() != 28 {
 		t.Errorf("exact match should roll to next day: %v", next)
 	}
@@ -39,7 +49,7 @@ func TestNextFire(t *testing.T) {
 
 func TestNextFireMergesSchedules(t *testing.T) {
 	now := time.Date(2026, 7, 27, 20, 0, 0, 0, time.Local)
-	next := nextFire(now, []int{9, 21, 22})
+	next := nextFire(now, slots(9, 21, 22))
 	if next.Hour() != 21 {
 		t.Errorf("next=%v want 21 (earliest of 21/22)", next)
 	}
@@ -47,7 +57,7 @@ func TestNextFireMergesSchedules(t *testing.T) {
 
 // TestNextWakeKeepaliveOnly 签到已过点时按保活整点唤醒。
 func TestNextWakeKeepaliveOnly(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
+	s := New(Config{CheckinHours: slots(9), KeepaliveHours: slots(22),
 		TravelDisabled: true, ActivityDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -61,10 +71,10 @@ func TestNextWakeKeepaliveOnly(t *testing.T) {
 // TestNextWakeSameInstantFiresAll 签到与保活配到同一整点时两类任务都要执行。
 func TestNextWakeSameInstantFiresAll(t *testing.T) {
 	s := New(Config{
-		CheckinHours:     []int{9, 22},
-		TravelHours:      []int{}, // 禁用旅行时点干扰（仅测签到+保活同整点）
-		ActivityHours:    []int{}, // 禁用活跃时点干扰
-		KeepaliveHours:   []int{22},
+		CheckinHours:     slots(9, 22),
+		TravelHours:      slots(), // 禁用旅行时点干扰（仅测签到+保活同整点）
+		ActivityHours:    slots(), // 禁用活跃时点干扰
+		KeepaliveHours:   slots(22),
 		TravelDisabled:   true,
 		ActivityDisabled: true,
 		SchoolDisabled:   true,
@@ -99,7 +109,7 @@ func TestNextWakeNothingScheduled(t *testing.T) {
 
 // TestNextWakeCheckinDisabled 显式禁用签到后，排程里不再有签到时点（保活照常）。
 func TestNextWakeCheckinDisabled(t *testing.T) {
-	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+	s := New(Config{CheckinDisabled: true, CheckinHours: slots(9, 21), KeepaliveHours: slots(22),
 		TravelDisabled: true, ActivityDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -112,7 +122,7 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
 
 // TestNextWakeKeepaliveDisabled 显式禁用保活后，排程里不再有保活时点（签到照常）。
 func TestNextWakeKeepaliveDisabled(t *testing.T) {
-	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+	s := New(Config{KeepaliveDisabled: true, CheckinHours: slots(9, 21), KeepaliveHours: slots(22),
 		TravelDisabled: true, ActivityDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -132,8 +142,8 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		CheckinHours:      []int{9, 21},
-		KeepaliveHours:    []int{22},
+		CheckinHours:      slots(9, 21),
+		KeepaliveHours:    slots(22),
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
@@ -243,8 +253,8 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	s := New(Config{
 		Pool:           p,
 		Upstream:       up,
-		CheckinHours:   []int{9, 21},
-		KeepaliveHours: []int{22},
+		CheckinHours:   slots(9, 21),
+		KeepaliveHours: slots(22),
 	})
 	s.RunCheckinNow()
 	if f.checkinCalls.Load() != 1 {

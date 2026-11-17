@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/loomyops"
 	"workbuddy2api/internal/pool"
@@ -22,15 +23,19 @@ import (
 //
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
+//
+// 时点统一用 config.HourSlot（自当日 0 点的分钟数）：签到窗口 10:00 开放后，
+// 整点排程在 10:00 之前的那趟跑时活动还没上线，支持分钟粒度才能把时点
+// 精确卡在窗口开放之后（如 10:30 补跑一趟）。
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
-	CheckinHours   []int // 默认 [9, 21]
-	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
-	ActivityHours  []int // 默认 [10]
-	KeepaliveHours []int // 默认 [22]
-	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
-	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	CheckinHours   []config.HourSlot // 默认 [9:00,21:00]
+	TravelHours    []config.HourSlot // 默认 [9:00,21:00]：一趟派出 + 一趟领奖闭环
+	ActivityHours  []config.HourSlot // 默认 [10:00]
+	KeepaliveHours []config.HourSlot // 默认 [22:00]
+	SchoolHours    []config.HourSlot // 默认 [12:00]：开学季任务（迁移自系统 crontab）
+	CatHours       []config.HourSlot // 默认 [1:00]：夜猫子任务（迁移自系统 crontab）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -55,18 +60,18 @@ type Config struct {
 	CatDisabled bool
 
 	// ── Qoder 第二上游（QoderOps=nil 表示未启用，全部排程忽略）──
-	QoderOps               *qoderops.Service
-	QoderCheckinHours      []int // 默认 [9, 21]
-	QoderKeepaliveHours    []int // 默认 [22]
-	QoderCheckinDisabled   bool
-	QoderKeepaliveDisabled bool
+	QoderOps                *qoderops.Service
+	QoderCheckinHours       []config.HourSlot // 默认 [9:00,21:00]
+	QoderKeepaliveHours     []config.HourSlot // 默认 [22:00]
+	QoderCheckinDisabled    bool
+	QoderKeepaliveDisabled  bool
 
 	// ── Loomy 第三上游（LoomyOps=nil 表示未启用，全部排程忽略）──
-	LoomyOps               *loomyops.Service
-	LoomyCheckinHours      []int // 默认 [9, 21]
-	LoomyKeepaliveHours    []int // 默认 [22]
-	LoomyCheckinDisabled   bool
-	LoomyKeepaliveDisabled bool
+	LoomyOps                *loomyops.Service
+	LoomyCheckinHours       []config.HourSlot // 默认 [9:00,21:00]
+	LoomyKeepaliveHours     []config.HourSlot // 默认 [22:00]
+	LoomyCheckinDisabled    bool
+	LoomyKeepaliveDisabled  bool
 	// LoomyRenewBefore 会话续期提前量（Loomy 无 refresh token，续期 = 重登）。
 	LoomyRenewBefore time.Duration
 }
@@ -102,34 +107,34 @@ func (s *Scheduler) LastCheckin() (time.Time, string) {
 // New 构建。
 func New(cfg Config) *Scheduler {
 	if len(cfg.CheckinHours) == 0 {
-		cfg.CheckinHours = []int{9, 21}
+		cfg.CheckinHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(cfg.TravelHours) == 0 {
-		cfg.TravelHours = []int{9, 21}
+		cfg.TravelHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(cfg.ActivityHours) == 0 {
-		cfg.ActivityHours = []int{10}
+		cfg.ActivityHours = []config.HourSlot{10 * 60}
 	}
 	if len(cfg.KeepaliveHours) == 0 {
-		cfg.KeepaliveHours = []int{22}
+		cfg.KeepaliveHours = []config.HourSlot{22 * 60}
 	}
 	if len(cfg.SchoolHours) == 0 {
-		cfg.SchoolHours = []int{12}
+		cfg.SchoolHours = []config.HourSlot{12 * 60}
 	}
 	if len(cfg.CatHours) == 0 {
-		cfg.CatHours = []int{1}
+		cfg.CatHours = []config.HourSlot{1 * 60}
 	}
 	if len(cfg.QoderCheckinHours) == 0 {
-		cfg.QoderCheckinHours = []int{9, 21}
+		cfg.QoderCheckinHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(cfg.QoderKeepaliveHours) == 0 {
-		cfg.QoderKeepaliveHours = []int{22}
+		cfg.QoderKeepaliveHours = []config.HourSlot{22 * 60}
 	}
 	if len(cfg.LoomyCheckinHours) == 0 {
-		cfg.LoomyCheckinHours = []int{9, 21}
+		cfg.LoomyCheckinHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(cfg.LoomyKeepaliveHours) == 0 {
-		cfg.LoomyKeepaliveHours = []int{22}
+		cfg.LoomyKeepaliveHours = []config.HourSlot{22 * 60}
 	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
@@ -164,11 +169,12 @@ type CheckinOutcome struct {
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
 var ErrBusy = errors.New("checkin already running")
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
-func nextFire(now time.Time, hours []int) time.Time {
+// nextFire 返回 now 之后最近的一个排程时点；slots 为自当日 0 点的分钟数（config.HourSlot）。
+func nextFire(now time.Time, slots []config.HourSlot) time.Time {
 	var earliest time.Time
-	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+	for _, s := range slots {
+		t := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).
+			Add(time.Duration(s) * time.Minute)
 		if !t.After(now) {
 			t = t.Add(24 * time.Hour)
 		}

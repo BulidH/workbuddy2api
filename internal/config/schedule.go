@@ -6,7 +6,85 @@
 // 两个命令共用同一份定义，消除漂移源头。
 package config
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// HourSlot 排程时点：自当日 0 点的分钟数（9:00 → 540，10:30 → 630）。
+//
+// JSON 里两种写法都接受，便于配置：
+//   - 整数小时：9（等价 "09:00"）
+//   - 字符串：  "10:30"（签到窗口 10:00 开放后，10:30 补跑一趟）
+//
+// 为什么用自定义类型而不是直接 []int：上游活动平台的每日领取窗口是 10:00 开放，
+// 整点排程在 9:00 那趟跑时活动还没上线，只能等下一趟，用户感知就是「没自动签到」。
+// 支持分钟粒度后可以把时点精确卡在窗口开放之后。
+type HourSlot int
+
+// UnmarshalJSON 兼容整数小时与 "H:MM" 字符串两种写法。
+//
+// 只做格式解析，范围校验留给 Normalize/validateHours——那边报错能指向正确的
+// 禁用开关（checkin_enabled 等），这里提前拒绝会丢掉这层指引。
+func (s *HourSlot) UnmarshalJSON(b []byte) error {
+	raw := strings.TrimSpace(string(b))
+	if raw == "null" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "\"") {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		mins, err := parseSlot(str)
+		if err != nil {
+			return err
+		}
+		*s = HourSlot(mins)
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("排程时点 %s 非法：应为整数小时或 \"H:MM\" 字符串", raw)
+	}
+	*s = HourSlot(n * 60)
+	return nil
+}
+
+// parseSlot 解析 "H" / "H:MM" / "HH:MM" 为分钟数。
+// 分钟范围（0-59）在此校验（格式级错误，直接拒）；小时范围留给 Normalize 校验，
+// 那边报错能指向正确的禁用开关。
+func parseSlot(str string) (int, error) {
+	parts := strings.Split(str, ":")
+	if len(parts) == 1 {
+		n, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return 0, fmt.Errorf("排程时点 %q 非法：应为整数小时或 \"H:MM\"", str)
+		}
+		return n * 60, nil
+	}
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("排程时点 %q 非法：应为 \"H:MM\"", str)
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, fmt.Errorf("排程时点 %q 非法：应为 \"H:MM\"", str)
+	}
+	if m < 0 || m > 59 {
+		return 0, fmt.Errorf("排程时点 %q 非法：分钟须在 0-59", str)
+	}
+	return h*60 + m, nil
+}
+
+// String 输出 "H:MM" 便于日志与错误信息展示。
+func (s HourSlot) String() string {
+	return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).
+		Add(time.Duration(s) * time.Minute).Format("15:04")
+}
 
 // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
 //
@@ -14,12 +92,12 @@ import "fmt"
 // cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
 // 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
 type Schedule struct {
-	CheckinHours   []int `json:"checkin_hours"`   // [9,21]
-	TravelHours    []int `json:"travel_hours"`    // [9,21]
-	ActivityHours  []int `json:"activity_hours"`  // [10]
-	KeepaliveHours []int `json:"keepalive_hours"` // [22]
-	SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
-	CatHours       []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
+	CheckinHours   []HourSlot `json:"checkin_hours"`   // [9:00,21:00]
+	TravelHours    []HourSlot `json:"travel_hours"`    // [9:00,21:00]
+	ActivityHours  []HourSlot `json:"activity_hours"`  // [10:00]
+	KeepaliveHours []HourSlot `json:"keepalive_hours"` // [22:00]
+	SchoolHours    []HourSlot `json:"school_hours"`    // [12:00] 开学季任务（迁移自 school/cat 两条系统 crontab）
+	CatHours       []HourSlot `json:"cat_hours"`       // [1:00] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
 	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
 	// 显式禁用开关（缺省 true）。
 	//
@@ -57,12 +135,12 @@ type Schedule struct {
 // ActivityReportCount 默认 5：领猫前置需 5 次对话，5 连发刷满 chat_5。
 func DefaultSchedule() Schedule {
 	return Schedule{
-		CheckinHours:        []int{9, 21},
-		TravelHours:         []int{9, 21},
-		ActivityHours:       []int{10},
-		KeepaliveHours:       []int{22},
-		SchoolHours:          []int{12},
-		CatHours:             []int{1},
+		CheckinHours:        []HourSlot{9 * 60, 21 * 60},
+		TravelHours:         []HourSlot{9 * 60, 21 * 60},
+		ActivityHours:       []HourSlot{10 * 60},
+		KeepaliveHours:      []HourSlot{22 * 60},
+		SchoolHours:         []HourSlot{12 * 60},
+		CatHours:            []HourSlot{1 * 60},
 		CheckinEnabled:      true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,
@@ -84,22 +162,22 @@ func DefaultSchedule() Schedule {
 // 「缺省 = 5」由 DefaultSchedule 在 Unmarshal 前置入，是另一条路径，两者不合并。
 func (s *Schedule) Normalize() error {
 	if len(s.CheckinHours) == 0 {
-		s.CheckinHours = []int{9, 21}
+		s.CheckinHours = []HourSlot{9 * 60, 21 * 60}
 	}
 	if len(s.TravelHours) == 0 {
-		s.TravelHours = []int{9, 21}
+		s.TravelHours = []HourSlot{9 * 60, 21 * 60}
 	}
 	if len(s.ActivityHours) == 0 {
-		s.ActivityHours = []int{10}
+		s.ActivityHours = []HourSlot{10 * 60}
 	}
 	if len(s.KeepaliveHours) == 0 {
-		s.KeepaliveHours = []int{22}
+		s.KeepaliveHours = []HourSlot{22 * 60}
 	}
 	if len(s.SchoolHours) == 0 {
-		s.SchoolHours = []int{12}
+		s.SchoolHours = []HourSlot{12 * 60}
 	}
 	if len(s.CatHours) == 0 {
-		s.CatHours = []int{1}
+		s.CatHours = []HourSlot{1 * 60}
 	}
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
@@ -108,10 +186,10 @@ func (s *Schedule) Normalize() error {
 	return s.validateHours()
 }
 
-// validateHours 校验排程小时落在 0-23。
+// validateHours 校验排程时点落在 0:00-23:59。
 //
-// 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法小时被静默吞掉时，用户以为关掉了签到，
-// 实际可能被当成另一个整点照常执行；这里直接快速失败，并在错误信息里指向正确的开关
+// 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法时点被静默吞掉时，用户以为关掉了签到，
+// 实际可能被当成另一个时点照常执行；这里直接快速失败，并在错误信息里指向正确的开关
 // （checkin_enabled / keepalive_enabled），避免用户靠猜哨兵值来配。
 func (s *Schedule) validateHours() error {
 	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", s.CheckinHours); err != nil {
@@ -132,10 +210,10 @@ func (s *Schedule) validateHours() error {
 	return checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours)
 }
 
-func checkHourRange(field, switchKey string, hours []int) error {
+func checkHourRange(field, switchKey string, hours []HourSlot) error {
 	for _, h := range hours {
-		if h < 0 || h > 23 {
-			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false", field, h, switchKey)
+		if h < 0 || h >= 24*60 {
+			return fmt.Errorf("%s: %s 不是合法时点（0:00-23:59）；如要关闭该任务请设 schedule.%s=false", field, h.String(), switchKey)
 		}
 	}
 	return nil

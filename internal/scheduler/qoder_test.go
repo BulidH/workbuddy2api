@@ -22,7 +22,7 @@ func qoderOnlyScheduler(t *testing.T, cfg Config) *Scheduler {
 func TestQoderCheckinSlotInNextWake(t *testing.T) {
 	now := time.Now()
 	h := (now.Hour() + 2) % 24
-	s := qoderOnlyScheduler(t, Config{QoderCheckinHours: []int{h}, QoderKeepaliveDisabled: true})
+	s := qoderOnlyScheduler(t, Config{QoderCheckinHours: slots(h), QoderKeepaliveDisabled: true})
 	at, kinds := s.nextWake(now)
 	if at.IsZero() || len(kinds) != 1 || kinds[0] != taskQoderCheckin {
 		t.Fatalf("at=%v kinds=%v", at, kinds)
@@ -37,7 +37,7 @@ func TestQoderKeepaliveSlotInNextWake(t *testing.T) {
 	h := (now.Hour() + 3) % 24
 	s := qoderOnlyScheduler(t, Config{
 		QoderCheckinDisabled: true,
-		QoderKeepaliveHours:  []int{h},
+		QoderKeepaliveHours:  slots(h),
 	})
 	at, kinds := s.nextWake(now)
 	if at.IsZero() || len(kinds) != 1 || kinds[0] != taskQoderKeepalive {

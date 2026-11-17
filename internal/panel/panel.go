@@ -73,11 +73,13 @@ type Deps struct {
 	// （get-user-resource，与国内版同一接口，上游本就实现了 global 路径）。
 	QueryBalances func() ([]BalanceOutcome, error)
 
-	// QueryUsage 拉取 since 之后各账号的积分消耗明细（按请求），供「用量统计」页聚合。
+	// QueryUsage 返回 since 之后各账号的积分消耗明细（按请求），供「用量统计」页聚合。
 	//
-	// 与 QueryBalances 同样是**只读**且用户显式触发；但调用量更大——每个账号一轮
-	// 上游请求（分页时更多），故 panel 侧带 TTL 缓存（见 usage.go）。
-	// 明细含 credit=0 的免费请求，故同时是调用量的权威来源。
+	// 数据源是网关本地用量账本（internal/usageledger）：每次成功请求在 handler 侧
+	// 从 SSE 末帧 usage 记一条事件，cmd/server 在此读出并按池状态过滤禁用账号。
+	// 相比此前逐账号拉上游明细：覆盖三个上游、零上游请求开销、毫秒返回（不再卡顿），
+	// 且与余额扣减（NoteCreditSpend）同一口径。明细含 credit=0 的免费请求，
+	// 故同时是调用量的权威来源。panel 侧仍带 TTL 缓存（见 usage.go）。
 	// 返回的 errs 是逐账号失败明细（部分成功仍要展示），err 是整体失败。
 	QueryUsage func(since time.Time) ([]UsageRecord, []UsageError, error)
 

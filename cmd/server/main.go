@@ -29,6 +29,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usageledger"
 )
 
 // buildVersion 由构建时注入：-ldflags "-X main.buildVersion=$(git rev-parse --short HEAD)"。
@@ -182,6 +183,16 @@ func main() {
 	// 已实测免费账号的权重加成（pool.free_tier_bonus，默认 3.0）。
 	// 配合 pick.go 的过滤修正：免费号优先但不独占，避免池子塌缩成单账号。
 	p.SetFreeTierBonus(cfg.Pool.FreeTierBonus)
+
+	// 本地用量账本：每次成功请求记一条事件（handler 侧 recordUsage），面板「用量统计」
+	// 从账本聚合——覆盖三个上游、零上游请求开销，取代此前「逐账号拉上游明细」的慢路径。
+	// 持久化到 state 文件同目录的 usage_ledger.jsonl，启动加载并按 7 天窗口裁剪。
+	usageLedger := usageledger.New(filepath.Join(filepath.Dir(cfg.StateFile), "usage_ledger.jsonl"), usageledger.DefaultMaxAge)
+	if err := usageLedger.Load(); err != nil {
+		log.Printf("WARN: 加载用量账本失败（继续以空账本运行）: %v", err)
+	} else {
+		log.Printf("用量账本已加载：%d 条历史事件", usageLedger.Len())
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -445,53 +456,34 @@ func main() {
 				}
 				return out, nil
 			},
-			// 用量统计：逐账号拉「积分消耗明细」（get-user-request-usage，与官网同源）。
-			// 与 QueryBalances 同为只读 + 用户显式触发；区别是数据量大（每号一轮上游
-			// 请求，分页时更多），故 panel 侧带 TTL 缓存，这里只管拉。
-			// 沿用余额查询的串行 + 间隔策略：上游 billing 域连续快打会偶发超时/500。
+			// 用量统计：数据源是网关本地用量账本（internal/usageledger）——每次成功
+			// 请求在 handler 侧记一条事件（与 NoteCreditSpend 同一 usage 口径），
+			// 覆盖三个上游、零上游请求开销，取代此前「逐账号拉上游明细」的慢路径
+			// （每号一轮上游请求 + 串行间隔，打开页面要等十几秒）。
+			// 禁用账号不参与统计：按 provider 路由到对应池查 Disabled 过滤。
 			QueryUsage: func(since time.Time) ([]panel.UsageRecord, []panel.UsageError, error) {
-				var recs []panel.UsageRecord
-				var errs []panel.UsageError
-				now := time.Now()
-				first := true
-				for _, st := range p.List() {
-					if st.Disabled {
-						continue
-					}
-					a := p.AuthByUID(st.UID)
-					if a == nil {
-						errs = append(errs, panel.UsageError{
-							UID: st.UID, Nickname: st.Nickname, Realm: st.Realm,
-							Error: "无有效凭证",
-						})
-						continue
-					}
-					if !first {
-						time.Sleep(400 * time.Millisecond)
-					}
-					first = false
-					// 明细按天查询，end 用今天（含当日实时数据）。
-					us, err := up.UsageRecords(a, since, now)
-					if err != nil {
-						errs = append(errs, panel.UsageError{
-							UID: st.UID, Nickname: st.Nickname, Realm: a.Realm(),
-							Error: err.Error(),
-						})
-						log.Printf("[panel] usage %s: %v", logfmt.UID8(st.UID), err)
-						continue
-					}
-					for _, u := range us {
-						t, perr := time.ParseInLocation("2006-01-02 15:04:05", u.RequestTime, panel.UsageLoc())
-						if perr != nil {
-							continue // 时间解析失败的行无法分桶，丢弃
-						}
-						recs = append(recs, panel.UsageRecord{
-							UID: st.UID, Nickname: st.Nickname, Realm: a.Realm(),
-							Time: t, Credit: u.Credit, Model: u.Model,
-						})
+				// provider → 池：账本事件带 provider，据此查该号当前是否被禁用。
+				poolOf := func(provider string) *pool.Pool {
+					switch provider {
+					case auth.ProviderQoder:
+						return qp
+					case auth.ProviderLoomy:
+						return lp
+					default:
+						return p
 					}
 				}
-				return recs, errs, nil
+				var recs []panel.UsageRecord
+				for _, e := range usageLedger.Since(since) {
+					if st, ok := poolOf(e.Provider).Status(e.UID); ok && st.Disabled {
+						continue // 禁用账号不计入统计
+					}
+					recs = append(recs, panel.UsageRecord{
+						UID: e.UID, Nickname: e.Nickname, Provider: e.Provider,
+						Time: e.Time, Credit: e.Credit, Model: e.Model,
+					})
+				}
+				return recs, nil, nil
 			},
 			Logs: logRing,
 
@@ -710,6 +702,9 @@ func main() {
 		LoomyPriority: cfg.Loomy.Priority,
 		// WorkBuddy 无独立档位（恒 1）；Qoder 可由 qoder.priority 调整。
 		QoderPriority: cfg.Qoder.Priority,
+
+		// 本地用量账本：面板「用量统计」的数据源（取代逐账号拉上游明细的慢路径）。
+		Usage: usageLedger,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

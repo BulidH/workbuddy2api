@@ -263,8 +263,8 @@ func TestRetiredTravelIntervalKeyIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retired key should not fail load: %v", err)
 	}
-	if len(c.Schedule.CheckinHours) != 1 || c.Schedule.CheckinHours[0] != 9 {
-		t.Errorf("checkin_hours=%v want [9]（同段其余键照常生效）", c.Schedule.CheckinHours)
+	if len(c.Schedule.CheckinHours) != 1 || c.Schedule.CheckinHours[0] != 9*60 {
+		t.Errorf("checkin_hours=%v want [9:00]（同段其余键照常生效）", c.Schedule.CheckinHours)
 	}
 }
 
@@ -283,17 +283,17 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 		t.Errorf("travel/activity enabled defaults want true/true, got %v/%v",
 			c.Schedule.TravelEnabled, c.Schedule.ActivityEnabled)
 	}
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want [9,21]", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9*60 || c.Schedule.TravelHours[1] != 21*60 {
+		t.Errorf("travel_hours=%v want [9:00,21:00]", c.Schedule.TravelHours)
 	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10*60 {
+		t.Errorf("activity_hours=%v want [10:00]", c.Schedule.ActivityHours)
 	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12*60 {
+		t.Errorf("school_hours=%v want [12:00]", c.Schedule.SchoolHours)
 	}
-	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
-		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1*60 {
+		t.Errorf("cat_hours=%v want [1:00]", c.Schedule.CatHours)
 	}
 	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
 		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
@@ -321,17 +321,17 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 		t.Errorf("checkin_hours=%v", c.Schedule.CheckinHours)
 	}
 	// 新 hours 缺省 → 回落默认（非空）。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21]", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9*60 || c.Schedule.TravelHours[1] != 21*60 {
+		t.Errorf("travel_hours=%v want default [9:00,21:00]", c.Schedule.TravelHours)
 	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10*60 {
+		t.Errorf("activity_hours=%v want default [10:00]", c.Schedule.ActivityHours)
 	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12*60 {
+		t.Errorf("school_hours=%v want default [12:00]", c.Schedule.SchoolHours)
 	}
-	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
-		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1*60 {
+		t.Errorf("cat_hours=%v want default [1:00]", c.Schedule.CatHours)
 	}
 	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
 		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
@@ -352,11 +352,11 @@ func TestScheduleExplicitDisable(t *testing.T) {
 		t.Errorf("want both disabled: %+v", c.Schedule)
 	}
 	// 小时数组仍回落默认值（禁用与默认值互不干扰：重新启用无需补配小时）。
-	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9 || c.Schedule.CheckinHours[1] != 21 {
-		t.Errorf("checkin_hours=%v want default [9 21] even when disabled", c.Schedule.CheckinHours)
+	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9*60 || c.Schedule.CheckinHours[1] != 21*60 {
+		t.Errorf("checkin_hours=%v want default [9:00 21:00] even when disabled", c.Schedule.CheckinHours)
 	}
-	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
-		t.Errorf("keepalive_hours=%v want default [22] even when disabled", c.Schedule.KeepaliveHours)
+	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22*60 {
+		t.Errorf("keepalive_hours=%v want default [22:00] even when disabled", c.Schedule.KeepaliveHours)
 	}
 }
 
@@ -377,11 +377,11 @@ func TestScheduleTravelActivityExplicitDisable(t *testing.T) {
 		t.Errorf("checkin/keepalive should stay enabled: %+v", c.Schedule)
 	}
 	// hours 仍回落默认。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21] even when disabled", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9*60 || c.Schedule.TravelHours[1] != 21*60 {
+		t.Errorf("travel_hours=%v want default [9:00,21:00] even when disabled", c.Schedule.TravelHours)
 	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want default [10] even when disabled", c.Schedule.ActivityHours)
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10*60 {
+		t.Errorf("activity_hours=%v want default [10:00] even when disabled", c.Schedule.ActivityHours)
 	}
 }
 
@@ -416,11 +416,11 @@ func TestScheduleTravelActivityExplicitHours(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want [9 21]", c.Schedule.TravelHours)
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9*60 || c.Schedule.TravelHours[1] != 21*60 {
+		t.Errorf("travel_hours=%v want [9:00 21:00]", c.Schedule.TravelHours)
 	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 11 {
-		t.Errorf("activity_hours=%v want [11]", c.Schedule.ActivityHours)
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 11*60 {
+		t.Errorf("activity_hours=%v want [11:00]", c.Schedule.ActivityHours)
 	}
 }
 
@@ -436,7 +436,7 @@ func TestScheduleDisableKeepsExplicitHours(t *testing.T) {
 	if c.Schedule.CheckinEnabled {
 		t.Error("checkin should be disabled")
 	}
-	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 10 || c.Schedule.CheckinHours[1] != 14 {
+	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 10*60 || c.Schedule.CheckinHours[1] != 14*60 {
 		t.Errorf("explicit hours must be preserved: %v", c.Schedule.CheckinHours)
 	}
 }
@@ -458,17 +458,17 @@ func TestScheduleEmptyHoursFallsBackToDefault(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9 || c.Schedule.CheckinHours[1] != 21 {
-				t.Errorf("checkin_hours=%v want default [9 21]", c.Schedule.CheckinHours)
+			if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9*60 || c.Schedule.CheckinHours[1] != 21*60 {
+				t.Errorf("checkin_hours=%v want default [9:00 21:00]", c.Schedule.CheckinHours)
 			}
-			if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
-				t.Errorf("keepalive_hours=%v want default [22]", c.Schedule.KeepaliveHours)
+			if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22*60 {
+				t.Errorf("keepalive_hours=%v want default [22:00]", c.Schedule.KeepaliveHours)
 			}
-			if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-				t.Errorf("travel_hours=%v want default [9 21]", c.Schedule.TravelHours)
+			if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9*60 || c.Schedule.TravelHours[1] != 21*60 {
+				t.Errorf("travel_hours=%v want default [9:00 21:00]", c.Schedule.TravelHours)
 			}
-			if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-				t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+			if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10*60 {
+				t.Errorf("activity_hours=%v want default [10:00]", c.Schedule.ActivityHours)
 			}
 			if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
 				t.Errorf("empty hours must not imply disabled: %+v", c.Schedule)

@@ -164,9 +164,11 @@ type Config struct {
 
 		// 桌面端活动平台版本（cosy-version），缺省 0.4.8。
 		DesktopVersion string `json:"desktop_version"`
-		// CheckinHours/KeepaliveHours Qoder 独立排程；空 = [9,21] / [22]。
-		CheckinHours   []int `json:"checkin_hours"`
-		KeepaliveHours []int `json:"keepalive_hours"`
+		// CheckinHours/KeepaliveHours Qoder 独立排程；空 = [9:00,21:00] / [22:00]。
+		// 支持分钟粒度（"10:30"）：活动平台每日领取窗口 10:00 开放，整点排程在
+		// 窗口开放前的那趟跑不到活动，分钟粒度可把签到精确卡在窗口之后。
+		CheckinHours   []config.HourSlot `json:"checkin_hours"`
+		KeepaliveHours []config.HourSlot `json:"keepalive_hours"`
 		// 开关缺省 true；false = 停止该排程。
 		CheckinEnabled   bool `json:"checkin_enabled"`
 		KeepaliveEnabled bool `json:"keepalive_enabled"`
@@ -230,9 +232,9 @@ type Config struct {
 		// RequestPurpose X-Loomy-Request-Purpose 头，默认 chat.message。
 		RequestPurpose string `json:"request_purpose"`
 
-		// CheckinHours/KeepaliveHours Loomy 独立排程；空 = [9,21] / [22]。
-		CheckinHours   []int `json:"checkin_hours"`
-		KeepaliveHours []int `json:"keepalive_hours"`
+		// CheckinHours/KeepaliveHours Loomy 独立排程；空 = [9:00,21:00] / [22:00]。
+		CheckinHours   []config.HourSlot `json:"checkin_hours"`
+		KeepaliveHours []config.HourSlot `json:"keepalive_hours"`
 		// 开关缺省 true；false = 停止该排程。
 		CheckinEnabled   bool `json:"checkin_enabled"`
 		KeepaliveEnabled bool `json:"keepalive_enabled"`
@@ -558,14 +560,14 @@ func (c *Config) normalize() error {
 		c.Qoder.StateFile = "./data/qoder_state.json"
 	}
 	if len(c.Qoder.CheckinHours) == 0 {
-		c.Qoder.CheckinHours = []int{9, 21}
+		c.Qoder.CheckinHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(c.Qoder.KeepaliveHours) == 0 {
-		c.Qoder.KeepaliveHours = []int{22}
+		c.Qoder.KeepaliveHours = []config.HourSlot{22 * 60}
 	}
-	for _, h := range append(append([]int{}, c.Qoder.CheckinHours...), c.Qoder.KeepaliveHours...) {
-		if h < 0 || h > 23 {
-			return fmt.Errorf("qoder.checkin_hours/keepalive_hours: %d 不是合法小时（0-23）；如要关闭请用 qoder.checkin_enabled=false / keepalive_enabled=false", h)
+	for _, h := range append(append([]config.HourSlot{}, c.Qoder.CheckinHours...), c.Qoder.KeepaliveHours...) {
+		if h < 0 || h >= 24*60 {
+			return fmt.Errorf("qoder.checkin_hours/keepalive_hours: %s 不是合法时点（0:00-23:59）；如要关闭请用 qoder.checkin_enabled=false / keepalive_enabled=false", h)
 		}
 	}
 	if c.Qoder.ActivityFile == "" {
@@ -613,14 +615,14 @@ func (c *Config) normalize() error {
 		c.Loomy.RequestPurpose = "chat.message"
 	}
 	if len(c.Loomy.CheckinHours) == 0 {
-		c.Loomy.CheckinHours = []int{9, 21}
+		c.Loomy.CheckinHours = []config.HourSlot{9 * 60, 21 * 60}
 	}
 	if len(c.Loomy.KeepaliveHours) == 0 {
-		c.Loomy.KeepaliveHours = []int{22}
+		c.Loomy.KeepaliveHours = []config.HourSlot{22 * 60}
 	}
-	for _, h := range append(append([]int{}, c.Loomy.CheckinHours...), c.Loomy.KeepaliveHours...) {
-		if h < 0 || h > 23 {
-			return fmt.Errorf("loomy.checkin_hours/keepalive_hours: %d 不是合法小时（0-23）；如要关闭请用 loomy.checkin_enabled=false / keepalive_enabled=false", h)
+	for _, h := range append(append([]config.HourSlot{}, c.Loomy.CheckinHours...), c.Loomy.KeepaliveHours...) {
+		if h < 0 || h >= 24*60 {
+			return fmt.Errorf("loomy.checkin_hours/keepalive_hours: %s 不是合法时点（0:00-23:59）；如要关闭请用 loomy.checkin_enabled=false / keepalive_enabled=false", h)
 		}
 	}
 	if c.Loomy.RequestGapSeconds <= 0 {

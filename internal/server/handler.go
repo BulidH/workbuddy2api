@@ -23,6 +23,7 @@ import (
 	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usageledger"
 )
 
 // Config handler 依赖。
@@ -87,6 +88,10 @@ type Config struct {
 	// WorkBuddyPriority / QoderPriority 另两家的调度档位（默认 1）。
 	WorkBuddyPriority int
 	QoderPriority     int
+
+	// Usage 本地用量账本（可选；nil = 不记录）。每次成功请求记一条事件，
+	// 供面板「用量统计」聚合——覆盖三个上游、零上游开销（见 internal/usageledger）。
+	Usage *usageledger.Ledger
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -1088,6 +1093,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 余额实时扣减：同一份权威回执同时驱动面板积分，避免两次快照之间
 				// 面板停在旧值（用户要手点「查询余额」才看到真实数字）。
 				ap.NoteCreditSpend(acct.UID, credit)
+				h.recordUsage(provider, acct, bareModel, credit, stats.TotalTokens())
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -1111,6 +1117,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			ap.NoteModelCost(acct.UID, bareModel, credit, total)
 			ap.NoteCreditSpend(acct.UID, credit)
+			h.recordUsage(provider, acct, bareModel, credit, total)
 		}
 		return
 	}
@@ -1288,5 +1295,23 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"type":    "api_error",
 			"code":    code,
 		},
+	})
+}
+
+// recordUsage 把一次成功请求的实测消耗写入本地用量账本（面板「用量统计」的数据源）。
+// 与 NoteCreditSpend 同一口径（SSE 末帧 usage.credit），三个上游统一记账。
+// 账本为 nil（未启用）时零开销跳过。
+func (h *Handler) recordUsage(provider string, acct *auth.Auth, model string, credit float64, tokens int) {
+	if h.cfg.Usage == nil || acct == nil {
+		return
+	}
+	h.cfg.Usage.Record(usageledger.Event{
+		Time:     time.Now(),
+		Provider: provider,
+		UID:      acct.UID,
+		Nickname: acct.Nickname,
+		Model:    model,
+		Credit:   credit,
+		Tokens:   tokens,
 	})
 }

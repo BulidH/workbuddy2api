@@ -1,10 +1,17 @@
-// usage.go 面板「用量统计」页：按账号 / 小时 / 天 / 模型聚合积分消耗。
+// usage.go 面板「用量统计」页：按上游 / 账号 / 小时 / 天 / 模型聚合积分消耗。
 //
-// 数据源是上游的「积分消耗明细」（get-user-request-usage，与官网同源），
-// 由 cmd/server 注入的 Deps.QueryUsage 拉取——panel 包不感知 upstream/pool 细节。
+// 数据源是网关本地用量账本（internal/usageledger）：每次成功请求在 handler 侧
+// 从 SSE 末帧 usage 记一条事件，由 cmd/server 注入的 Deps.QueryUsage 读出——panel
+// 包不感知账本细节。
 //
-// 关键口径：明细里**免费请求（credit=0）也逐条记录**，所以本页同时反映
+// 为什么用本地账本而非上游明细接口：上游只有 WorkBuddy 有按请求的消耗明细接口，
+// Qoder/Loomy 没有，三上游无法统一统计；且逐账号拉明细要串行打十几轮上游请求，
+// 打开页面卡顿。本地账本零上游开销、毫秒返回，且与余额扣减（NoteCreditSpend）
+// 同一口径。
+//
+// 关键口径：账本里**免费请求（credit=0）也逐条记录**，所以本页同时反映
 // 「调用量」与「扣费」。两者分开展示：免费模型跑得再多，credit 也是 0。
+// 被禁用的账号不计入统计（QueryUsage 侧按池状态过滤）。
 package panel
 
 import (
@@ -21,10 +28,11 @@ var usageLoc = time.FixedZone("UTC+8", 8*60*60)
 // UsageLoc 导出明细时区，供 cmd/server 按同一口径解析 requestTime。
 func UsageLoc() *time.Location { return usageLoc }
 
-// UsageRecord 单条积分消耗明细（cmd/server 从上游拉取后注入）。
+// UsageRecord 单条积分消耗明细（cmd/server 从本地用量账本注入）。
 type UsageRecord struct {
 	UID      string
 	Nickname string
+	Provider string // workbuddy / qoder / loomy
 	Realm    string
 	Time     time.Time // 已按 usageLoc 解析
 	Credit   float64
@@ -78,6 +86,17 @@ type usageAccountDetail struct {
 	Models []usageModelRow `json:"models"`
 }
 
+// usageProviderRow 按上游（workbuddy / qoder / loomy）的聚合。
+// 窗口口径与小时桶一致（近 24 小时），另附今日口径便于对账。
+type usageProviderRow struct {
+	Provider     string  `json:"provider"`
+	Calls        int     `json:"calls"`
+	Credit       float64 `json:"credit"`
+	CallsToday   int     `json:"calls_today"`
+	CreditToday  float64 `json:"credit_today"`
+	ActiveAccts  int     `json:"active_accounts"` // 窗口内有调用的账号数
+}
+
 // usageError 拉取失败的账号。
 type UsageError struct {
 	UID      string `json:"uid"`
@@ -94,6 +113,7 @@ type usageAgg struct {
 	Hourly      []usageBucket                 `json:"hourly"`
 	Daily       []usageBucket                 `json:"daily"`
 	Models      []usageModelRow               `json:"models"`
+	Providers   []usageProviderRow           `json:"providers"`
 	Detail      map[string]usageAccountDetail `json:"detail"`
 	Errors      []UsageError                  `json:"errors"`
 	TotalCalls  int                           `json:"total_calls"`
@@ -198,6 +218,37 @@ func aggregateUsage(recs []UsageRecord, errs []UsageError, now time.Time) *usage
 	modelsIdx := map[string]int{}
 	var models []usageModelRow
 
+	// 分上游聚合（24h 窗口 + 今日）：用户要一眼看到各上游各用了多少。
+	type provAcc struct {
+		calls          int
+		credit         float64
+		callsToday     int
+		creditToday    float64
+		accts          map[string]bool
+	}
+	provIdx := map[string]int{}
+	var providers []usageProviderRow
+	newProv := func(name string) *provAcc {
+		p := &provAcc{accts: map[string]bool{}}
+		pi := len(providers)
+		providers = append(providers, usageProviderRow{Provider: name})
+		provIdx[name] = pi
+		return p
+	}
+	provs := map[string]*provAcc{}
+	provOf := func(rec UsageRecord) *provAcc {
+		name := rec.Provider
+		if name == "" {
+			name = "unknown"
+		}
+		p, ok := provs[name]
+		if !ok {
+			p = newProv(name)
+			provs[name] = p
+		}
+		return p
+	}
+
 	// 下钻明细：按 uid 存各自的小时/天/模型桶。
 	type detailAcc struct {
 		hourly []usageBucket
@@ -220,6 +271,16 @@ func aggregateUsage(recs []UsageRecord, errs []UsageError, now time.Time) *usage
 
 	for _, rec := range recs {
 		lt := rec.Time.In(usageLoc)
+
+		// ── 分上游维度 ──
+		pp := provOf(rec)
+		pp.calls++
+		pp.credit += rec.Credit
+		pp.accts[rec.UID] = true
+		if !lt.Before(today) {
+			pp.callsToday++
+			pp.creditToday += rec.Credit
+		}
 
 		// ── 账号维度 ──
 		ai, ok := acctIdx[rec.UID]
@@ -315,6 +376,30 @@ func aggregateUsage(recs []UsageRecord, errs []UsageError, now time.Time) *usage
 		detail[uid] = usageAccountDetail{Hourly: d.hourly, Daily: d.daily, Models: d.models}
 	}
 
+	// 分上游按消耗降序；固定展示顺序更直观：workbuddy → qoder → loomy → 其它。
+	providerOrder := map[string]int{"workbuddy": 0, "qoder": 1, "loomy": 2}
+	for name, p := range provs {
+		pi := provIdx[name]
+		providers[pi].Calls = p.calls
+		providers[pi].Credit = round2(p.credit)
+		providers[pi].CallsToday = p.callsToday
+		providers[pi].CreditToday = round2(p.creditToday)
+		providers[pi].ActiveAccts = len(p.accts)
+	}
+	sort.SliceStable(providers, func(i, j int) bool {
+		oi, oj := providerOrder[providers[i].Provider], providerOrder[providers[j].Provider]
+		if oi != oj {
+			if oi == 0 && oj != 0 {
+				return true
+			}
+			if oj == 0 {
+				return false
+			}
+			return oi < oj
+		}
+		return providers[i].Credit > providers[j].Credit
+	})
+
 	if errs == nil {
 		errs = []UsageError{}
 	}
@@ -325,6 +410,7 @@ func aggregateUsage(recs []UsageRecord, errs []UsageError, now time.Time) *usage
 		Hourly:      hourly,
 		Daily:       daily,
 		Models:      models,
+		Providers:   providers,
 		Detail:      detail,
 		Errors:      errs,
 		TotalCalls:  totalCalls,

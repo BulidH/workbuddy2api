@@ -77,6 +77,11 @@
     "image_transcode": true,
     "web_tools": false,
     "pricing_file": "",
+    "checkin_hours": ["10:30", 21],
+    "keepalive_hours": [22],
+    "checkin_enabled": true,
+    "keepalive_enabled": true,
+    "checkin_on_startup": true,
     "guard": {
       "enabled": true,
       "max_concurrency": 1,

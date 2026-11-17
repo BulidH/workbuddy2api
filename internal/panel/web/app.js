@@ -1564,8 +1564,9 @@ async function viewUsage(force = false) {
 
   $('#view').innerHTML = `
     <div class="alert info">
-      数据源为上游「积分消耗明细」，含 <b>credit=0 的免费请求</b>，故同时反映调用量与扣费。
-      ${esc(ageTxt)}（缓存 ${ttlMin} 分钟，点「强制刷新」立即重拉）。
+      数据源为网关本地用量账本（每次成功请求的实测 usage），含 <b>credit=0 的免费请求</b>，
+      故同时反映调用量与扣费；覆盖 WorkBuddy / Qoder / Loomy 三个上游，禁用账号不计入。
+      ${esc(ageTxt)}（缓存 ${ttlMin} 分钟，点「强制刷新」立即重算）。
     </div>
     ${errBox}
 
@@ -1577,6 +1578,9 @@ async function viewUsage(force = false) {
              `共 ${(d.accounts || []).length} 个账号`, '')}
     </div>
 
+    <div style="height:16px"></div>
+    ${providerTable(d.providers || [])}
+
     <div class="row-flex" style="margin:16px 0;gap:8px">
       <button class="btn sm" id="usageForce">强制刷新</button>
       <span class="muted" style="font-size:12px;align-self:center">
@@ -1584,6 +1588,7 @@ async function viewUsage(force = false) {
       </span>
     </div>
 
+    <div style="height:16px"></div>
     <div class="grid cols-2">
       ${chartCard('近 24 小时调用量', d.hourly, 'calls')}
       ${chartCard('近 7 天调用量', d.daily, 'calls')}
@@ -1604,6 +1609,47 @@ async function viewUsage(force = false) {
 
   $('#usageForce').onclick = () => viewUsage(true);
   bindUsageRows();
+}
+
+// providerTable 按上游（WorkBuddy / Qoder / Loomy）汇总近 24 小时用量 + 总计。
+function providerTable(rows) {
+  const provName = { workbuddy: 'WorkBuddy', qoder: 'Qoder', loomy: 'Loomy' };
+  if (!rows.length) {
+    return `<div class="card"><div class="card-head"><h3>近 24 小时分上游用量</h3></div>
+      <div class="empty">窗口内没有调用记录。</div></div>`;
+  }
+  const totalCalls = rows.reduce((s, r) => s + (r.calls || 0), 0);
+  const totalCredit = rows.reduce((s, r) => s + (r.credit || 0), 0);
+  const body = rows.map(r => `
+    <tr>
+      <td><b>${esc(provName[r.provider] || r.provider)}</b></td>
+      <td class="num">${r.calls || 0}</td>
+      <td class="num">${(r.credit || 0).toFixed(2)}</td>
+      <td class="num">${r.calls_today || 0}</td>
+      <td class="num">${(r.credit_today || 0).toFixed(2)}</td>
+      <td class="num">${r.active_accounts || 0}</td>
+    </tr>`).join('');
+  return `<div class="card">
+    <div class="card-head"><h3>近 24 小时分上游用量</h3>
+      <span class="sub">调用量 / 消耗积分（credit）</span></div>
+    <div class="card-body" style="padding:0">
+      <table class="tbl">
+        <thead><tr><th>上游</th><th class="num">调用</th><th class="num">消耗</th>
+          <th class="num">今日调用</th><th class="num">今日消耗</th><th class="num">活跃账号</th></tr></thead>
+        <tbody>
+          ${body}
+          <tr class="total-row">
+            <td><b>合计</b></td>
+            <td class="num"><b>${totalCalls}</b></td>
+            <td class="num"><b>${totalCredit.toFixed(2)}</b></td>
+            <td class="num"><b>${rows.reduce((s, r) => s + (r.calls_today || 0), 0)}</b></td>
+            <td class="num"><b>${rows.reduce((s, r) => s + (r.credit_today || 0), 0).toFixed(2)}</b></td>
+            <td class="num">—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>`;
 }
 
 // chartCard 用纯 CSS 柱状图渲染一组时间桶（无需引入图表库）。

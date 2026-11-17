@@ -107,7 +107,7 @@ func newTravelScheduler(t *testing.T, srv *httptest.Server, uids ...string) (*Sc
 		p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	}
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	return New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), p
+	return New(Config{Pool: p, Upstream: up, CheckinHours: slots(9, 21), KeepaliveHours: slots(22)}), p
 }
 
 // TestRunCheckinNowNoLongerTriggersTravel 签到收尾不再跑旅行（旅行已剥离为独立排程）。
@@ -462,7 +462,7 @@ func TestRunTravelLoopCancelsWhenDisabled(t *testing.T) {
 
 // TestRunTravelLoopStopsOnCancel 有排程在等计时器时 ctx 取消应立即退出。
 func TestRunTravelLoopStopsOnCancel(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22}})
+	s := New(Config{CheckinHours: slots(9), KeepaliveHours: slots(22)})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()
