@@ -915,7 +915,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		attempts++
 		st.uid = acct.UID
-		st.providers = append(st.providers, provider)
+		// 记录「上游:模型」而非只记上游：混合路由下同一上游可能挂多个模型，
+		// 只写 loomy 看不出到底用的是 DeepSeek-V4.1-Flash 还是 GLM-5.3-Flash。
+		st.providers = append(st.providers, provider+"="+stepModel)
 		triedThis[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -1022,7 +1024,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 首字节超时（Loomy 排队限速）：上游健康、账号也没问题，换号无意义
 			// ——实测同上游所有账号一样慢。直接跳到路由链下一环（换上游/换模型）。
 			if errors.Is(terr, loomy.ErrHeaderTimeout) {
-				st.providers = append(st.providers, "timeout")
+				// 标注是哪个模型超时（而不是笼统的 timeout），
+				// 便于判断「三环 Loomy 是不是一起慢」。
+				st.providers = append(st.providers, provider+"="+stepModel+":首字节超时")
 				stepIdx++
 				continue
 			}

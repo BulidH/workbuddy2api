@@ -403,6 +403,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	}
 	req["stream"] = true
 	req["stream_options"] = map[string]any{"include_usage": true}
+	// 仅用于超时日志展示（混合路由下同一上游可能挂多个模型）。
+	reqModel, _ := req["model"].(string)
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, http.StatusInternalServerError, nil, err
@@ -436,8 +438,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 返回哨兵错误让上层直接跳到下一个路由环节，而不是继续换同上游的号
 		// （实测同上游所有账号一样慢，换号纯属浪费时间）。
 		if isTimeoutErr(err) {
-			log.Printf("WARN: [loomy] chat_stream uid=%s: header timeout after %s, fall through to next route step",
-				logfmt.UID8(a.UID), c.cfg.HeaderTimeout)
+			log.Printf("WARN: [loomy] 账号 %s 模型 %s 首字节等待超时（%s），跳过该环节改用下一环",
+				logfmt.UID8(a.UID), reqModel, c.cfg.HeaderTimeout)
 			return nil, 0, nil, ErrHeaderTimeout
 		}
 		// 与 upstream 客户端同口径：传输层错误只换号、不罚账号，但必须留痕，

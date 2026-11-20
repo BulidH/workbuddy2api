@@ -239,10 +239,19 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, providers []
 	if len(providers) > 0 {
 		short := make([]string, 0, len(providers))
 		for _, p := range providers {
-			if p == "workbuddy" {
-				p = "wb"
+			// 记录格式有两种：
+			//   "provider=model"        —— 实际尝试过的环节（含模型名）
+			//   "provider"              —— 旧格式/兼容纯上游名
+			// 渲染成 "provider:model" / "provider"，让一行日志就能看出用的哪个模型。
+			label := p
+			if i := strings.Index(p, "="); i > 0 {
+				label = p[:i] + ":" + p[i+1:]
 			}
-			short = append(short, p)
+			// workbuddy 统一简写为 wb（两种形态都覆盖）。
+			if label == "workbuddy" || strings.HasPrefix(label, "workbuddy:") {
+				label = "wb" + strings.TrimPrefix(label, "workbuddy")
+			}
+			short = append(short, label)
 		}
 		provField = strings.Join(short, ">")
 	}

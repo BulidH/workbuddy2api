@@ -1701,10 +1701,15 @@ async function mrSave(rt) {
       body: { config: { qoder: { aliases: { [rt.name]: { steps: payload } } } } },
     });
     rt.dirty = false;
-    toast(`已保存 ${rt.name} 的候选链，重启后生效`);
-    const rb = $('#mrRestart'); if (rb) rb.style.display = '';
-    const m = $('#mrMsg'); if (m) m.textContent = '配置已保存，点「重启并生效」';
-    renderModelRoute();
+    toast(`已保存 ${rt.name} 的候选链，正在重启生效…`);
+    const rb = $('#mrRestart'); if (rb) { rb.style.display = 'none'; }
+    const m = $('#mrMsg'); if (m) m.textContent = '配置已保存，正在重启网关…';
+    // 保存后立即自动重启：网关的路由配置读的是启动时的内存快照，
+    // 不重启则页面切换回来仍显示旧值，容易误判成「保存没生效」。
+    await doRestart();
+    // 重启后重新拉取，展示真实生效的配置
+    await viewModelRoute();
+    toast(`${rt.name} 的候选链已生效`);
   } catch (e) { toast(e.message, 'err', 7000); }
 }
 
