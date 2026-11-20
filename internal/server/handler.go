@@ -864,6 +864,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 串行等 3×25=75s 才落到兜底上游（实测单请求 90s）。改为同上游共享一份预算后，
 	// 后续环节只用剩余额度，总等待仍是一次上游的容忍度。
 	providerWait := map[string]time.Duration{}
+	// requestFailedAccts 本请求内已「白等过」的账号（按 provider 分组）。
+	// 典型来源是首字节超时：账号健康但此刻排队慢，下一环换模型时应换号，
+	// 否则同一账号又被选中、再等满一轮预算。仅请求内有效，不污染池状态。
+	requestFailedAccts := map[string]map[string]bool{}
 	for attempts < h.cfg.MaxRotate && stepIdx < len(steps) {
 		step := steps[stepIdx]
 		provider := step.provider
@@ -883,12 +887,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 为什么：同一个上游可能在候选链里出现多次（Loomy 的多个模型互相兜底）。
 		// 若按 provider 共享 tried，第一环失败用掉全部 Loomy 号后，第二环就无号可选、
 		// 直接跳过——那「同上游多模型兜底」就形同虚设。按环节隔离后，每个环节都能
-		// 用满该上游的全部账号，代价只是同一账号可能被不同模型各试一次（这正是想要的）。
+		// 用满该上游的全部账号。
 		triedKey := fmt.Sprintf("%s#%d", provider, stepIdx)
 		triedThis, ok := tried[triedKey]
 		if !ok {
 			triedThis = map[string]bool{}
 			tried[triedKey] = triedThis
+		}
+		// 跨环节的「本请求已超时账号」：同一账号在上一环已经等满首字节预算，
+		// 下一环不该再用它（否则换个模型又卡同一个慢账号，白等一轮）。
+		// 只影响本次请求，不写池状态——账号本身是健康的，只是此刻排队慢。
+		for uid := range requestFailedAccts[provider] {
+			triedThis[uid] = true
 		}
 
 		// 选号：粘性号优先（仅当绑定号属于当前 Provider），否则普通轮换。
@@ -898,11 +908,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 绑定号已从任何池移除（删号）→ 解绑，回落普通轮换。
 				unbindSticky()
 			} else if sprovider == provider {
-				acct = sp.PickByUIDForModel(stickyUID, stepModel)
-				if acct == nil || (provider == auth.ProviderWorkBuddy && realm != "" && acct.Realm() != realm) {
-					// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+				// 粘性号在本请求里已经超时过（上一环等满预算）→ 不再用它，
+				// 解绑后走普通轮换换一个号。否则换模型仍会卡同一个慢账号。
+				if requestFailedAccts[provider][stickyUID] {
+					log.Printf("[路由] 粘性账号 %s 本请求已超时过，解绑并换号", logfmt.UID8(stickyUID))
 					unbindSticky()
-					acct = nil
+				} else {
+					acct = sp.PickByUIDForModel(stickyUID, stepModel)
+					if acct == nil || (provider == auth.ProviderWorkBuddy && realm != "" && acct.Realm() != realm) {
+						// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+						unbindSticky()
+						acct = nil
+					}
 				}
 			}
 		}
@@ -915,6 +932,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				acct = ap.PickExcludingForRealm(triedThis, stepModel, "")
 			} else {
 				acct = ap.PickExcludingForRealm(triedThis, stepModel, realm)
+			}
+		}
+		if acct == nil {
+			// 本环节没选到号。若是因为「本请求已超时账号」把整池都排除了
+			// （Loomy 只有 3 个号，前几环各超时一个），清空这份记忆重试一次——
+			// 否则会把「账号此刻慢」误判成「该上游不可用」，白白跳过剩余模型兜底。
+			if len(requestFailedAccts[provider]) > 0 {
+				delete(requestFailedAccts, provider)
+				delete(tried, triedKey)
+				triedThis = map[string]bool{}
+				tried[triedKey] = triedThis
+				if provider == auth.ProviderQoder || provider == auth.ProviderLoomy {
+					acct = ap.PickExcludingForRealm(triedThis, stepModel, "")
+				} else {
+					acct = ap.PickExcludingForRealm(triedThis, stepModel, realm)
+				}
+				if acct != nil {
+					log.Printf("[路由] %s 的账号本请求均已超时过，清空失败记忆后重试 %s", provider, stepModel)
+				}
 			}
 		}
 		if acct == nil {
@@ -1055,6 +1091,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(terr, loomy.ErrHeaderTimeout) {
 				// 累计该上游已消耗的首字节等待，后续同上游环节按剩余预算收紧。
 				providerWait[provider] += time.Since(stepStart)
+				// 记住这个账号「本请求已白等过」：下一环换模型时应该换号，
+				// 而不是又选中它、再等满一轮预算。
+				if requestFailedAccts[provider] == nil {
+					requestFailedAccts[provider] = map[string]bool{}
+				}
+				requestFailedAccts[provider][acct.UID] = true
 				// 标注是哪个模型超时（而不是笼统的 timeout），
 				// 便于判断「三环 Loomy 是不是一起慢」。
 				st.providers = append(st.providers, provider+"="+stepModel+":首字节超时")
