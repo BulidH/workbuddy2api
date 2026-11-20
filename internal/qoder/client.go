@@ -215,7 +215,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		Refresh:   a.RefreshToken,
 	}
 	if transcribed, total := PrepareRequestImages(req); transcribed > 0 {
-		log.Printf("qoder images: transcoded %d/%d inline png(s)", transcribed, total)
+		log.Printf("Qoder 图片：转码 %d/%d 个内联 PNG", transcribed, total)
 	}
 	qbody, err := BuildRequest(req, acct, match.Info, realm)
 	if err != nil {

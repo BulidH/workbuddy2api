@@ -84,6 +84,9 @@ type Config struct {
 	LoomyPool     *pool.Pool
 	LoomyWeight   float64 // 与其它上游同档位时的相对权重（默认 1.0）
 	LoomyPriority int     // 裸名调度的档位：数值大者先试（Loomy 默认 2 = 最优先）
+	// LoomyHeaderTimeout Loomy 首字节容忍度，也是「同上游多环节」的共享总预算。
+	// <=0 = 不限制（由 Loomy client 自身配置决定）。
+	LoomyHeaderTimeout time.Duration
 
 	// WorkBuddyPriority / QoderPriority 另两家的调度档位（默认 1）。
 	WorkBuddyPriority int
@@ -705,7 +708,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只落"大请求"（超过上限一半）：小探针（{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
 	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body)*2 >= int(limit) {
 		if err := os.WriteFile("/app/data/last_request.json", body, 0o600); err != nil {
-			log.Printf("ERR: [server] dump req: %v", err)
+			log.Printf("ERR: [服务] 请求转储失败：%v", err)
 		}
 	}
 	var peek struct {
@@ -855,6 +858,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	attempts := 0
+	// 同上游首字节预算：按 provider 累计已等待时长，供「同上游多环节」共享总额。
+	//
+	// 为什么需要：Loomy 的多个模型互相兜底时，若每环各给满 25s，上游整体卡住就会
+	// 串行等 3×25=75s 才落到兜底上游（实测单请求 90s）。改为同上游共享一份预算后，
+	// 后续环节只用剩余额度，总等待仍是一次上游的容忍度。
+	providerWait := map[string]time.Duration{}
 	for attempts < h.cfg.MaxRotate && stepIdx < len(steps) {
 		step := steps[stepIdx]
 		provider := step.provider
@@ -961,7 +970,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := acct.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-					log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+					log.Printf("ERR: [服务] 聊天刷新 uid=%s：auth 落盘失败：%v", logfmt.UID8(acct.UID), err)
 				}
 			}
 		}
@@ -986,12 +995,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var respBody []byte
 		var terr error
 		var gateLease *guard.Lease
+		stepStart := time.Now()
 		switch provider {
 		case auth.ProviderLoomy:
 			// Loomy 上游本身就是 OpenAI 兼容 SSE：直接透传，usage 已在 client 内
 			// 把 points_consumed 映射为 credit，复用同一 Stream/Aggregate 出口。
-			rc, status, respBody, terr = h.cfg.Loomy.ChatStreamContext(r.Context(), acct, outbound,
-				loomy.ChatMeta{SessionKey: sessKey, RequestID: chatMeta.ConversationRequestID})
+			//
+			// 预算：同上游多环共享一份首字节容忍度。第 N 环只拿「总额 - 已等」，
+			// 避免三环各等满额导致单请求拖到 90s（实测）。
+			budget := time.Duration(0)
+			if full := h.cfg.LoomyHeaderTimeout; full > 0 {
+				budget = full - providerWait[provider]
+				if budget <= 0 {
+					// 该上游的预算已耗尽：直接跳过剩余同上游环节。
+					log.Printf("Loomy 首字节预算已耗尽（%s），跳过 %s 环节", full, stepModel)
+					st.providers = append(st.providers, provider+"="+stepModel+":预算已耗尽")
+					stepIdx++
+					continue
+				}
+			}
+			rc, status, respBody, terr = h.cfg.Loomy.ChatStreamContextWithBudget(r.Context(), acct, outbound,
+				loomy.ChatMeta{SessionKey: sessKey, RequestID: chatMeta.ConversationRequestID}, budget)
 		case auth.ProviderQoder:
 			if h.cfg.QoderGuard != nil {
 				gateLease, _ = h.cfg.QoderGuard.Acquire(r.Context(), acct.UID)
@@ -1016,7 +1040,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 「loomy>loomy>loomy>wb 全部 transport error」的误导性错误风暴。
 			// 这类失败不是账号健康问题，也不该喂熔断计数。
 			if r.Context().Err() != nil {
-				log.Printf("client canceled request, stop rotation (provider=%s uid=%s): %v",
+				log.Printf("客户端已取消请求，停止轮转（provider=%s uid=%s）：%v",
 					provider, logfmt.UID8(acct.UID), terr)
 				st.status = 499 // 非标准但通用：客户端关闭请求
 				return
@@ -1024,6 +1048,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 首字节超时（Loomy 排队限速）：上游健康、账号也没问题，换号无意义
 			// ——实测同上游所有账号一样慢。直接跳到路由链下一环（换上游/换模型）。
 			if errors.Is(terr, loomy.ErrHeaderTimeout) {
+				// 累计该上游已消耗的首字节等待，后续同上游环节按剩余预算收紧。
+				providerWait[provider] += time.Since(stepStart)
 				// 标注是哪个模型超时（而不是笼统的 timeout），
 				// 便于判断「三环 Loomy 是不是一起慢」。
 				st.providers = append(st.providers, provider+"="+stepModel+":首字节超时")
@@ -1056,7 +1082,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				degradedApplied = true
 				delete(triedThis, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
-				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				log.Printf("WARN: [服务] 内容被拦（疑似指纹误判）→ 降级提示词重试")
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {
@@ -1079,7 +1105,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 不罚账号（applyErrorPolicy 该分支无冷却/熔断），风控解除后池子照常可用。
 				h.applyErrorPolicyOn(ap, acct.UID, kind, string(respBody), bareModel)
 				fail(acct.UID)
-				log.Printf("WARN: [server] upstream WAF blocked this egress IP (account-independent); " +
+				log.Printf("WARN: [服务] 上游 WAF 按出口 IP 拦截（与账号无关）；" +
 					"skip rotation and fail fast")
 				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_waf_blocked",
 					"上游风控按出口 IP 拦截了本网关，与账号无关；换号重试无效。请稍后重试，"+
@@ -1129,7 +1155,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
-				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [服务] 流式响应缺少 credit uid=%s model=%s（无法计入成本）", logfmt.UID8(acct.UID), bareModel)
 			}
 			rc.Close()
 			return
@@ -1272,7 +1298,7 @@ func (h *Handler) applyErrorPolicyOn(p *pool.Pool, uid string, kind upstream.Err
 		if (h.cfg.QoderPool != nil && p == h.cfg.QoderPool) ||
 			(h.cfg.LoomyPool != nil && p == h.cfg.LoomyPool) {
 			if p.NoteSessionDead(uid) {
-				log.Printf("WARN: [server] qoder 连续 %d 次 401 session dead — 禁用 uid=%s",
+				log.Printf("WARN: [服务] Qoder 连续 %d 次 401 session 失效 — 已禁用 uid=%s",
 					pool.SessionDeadThreshold(), logfmt.UID8(uid))
 			}
 			return

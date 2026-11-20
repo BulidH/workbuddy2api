@@ -323,7 +323,7 @@ func (s *Scheduler) RunQoderCheckinNow() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	if _, err := s.cfg.QoderOps.CheckinAll(ctx, nil, false); err != nil {
-		log.Printf("scheduled qoder checkin skipped: %v", err)
+		log.Printf("定时 Qoder 签到跳过：%v", err)
 	}
 }
 
@@ -345,7 +345,7 @@ func (s *Scheduler) RunLoomyCheckinNow() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	if _, err := s.cfg.LoomyOps.CheckinAll(ctx, nil); err != nil {
-		log.Printf("scheduled loomy checkin skipped: %v", err)
+		log.Printf("定时 Loomy 签到跳过：%v", err)
 	}
 }
 
@@ -362,7 +362,7 @@ func (s *Scheduler) RunLoomyKeepaliveNow() {
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
 func (s *Scheduler) RunCheckinNow() {
 	if _, err := s.CheckinAll(); err != nil {
-		log.Printf("scheduled checkin skipped: %v", err)
+		log.Printf("定时签到跳过：%v", err)
 	}
 }
 
@@ -439,7 +439,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("签到 %s 刷新 token：%v", logfmt.UID8(st.UID), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -458,7 +458,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+					log.Printf("签到 %s 落盘：%v", logfmt.UID8(st.UID), err)
 				}
 			}
 		}
@@ -471,7 +471,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			} else {
 				oc.Status = CheckinFail
 				oc.Detail = err.Error()
-				log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+				log.Printf("签到 %s：%v", logfmt.UID8(st.UID), err)
 			}
 		} else {
 			oc.Status = CheckinOK
@@ -480,7 +480,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("用户资源 %s：%v", logfmt.UID8(st.UID), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
 			failN++
@@ -504,7 +504,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		len(statuses), okN, alreadyN, failN, skipN)
 	s.lastCheckinAt = time.Now()
 	s.lastCheckinSummary = summary
-	log.Printf("checkin done: %s", summary)
+	log.Printf("签到完成：%s", summary)
 	return out, nil
 }
 
@@ -556,10 +556,10 @@ func (s *Scheduler) RunActivityNow() {
 		for i := 1; i <= count; i++ {
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
-				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
+				log.Printf("活跃 %s：上报 %d/%d：%v", logfmt.UID8(a.UID), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
 			}
-			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
+			log.Printf("活跃 %s：上报 %d/%d 成功", logfmt.UID8(a.UID), i, count)
 			ok++
 			if i < count {
 				time.Sleep(activityReportGap) // 账号内 5 条之间间隔，避免秒发风控
@@ -583,14 +583,14 @@ func (s *Scheduler) RunActivityNow() {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: 活跃 %s：连登校验失败（上报已成功）：%v", logfmt.UID8(a.UID), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.UID8(a.UID))
+		log.Printf("WARN: 活跃 %s：上报成功但连登天数=0（疑似静默丢弃）", logfmt.UID8(a.UID))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.UID8(a.UID), days)
+	log.Printf("活跃 %s：连登天数=%d", logfmt.UID8(a.UID), days)
 	return false
 }
 
@@ -608,7 +608,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("保活 %s：%v", logfmt.UID8(st.UID), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
@@ -620,7 +620,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
+			log.Printf("保活 %s 落盘：%v", logfmt.UID8(st.UID), err)
 		}
 	}
 }

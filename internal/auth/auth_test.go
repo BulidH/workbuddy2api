@@ -258,8 +258,8 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		t.Fatalf("want 2 accounts loaded (dedup later in pool), got %d", len(list))
 	}
 	// WARN 已触发且含两文件路径。
-	if !strings.Contains(string(raw), "WARN: uid") ||
-		!strings.Contains(string(raw), "duplicated") ||
+	if !strings.Contains(string(raw), "WARN:") ||
+		!strings.Contains(string(raw), "重复") ||
 		!strings.Contains(string(raw), "workbuddy-a-cn.json") ||
 		!strings.Contains(string(raw), "workbuddy-z-global.json") {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))

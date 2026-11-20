@@ -334,7 +334,7 @@ func (p *Pool) logFallbackLocked(best *entry, now time.Time, cands int) {
 		return
 	}
 	p.fallbackLogAt[uid] = now
-	log.Printf("WARN: [pool] fallback_pick uid=%s until=%s kind=%s cands=%d",
+	log.Printf("WARN: [池] 兜底选号 uid=%s 截止=%s 类型=%s 候选=%d",
 		logfmt.UID8(uid), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now), cands)
 }
 

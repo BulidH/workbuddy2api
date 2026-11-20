@@ -172,7 +172,7 @@ func (a *Auth) UpdateCheckinState(provider, ts string) error {
 	defer a.mu.Unlock()
 	if provider != "" && provider != a.Provider() {
 		// 上游归类不一致不阻断（配置换代时的历史账号），仍按账号自身形状落盘。
-		log.Printf("WARN: auth %s checkin provider mismatch: want=%s have=%s", logfmt.UID8(a.UID), provider, a.Provider())
+		log.Printf("WARN: 账号 %s 签到 provider 不匹配：期望=%s 实际=%s", logfmt.UID8(a.UID), provider, a.Provider())
 	}
 	a.LastCheckin = ts
 	if a.FilePath == "" {
@@ -696,7 +696,7 @@ func LoadQoderDir(dir string) ([]*Auth, error) {
 		}
 		a, err := ParseQoder(raw)
 		if err != nil {
-			log.Printf("WARN: qoder auth %s skipped: %v", f, err)
+			log.Printf("WARN: Qoder 账号 %s 已跳过：%v", f, err)
 			continue
 		}
 		a.FilePath = f
@@ -836,7 +836,7 @@ func LoadLoomyDir(dir string) ([]*Auth, error) {
 		}
 		a, err := ParseLoomy(raw)
 		if err != nil {
-			log.Printf("WARN: loomy auth %s skipped: %v", f, err)
+			log.Printf("WARN: Loomy 账号 %s 已跳过：%v", f, err)
 			continue
 		}
 		a.FilePath = f
@@ -971,16 +971,16 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
-			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
+			log.Printf("WARN: uid %s 在 %s 与 %s 中重复 — 后者覆盖（不同 realm 同名 UID？）",
 				logfmt.UID8(a.UID), prev, f)
 		}
 		seenUID[a.UID] = f
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+					log.Printf("WARN: 账号 %s realm 回填落盘：%v", logfmt.UID8(a.UID), err)
 				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
+					log.Printf("账号 %s 存量迁移：补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
 				}
 			}
 		}

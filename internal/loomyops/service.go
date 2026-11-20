@@ -150,7 +150,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string) ([]CheckinOutco
 		if err := s.ensureSession(ctx, a); err != nil {
 			oc.Status, oc.Detail = "fail", "refresh: "+err.Error()
 			failN++
-			log.Printf("ERR: loomy checkin %s refresh: %v", shortUID(st.UID), err)
+			log.Printf("ERR: Loomy 签到 %s 刷新：%v", shortUID(st.UID), err)
 			out = append(out, oc)
 			continue
 		}
@@ -160,13 +160,13 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string) ([]CheckinOutco
 			if _, err := s.cfg.Client.FirstLogin(ctx, a); err != nil {
 				oc.Status, oc.Detail = "fail", "first-login: "+err.Error()
 				failN++
-				log.Printf("ERR: loomy checkin %s first-login: %v", shortUID(st.UID), err)
+				log.Printf("ERR: Loomy 签到 %s 首次登录：%v", shortUID(st.UID), err)
 				out = append(out, oc)
 				continue
 			}
 			oc.Status = "ok"
 			if err := a.UpdateCheckinState("loomy", time.Now().Format(time.RFC3339)); err != nil {
-				log.Printf("WARN: loomy checkin %s save: %v", shortUID(st.UID), err)
+				log.Printf("WARN: Loomy 签到 %s 落盘：%v", shortUID(st.UID), err)
 			}
 		} else {
 			oc.Status = "already"
@@ -187,7 +187,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string) ([]CheckinOutco
 			done := len(pending) == 0 && !strings.HasPrefix(detail, "onboarding")
 			if done != a.OnboardingComplete() {
 				if err := a.SetOnboardingComplete(done); err != nil {
-					log.Printf("WARN: loomy checkin %s onboarding state: %v", shortUID(st.UID), err)
+					log.Printf("WARN: Loomy 签到 %s 新手任务状态：%v", shortUID(st.UID), err)
 				}
 			}
 		}
@@ -202,7 +202,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string) ([]CheckinOutco
 				oc.Credits = &v
 			}
 			if err := a.UpdateLoomyCredits(quotaMap(q)); err != nil {
-				log.Printf("WARN: loomy checkin %s credits save: %v", shortUID(st.UID), err)
+				log.Printf("WARN: Loomy 签到 %s 积分落盘：%v", shortUID(st.UID), err)
 			}
 		} else if oc.Detail == "" {
 			oc.Detail = "quota: " + err.Error()
@@ -222,7 +222,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string) ([]CheckinOutco
 		len(statuses), okN, alreadyN, failN, skipN)
 	s.lastAt = time.Now()
 	s.lastSummary = summary
-	log.Printf("loomy checkin done: %s", summary)
+	log.Printf("Loomy 签到完成：%s", summary)
 	return out, nil
 }
 
@@ -246,7 +246,7 @@ func (s *Service) claimOnboarding(ctx context.Context, a *auth.Auth) (claimed, p
 			}
 		}
 		if _, err := s.cfg.Client.ClaimTask(ctx, a, t.Key); err != nil {
-			log.Printf("WARN: loomy claim %s %s: %v", shortUID(a.UID), t.Key, err)
+			log.Printf("WARN: Loomy 领取 %s %s：%v", shortUID(a.UID), t.Key, err)
 			failedTitles = append(failedTitles, t.Title)
 			continue
 		}
@@ -322,7 +322,7 @@ func (s *Service) RefreshBalances(ctx context.Context, uids []string) ([]Balance
 		}
 		oc.Detail = quotaText(q)
 		if err := a.UpdateLoomyCredits(quotaMap(q)); err != nil {
-			log.Printf("WARN: loomy balance %s save: %v", shortUID(st.UID), err)
+			log.Printf("WARN: Loomy 余额 %s 落盘：%v", shortUID(st.UID), err)
 		}
 		out = append(out, oc)
 	}
@@ -347,10 +347,10 @@ func (s *Service) Keepalive(ctx context.Context, renewBefore time.Duration) {
 			continue
 		}
 		if err := s.cfg.Client.RefreshSession(ctx, a); err != nil {
-			log.Printf("WARN: loomy keepalive %s: %v", shortUID(st.UID), err)
+			log.Printf("WARN: Loomy 保活 %s：%v", shortUID(st.UID), err)
 			continue
 		}
-		log.Printf("loomy keepalive %s: ok", shortUID(st.UID))
+		log.Printf("Loomy 保活 %s：成功", shortUID(st.UID))
 	}
 }
 

@@ -44,7 +44,7 @@ func main() {
 	if err != nil {
 		// 配置文件不存在时给一次机会用纯默认 + env
 		if os.IsNotExist(err) {
-			log.Printf("config %s not found, using defaults+env", *cfgPath)
+			log.Printf("未找到配置文件 %s，使用默认值+环境变量", *cfgPath)
 			cfg, err = Load("")
 		}
 		if err != nil {
@@ -56,7 +56,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	log.Printf("从 %s 加载 %d 个账号", cfg.AuthDir, len(auths))
 
 	// Qoder 第二上游：独立账号目录 + 独立账号池（冷却/熔断/在途租约互不影响）。
 	// 未启用时不创建任何对象，纯 WorkBuddy 部署零变化。
@@ -71,9 +71,9 @@ func main() {
 	if cfg.Qoder.Enabled {
 		qoderAuths, err = auth.LoadQoderDir(cfg.Qoder.AuthDir)
 		if err != nil {
-			log.Printf("WARN: load qoder auths from %s: %v", cfg.Qoder.AuthDir, err)
+			log.Printf("WARN: 从 %s 加载 Qoder 账号失败：%v", cfg.Qoder.AuthDir, err)
 		}
-		log.Printf("loaded %d qoder account(s) from %s", len(qoderAuths), cfg.Qoder.AuthDir)
+		log.Printf("从 %s 加载 %d 个 Qoder 账号", cfg.Qoder.AuthDir, len(qoderAuths))
 		qp = pool.New(cfg.Qoder.StateFile)
 		// 注意：不共享 Redis 状态快照键（wb2api:state 为单池设计），Qoder 池仅用本地文件。
 		qp.RestoreFromSnapshot()
@@ -123,9 +123,9 @@ func main() {
 	if cfg.Loomy.Enabled {
 		loomyAuths, lerr := auth.LoadLoomyDir(cfg.Loomy.AuthDir)
 		if lerr != nil {
-			log.Printf("WARN: load loomy auths from %s: %v", cfg.Loomy.AuthDir, lerr)
+			log.Printf("WARN: 从 %s 加载 Loomy 账号失败：%v", cfg.Loomy.AuthDir, lerr)
 		}
-		log.Printf("loaded %d loomy account(s) from %s", len(loomyAuths), cfg.Loomy.AuthDir)
+		log.Printf("从 %s 加载 %d 个 Loomy 账号", cfg.Loomy.AuthDir, len(loomyAuths))
 		lp = pool.New(cfg.Loomy.StateFile)
 		lp.RestoreFromSnapshot()
 		lp.SyncToDir(loomyAuths)
@@ -710,6 +710,8 @@ func main() {
 		LoomyPool:     lp,
 		LoomyWeight:   cfg.Loomy.Weight,
 		LoomyPriority: cfg.Loomy.Priority,
+		// 首字节容忍度，同时作为「同上游多环节」的共享总预算。
+		LoomyHeaderTimeout: time.Duration(cfg.Loomy.HeaderTimeoutSeconds) * time.Second,
 		// WorkBuddy 无独立档位（恒 1）；Qoder 可由 qoder.priority 调整。
 		QoderPriority: cfg.Qoder.Priority,
 
@@ -759,7 +761,7 @@ func main() {
 			qctx, qcancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer qcancel()
 			if _, err := qops.CheckinAll(qctx, nil, false); err != nil {
-				log.Printf("qoder 启动补跑签到: %v", err)
+				log.Printf("Qoder 启动补跑签到：%v", err)
 			}
 		}()
 		log.Printf("已安排 Qoder 启动补跑签到（%s 后执行一次，可用 qoder.checkin_on_startup=false 关闭）",
@@ -773,7 +775,7 @@ func main() {
 			lctx, lcancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer lcancel()
 			if _, err := lops.CheckinAll(lctx, nil); err != nil {
-				log.Printf("loomy 启动补跑签到: %v", err)
+				log.Printf("Loomy 启动补跑签到：%v", err)
 			}
 		}()
 		log.Printf("已安排 Loomy 启动补跑签到（%s 后执行一次，可用 loomy.checkin_on_startup=false 关闭）",
@@ -812,9 +814,9 @@ func main() {
 	} else {
 		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
 	}
-	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("workbuddy2api 监听于 %s（已启用鉴权=%v）", cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
-	log.Printf("bye")
+	log.Printf("服务退出")
 }

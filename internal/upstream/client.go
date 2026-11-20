@@ -884,7 +884,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("ERR: [上游] 聊天流 uid=%s：传输错误：%v", logfmt.UID8(a.UID), err)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -892,7 +892,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			resp.Body.Close()
 			cancel()
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+			log.Printf("WARN: [上游] 聊天流 uid=%s：上游 %d %s body=%s",
 				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
 			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {

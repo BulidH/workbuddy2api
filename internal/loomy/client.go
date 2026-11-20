@@ -394,6 +394,16 @@ var ErrHeaderTimeout = errors.New("loomy: response header timeout")
 // 上游本身就是 OpenAI 兼容 SSE，只做两件事：强制 stream:true（便于本地聚合）与
 // 把 usage.points_consumed 同步为 usage.credit（网关成本账本只认 credit）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, meta ChatMeta) (io.ReadCloser, int, []byte, error) {
+	return c.ChatStreamContextWithBudget(ctx, a, body, meta, 0)
+}
+
+// ChatStreamContextWithBudget 同 ChatStreamContext，但可覆盖「首字节等待上限」。
+//
+// budget>0 时用它替代 cfg.HeaderTimeout，只约束到收到响应头为止；拿到响应头后
+// 立即释放该上限（否则会把正常的长流也一起切断）。
+// 为什么需要按调用覆盖：混合路由下同一上游可能有多环，各环共享一份总预算，
+// 后续环节要按剩余额度收紧，而非每环都给满额。
+func (c *Client) ChatStreamContextWithBudget(ctx context.Context, a *auth.Auth, body []byte, meta ChatMeta, budget time.Duration) (io.ReadCloser, int, []byte, error) {
 	if err := c.ensureSession(ctx, a); err != nil {
 		return nil, http.StatusUnauthorized, []byte(`{"error":{"message":"loomy session refresh: ` + escapeJSON(err.Error()) + `"}}`), nil
 	}
@@ -409,9 +419,21 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if err != nil {
 		return nil, http.StatusInternalServerError, nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+	// 首字节预算：budget>0 时用「请求 ctx + 该预算」约束到收到响应头为止。
+	// 拿到响应头后立刻 cancelHeader，避免长流被这个上限连带切断。
+	headerTimeout := c.cfg.HeaderTimeout
+	if budget > 0 {
+		headerTimeout = budget
+	}
+	reqCtx := ctx
+	cancelHeader := func() {}
+	if headerTimeout > 0 {
+		reqCtx, cancelHeader = context.WithTimeout(ctx, headerTimeout)
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
 		strings.TrimRight(c.cfg.ModelBase, "/")+PathChat, bytes.NewReader(raw))
 	if err != nil {
+		cancelHeader()
 		return nil, 0, nil, err
 	}
 	for k, v := range c.modelHeaders(a.AccessToken) {
@@ -434,26 +456,29 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 
 	resp, err := c.chatHTTP.Do(httpReq)
 	if err != nil {
-		// 首字节超时（ResponseHeaderTimeout）：上游健康但此刻排队太慢。
+		cancelHeader()
+		// 首字节超时：上游健康但此刻排队太慢。
 		// 返回哨兵错误让上层直接跳到下一个路由环节，而不是继续换同上游的号
 		// （实测同上游所有账号一样慢，换号纯属浪费时间）。
 		if isTimeoutErr(err) {
 			log.Printf("WARN: [loomy] 账号 %s 模型 %s 首字节等待超时（%s），跳过该环节改用下一环",
-				logfmt.UID8(a.UID), reqModel, c.cfg.HeaderTimeout)
+				logfmt.UID8(a.UID), reqModel, headerTimeout)
 			return nil, 0, nil, ErrHeaderTimeout
 		}
 		// 与 upstream 客户端同口径：传输层错误只换号、不罚账号，但必须留痕，
 		// 否则账号被跳过/冷却时面板与日志双双无据可查。
-		log.Printf("ERR: [loomy] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+		log.Printf("ERR: [Loomy] 聊天流 uid=%s：传输错误：%v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
+	// 已拿到响应头：解除首字节上限，后续流式输出按上游节奏走。
+	cancelHeader()
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		// 上游错误响应原样返回给上层做错误分类（429 软冷却、402 硬冷却等都依赖
 		// status+body），此前这里完全不打日志——账号冷却时面板看得见、日志查不到，
 		// 排查"为什么老冷却"只能靠猜。此处与 upstream 客户端对齐：WARN 一行留痕。
-		log.Printf("WARN: [loomy] chat_stream uid=%s: upstream %d %s body=%s",
+		log.Printf("WARN: [Loomy] 聊天流 uid=%s：上游 %d %s body=%s",
 			logfmt.UID8(a.UID), resp.StatusCode, Classify(resp.StatusCode, string(detail)), truncate(string(detail), 200))
 		// 会话失效（401/403 或业务码 020002/100002）且有密码：重新登录后重试一次。
 		if isAuthFailure(resp.StatusCode, string(detail)) && a.LoginID != "" && a.Password != "" {
@@ -479,13 +504,13 @@ func (c *Client) chatOnce(ctx context.Context, a *auth.Auth, raw []byte, meta Ch
 	httpReq.Header.Set("X-Loomy-Request-Purpose", firstNonEmpty(meta.Purpose, c.cfg.RequestPurpose))
 	resp, err := c.chatHTTP.Do(httpReq)
 	if err != nil {
-		log.Printf("ERR: [loomy] chat_stream uid=%s: transport error (retry after re-login): %v", logfmt.UID8(a.UID), err)
+		log.Printf("ERR: [Loomy] 聊天流 uid=%s：传输错误（重登后重试）：%v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		log.Printf("WARN: [loomy] chat_stream uid=%s: upstream %d %s body=%s (retry after re-login)",
+		log.Printf("WARN: [Loomy] 聊天流 uid=%s：上游 %d %s body=%s（重登后重试）",
 			logfmt.UID8(a.UID), resp.StatusCode, Classify(resp.StatusCode, string(detail)), truncate(string(detail), 200))
 		return nil, resp.StatusCode, detail, nil
 	}

@@ -121,7 +121,7 @@ func (s *Service) ensureToken(ctx context.Context, a *auth.Auth) error {
 		if a.AccessToken == "" {
 			return err
 		}
-		log.Printf("qoder refresh %s: %v（继续使用现有 access token）", shortUID(a.UID), err)
+		log.Printf("Qoder 刷新 %s：%v（继续使用现有 access token）", shortUID(a.UID), err)
 	}
 	return nil
 }
@@ -169,7 +169,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string, onlyDaily bool)
 		if err := s.ensureToken(ctx, a); err != nil {
 			oc.Status, oc.Detail = "fail", "refresh: "+err.Error()
 			failN++
-			log.Printf("qoder checkin %s refresh: %v", shortUID(st.UID), err)
+			log.Printf("Qoder 签到 %s 刷新：%v", shortUID(st.UID), err)
 			out = append(out, oc)
 			continue
 		}
@@ -210,7 +210,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string, onlyDaily bool)
 			if oc.Detail == "" {
 				oc.Detail = res.Message
 			}
-			log.Printf("qoder checkin %s: %s %s", shortUID(st.UID), oc.Status, oc.Detail)
+			log.Printf("Qoder 签到 %s：%s %s", shortUID(st.UID), oc.Status, oc.Detail)
 		}
 		s.logActivity(st, "checkin", oc)
 		out = append(out, oc)
@@ -219,7 +219,7 @@ func (s *Service) CheckinAll(ctx context.Context, uids []string, onlyDaily bool)
 		len(statuses), okN, alreadyN, blockedN, failN, skipN)
 	s.lastAt = time.Now()
 	s.lastSummary = summary
-	log.Printf("qoder checkin done: %s", summary)
+	log.Printf("Qoder 签到完成：%s", summary)
 	return out, nil
 }
 
@@ -276,10 +276,10 @@ func (s *Service) Keepalive(ctx context.Context) {
 			continue
 		}
 		if err := s.cfg.Client.RefreshToken(ctx, a); err != nil {
-			log.Printf("qoder keepalive %s: %v", shortUID(st.UID), err)
+			log.Printf("Qoder 保活 %s：%v", shortUID(st.UID), err)
 			continue
 		}
-		log.Printf("qoder keepalive %s: ok", shortUID(st.UID))
+		log.Printf("Qoder 保活 %s：成功", shortUID(st.UID))
 	}
 }
 

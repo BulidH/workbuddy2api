@@ -60,13 +60,13 @@ func main() {
 	if c.StateFile == "" {
 		c.StateFile = "data/state.json"
 	}
-	log.Printf("activity count=%d", c.Schedule.ActivityReportCount)
+	log.Printf("活跃上报条数=%d", c.Schedule.ActivityReportCount)
 
 	auths, err := auth.LoadDir(c.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s)", len(auths))
+	log.Printf("已加载 %d 个账号", len(auths))
 
 	p := pool.New(c.StateFile)
 	p.SyncToDir(auths)
@@ -81,7 +81,7 @@ func main() {
 		ActivityReportCount: c.Schedule.ActivityReportCount,
 	})
 	sch.RunActivityNow()
-	log.Printf("activity run complete")
+	log.Printf("活跃上报执行完成")
 }
 
 // newUpstream 构造上游客户端并显式接线 global realm 路由。
