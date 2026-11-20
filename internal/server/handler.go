@@ -1001,17 +1001,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// Loomy 上游本身就是 OpenAI 兼容 SSE：直接透传，usage 已在 client 内
 			// 把 points_consumed 映射为 credit，复用同一 Stream/Aggregate 出口。
 			//
-			// 预算：同上游多环共享一份首字节容忍度。第 N 环只拿「总额 - 已等」，
-			// 避免三环各等满额导致单请求拖到 90s（实测）。
+			// 预算：同上游多环共享一份首字节容忍度，避免三环各等满额把单请求拖到 90s。
+			// 但后续环节必须保留**最小尝试窗口**：若直接用「总额-已等」，第一环超时
+			// 就会把预算吃干，第二、三环被 0 预算瞬间跳过——那多模型互兜等于没配。
+			// 保底值取总额的 1/3（至少 5s），保证每个环节都有真实的尝试机会。
 			budget := time.Duration(0)
 			if full := h.cfg.LoomyHeaderTimeout; full > 0 {
+				floor := full / 3
+				if floor < 5*time.Second {
+					floor = 5 * time.Second
+				}
 				budget = full - providerWait[provider]
-				if budget <= 0 {
-					// 该上游的预算已耗尽：直接跳过剩余同上游环节。
-					log.Printf("Loomy 首字节预算已耗尽（%s），跳过 %s 环节", full, stepModel)
-					st.providers = append(st.providers, provider+"="+stepModel+":预算已耗尽")
-					stepIdx++
-					continue
+				if budget < floor {
+					budget = floor
+				}
+				if budget > full {
+					budget = full
 				}
 			}
 			rc, status, respBody, terr = h.cfg.Loomy.ChatStreamContextWithBudget(r.Context(), acct, outbound,

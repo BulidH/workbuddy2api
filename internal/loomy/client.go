@@ -419,21 +419,26 @@ func (c *Client) ChatStreamContextWithBudget(ctx context.Context, a *auth.Auth, 
 	if err != nil {
 		return nil, http.StatusInternalServerError, nil, err
 	}
-	// 首字节预算：budget>0 时用「请求 ctx + 该预算」约束到收到响应头为止。
-	// 拿到响应头后立刻 cancelHeader，避免长流被这个上限连带切断。
-	headerTimeout := c.cfg.HeaderTimeout
+	// 首字节预算：用「独立的 Transport 副本」承载本次请求，只给这层设
+	// ResponseHeaderTimeout，而不碰请求 ctx。
+	//
+	// 为什么不能用 ctx 超时：context.WithTimeout 的取消会连带阻断**响应体读取**
+	// （http.Response.Body 绑定在该 ctx 上）。拿到响应头后即便调用 cancel 也已经
+	// 太晚——body 的 Read 会立即返回 context canceled，表现为流是空的
+	// （实测：首字节 2s 正常返回，但 content 为空、chunk=1）。
+	// Transport 级的 ResponseHeaderTimeout 只约束「等到响应头」这一段，
+	// 拿到响应头后即失效，不影响后续流式读取，正是这里需要的行为。
+	httpClient := c.chatHTTP
 	if budget > 0 {
-		headerTimeout = budget
+		if tr, ok := c.chatHTTP.Transport.(*http.Transport); ok {
+			clone := tr.Clone()
+			clone.ResponseHeaderTimeout = budget
+			httpClient = &http.Client{Transport: clone}
+		}
 	}
-	reqCtx := ctx
-	cancelHeader := func() {}
-	if headerTimeout > 0 {
-		reqCtx, cancelHeader = context.WithTimeout(ctx, headerTimeout)
-	}
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(c.cfg.ModelBase, "/")+PathChat, bytes.NewReader(raw))
 	if err != nil {
-		cancelHeader()
 		return nil, 0, nil, err
 	}
 	for k, v := range c.modelHeaders(a.AccessToken) {
@@ -454,15 +459,14 @@ func (c *Client) ChatStreamContextWithBudget(ctx context.Context, a *auth.Auth, 
 	}
 	httpReq.Header.Set("X-Loomy-Request-Purpose", purpose)
 
-	resp, err := c.chatHTTP.Do(httpReq)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
-		cancelHeader()
 		// 首字节超时：上游健康但此刻排队太慢。
 		// 返回哨兵错误让上层直接跳到下一个路由环节，而不是继续换同上游的号
 		// （实测同上游所有账号一样慢，换号纯属浪费时间）。
 		if isTimeoutErr(err) {
 			log.Printf("WARN: [loomy] 账号 %s 模型 %s 首字节等待超时（%s），跳过该环节改用下一环",
-				logfmt.UID8(a.UID), reqModel, headerTimeout)
+				logfmt.UID8(a.UID), reqModel, budget)
 			return nil, 0, nil, ErrHeaderTimeout
 		}
 		// 与 upstream 客户端同口径：传输层错误只换号、不罚账号，但必须留痕，
@@ -470,8 +474,6 @@ func (c *Client) ChatStreamContextWithBudget(ctx context.Context, a *auth.Auth, 
 		log.Printf("ERR: [Loomy] 聊天流 uid=%s：传输错误：%v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
-	// 已拿到响应头：解除首字节上限，后续流式输出按上游节奏走。
-	cancelHeader()
 	if resp.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
