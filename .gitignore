@@ -17,6 +17,9 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+# 在线改配置时的临时备份（同样含 api_key）——config.json 的忽略规则不覆盖这些
+config.json.bak-*
+config.json.*.bak
 
 # Build artifacts
 *.tmp
