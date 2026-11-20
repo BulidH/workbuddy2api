@@ -1,6 +1,10 @@
 auths/
+qoder_auths/
+loomy_auths/
 data/
 *.tmp
+*.bak
+*.bak-*
 .git/
 .gitignore
 docs/

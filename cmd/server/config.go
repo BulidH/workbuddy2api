@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/qoder"
@@ -552,6 +553,40 @@ func (c *Config) normalize() error {
 	}
 	if c.Qoder.TimeoutSeconds <= 0 {
 		c.Qoder.TimeoutSeconds = 600
+	}
+	// aliases：校验 order（按模型覆盖调度顺序）里的 Provider 名合法且不重复。
+	// 静默忽略拼错的 provider 会让用户以为顺序生效了，实际没生效——直接报错。
+	for name, alias := range c.Qoder.Aliases {
+		seen := map[string]bool{}
+		for _, p := range alias.Order {
+			k := strings.ToLower(strings.TrimSpace(p))
+			if k == "" {
+				continue
+			}
+			switch k {
+			case auth.ProviderWorkBuddy, auth.ProviderQoder, auth.ProviderLoomy:
+			default:
+				return fmt.Errorf("qoder.aliases.%s.order: %q 不是合法 Provider（workbuddy / qoder / loomy）", name, p)
+			}
+			if seen[k] {
+				return fmt.Errorf("qoder.aliases.%s.order: %q 重复", name, p)
+			}
+			seen[k] = true
+		}
+		// steps：每环必须有合法 provider。同一上游可重复（这是设计意图），故不查重。
+		// model 也必填：留空会把裸名原样发给上游（如 a → a），必然失败且难以排查，
+		// 前端已拦，这里再兜一道（配置可被手工编辑/其它工具写入）。
+		for i, s := range alias.Steps {
+			k := strings.ToLower(strings.TrimSpace(s.Provider))
+			switch k {
+			case auth.ProviderWorkBuddy, auth.ProviderQoder, auth.ProviderLoomy:
+			default:
+				return fmt.Errorf("qoder.aliases.%s.steps[%d].provider: %q 不是合法 Provider（workbuddy / qoder / loomy）", name, i, s.Provider)
+			}
+			if strings.TrimSpace(s.Model) == "" {
+				return fmt.Errorf("qoder.aliases.%s.steps[%d].model: 不能为空（必须为该上游指定具体模型名）", name, i)
+			}
+		}
 	}
 	if c.Qoder.AuthDir == "" {
 		c.Qoder.AuthDir = "./qoder_auths"

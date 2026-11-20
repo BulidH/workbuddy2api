@@ -663,6 +663,15 @@ func main() {
 			},
 			// 智能体配置的 state/备份放在状态文件同目录，默认 ./accounts。
 			Agents: agentcfg.New(filepath.Dir(cfg.StateFile), ""),
+
+			// 混合路由预览：把 aliases 目标名 + 显式 order + 全局 priority 合成后的
+			// 最终候选顺序摊开给面板（只读，不发任何上游请求）。
+			ModelRoutes: func() ([]panel.ModelRouteView, error) {
+				if h == nil {
+					return nil, fmt.Errorf("网关尚未就绪")
+				}
+				return h.ModelRoutes(), nil
+			},
 		})
 		log.Printf("内置管理面板已启用：http://<host>%s/panel/", cfg.Listen)
 	}

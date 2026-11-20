@@ -146,14 +146,22 @@ func (p *Panel) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 //
 // 语义：
 //   - 两边同为 object → 递归合并
+//   - patch 中显式 null → **删除该键**（真正的删除，而非写成 null）
 //   - 其余情况（含数组、标量、类型不一致）→ patch 整体覆盖 base
-//   - patch 中显式 null → 覆盖为 null（用于清空字段）
+//
+// 为什么 null 要删键而不是留 null：配置是强类型结构体，`"key": null` 反序列化后
+// 等价于零值——对 map 类型字段（如 qoder.aliases）意味着键依然存在、只是值为空别名，
+// 于是「删除混合模型」在重启后又出现。删键才能让用户看到的东西真正消失。
 func deepMerge(base, patch map[string]any) map[string]any {
 	out := make(map[string]any, len(base))
 	for k, v := range base {
 		out[k] = v
 	}
 	for k, pv := range patch {
+		if pv == nil {
+			delete(out, k)
+			continue
+		}
 		if bv, ok := out[k]; ok {
 			bm, bok := bv.(map[string]any)
 			pm, pok := pv.(map[string]any)

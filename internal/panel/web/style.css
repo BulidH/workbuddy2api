@@ -366,6 +366,16 @@ html:not([data-theme="light"]) table.tbl tbody tr:hover {
 }
 html[data-theme="light"] table.tbl tbody tr:hover { background: var(--surface-2); }
 table.tbl td.num { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 12.5px; }
+
+/* 表格内联表单（混合路由页的候选链编辑器）：收紧内边距与高度，
+   让一行里同时放得下 上游下拉 + 模型下拉 + 操作按钮。 */
+table.tbl td .field { gap: 0; }
+table.tbl td .field select {
+  padding: 7px 10px;
+  font-size: 13px;
+  min-height: 34px;
+}
+table.tbl td .btn.xs { padding: 4px 8px; }
 .empty {
   padding: 34px; text-align: center; color: var(--text-mute);
   background: var(--surface-2); border: 1px dashed var(--border-2); border-radius: var(--radius-sm);

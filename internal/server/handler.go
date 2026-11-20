@@ -739,8 +739,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
 
-	providers := h.providerCandidates(forced, bareModel)
-	if len(providers) == 0 {
+	steps := h.routeSteps(forced, bareModel)
+	if len(steps) == 0 {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
 			"all accounts are temporarily unavailable, please retry later")
 		st.status = http.StatusServiceUnavailable
@@ -751,7 +751,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		auth.ProviderQoder:     {},
 		auth.ProviderLoomy:     {},
 	}
-	providerIdx := 0
+	stepIdx := 0
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
@@ -857,11 +857,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	attempts := 0
-	for attempts < h.cfg.MaxRotate && providerIdx < len(providers) {
-		provider := providers[providerIdx]
+	for attempts < h.cfg.MaxRotate && stepIdx < len(steps) {
+		step := steps[stepIdx]
+		provider := step.provider
+		// 该环节实际发往上游的模型名：Steps 显式指定优先，否则用别名目标。
+		// 选号与出站都要用同一个名字（池的 6004 模型级豁免也按它判断）。
+		stepModel := step.model
+		if stepModel == "" {
+			stepModel = bareModel
+		}
 		ap := h.poolFor(provider)
 		if ap == nil {
-			providerIdx++
+			stepIdx++
 			continue
 		}
 		triedThis, ok := tried[provider]
@@ -877,7 +884,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 绑定号已从任何池移除（删号）→ 解绑，回落普通轮换。
 				unbindSticky()
 			} else if sprovider == provider {
-				acct = sp.PickByUIDForModel(stickyUID, bareModel)
+				acct = sp.PickByUIDForModel(stickyUID, stepModel)
 				if acct == nil || (provider == auth.ProviderWorkBuddy && realm != "" && acct.Realm() != realm) {
 					// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
 					unbindSticky()
@@ -891,14 +898,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 由模型目录做跨区匹配，此处不按 realm 过滤。
 			if provider == auth.ProviderQoder || provider == auth.ProviderLoomy {
 				// 两家都不按 realm 过滤：Qoder 由模型目录跨区匹配，Loomy 只有国内站。
-				acct = ap.PickExcludingForRealm(triedThis, bareModel, "")
+				acct = ap.PickExcludingForRealm(triedThis, stepModel, "")
 			} else {
-				acct = ap.PickExcludingForRealm(triedThis, bareModel, realm)
+				acct = ap.PickExcludingForRealm(triedThis, stepModel, realm)
 			}
 		}
 		if acct == nil {
-			// 当前 Provider 无可用账号 → 降级到下一个 Provider（跨 Provider failover）。
-			providerIdx++
+			// 当前环节无可用账号 → 降级到链上下一个环节（可能同上游另一模型，也可能换上游）。
+			stepIdx++
 			continue
 		}
 		attempts++
@@ -961,12 +968,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
 		// Qoder 返回已归一化为 OpenAI SSE 的流，复用同一 Stream/Aggregate 出口。
-		// 按 Provider 改写模型名：别名可能把同一个对外裸名映射到两侧不同的
-		// 上游名字（如 deepseek-flash → Qoder:DeepSeek-Flash / WB:deepseek-v4.1-flash）。
-		// 必须在每次尝试前算：降级重试会换 body，但别名不能丢。
+		// 按候选环节改写模型名：链上每一环可能指定不同模型（Steps），
+		// 未指定时用别名目标，再否则保持裸名。
 		outbound := body
-		if target := h.providerModel(provider, bareModel); target != bareModel {
-			outbound = rewriteModel(body, target)
+		if stepModel != bareModel {
+			outbound = rewriteModel(body, stepModel)
 		}
 		var rc io.ReadCloser
 		var status int
@@ -998,6 +1004,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, outbound, clientIP, chatMeta)
 		}
 		if terr != nil {
+			// 客户端已断连/取消：ctx 已死，后续每次尝试都会瞬间失败且必然 503。
+			// 立刻收手（不再轮转、不罚账号），避免把一次客户端超时放大成
+			// 「loomy>loomy>loomy>wb 全部 transport error」的误导性错误风暴。
+			// 这类失败不是账号健康问题，也不该喂熔断计数。
+			if r.Context().Err() != nil {
+				log.Printf("client canceled request, stop rotation (provider=%s uid=%s): %v",
+					provider, logfmt.UID8(acct.UID), terr)
+				st.status = 499 // 非标准但通用：客户端关闭请求
+				return
+			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable

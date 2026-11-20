@@ -161,6 +161,7 @@ const ROUTES = {
   qoder: { title: 'Qoder 活动', sub: '每日签到 / 活动领取 / 额度与活动流水', render: viewQoder },
   config: { title: '网关配置', sub: '在线编辑 config.json（保存后需重启生效）', render: viewConfig },
   models: { title: '模型列表', sub: '网关对外暴露的全部模型', render: viewModels },
+  modelroute: { title: '混合路由', sub: '配置每个混合模型先走哪个上游、失败后如何兜底', render: viewModelRoute },
   agents: { title: '智能体配置', sub: '检测本机 AI 客户端，一键指向本网关；写入前备份，可精确还原', render: viewAgents },
   usage: { title: '用量统计', sub: '按账号 / 小时 / 天 / 模型统计积分消耗与调用量', render: viewUsage },
   logs: { title: '运行日志', sub: '网关进程日志与请求流水', render: viewLogs },
@@ -1505,6 +1506,305 @@ async function viewModels() {
     <div class="table-wrap"><table class="tbl">
       <thead><tr><th>模型 ID</th><th>来源</th><th>上下文</th><th>推理档位</th><th>默认档位</th></tr></thead>
       <tbody>${rows}</tbody></table></div></div>`;
+}
+
+/* ── 混合路由页 ─────────────────────────────────────── */
+// 展示并编辑每个混合模型（config 里的 aliases 裸名）的候选链。
+//
+// 候选链支持「同一上游出现多次」，因此数据结构是 (provider, model) 对的数组，
+// 对应 config 的 aliases.<name>.steps。没有 steps 时按 order/全局优先级推导，
+// 页面上把它物化成初始 steps，用户改动后保存为显式 steps。
+const PROV_LABEL = { workbuddy: 'WorkBuddy', qoder: 'Qoder', loomy: 'Loomy' };
+const PROV_TAG = { workbuddy: 'purple', qoder: 'ok', loomy: 'info' };
+
+// 各上游可选模型（来自 /models，按上游过滤），供链上下拉选择。
+let MR_MODELS = { workbuddy: [], qoder: [], loomy: [] };
+
+async function loadProviderModels() {
+  try {
+    const r = await api('/models');
+    const list = r.data || [];
+    const buckets = { workbuddy: new Set(), qoder: new Set(), loomy: new Set() };
+    for (const m of list) {
+      const id = m.id || '';
+      const prov = m.provider || m.owned_by || '';
+      // loomy:<name> / qoder:<name> 前缀模型归到对应上游
+      const mm = id.match(/^(loomy|qoder):(.+)$/);
+      if (mm) { buckets[mm[1]].add(mm[2]); continue; }
+      if (m.loomy_key) buckets.loomy.add(m.loomy_key);
+      if (m.qoder_key) buckets.qoder.add(m.qoder_key);
+      // 裸名/合并模型：其各上游目标名优先
+      if (m.workbuddy_model) buckets.workbuddy.add(m.workbuddy_model);
+      if (m.qoder_model) buckets.qoder.add(m.qoder_model);
+      if (m.loomy_model) buckets.loomy.add(m.loomy_model);
+    }
+    MR_MODELS = {
+      workbuddy: [...buckets.workbuddy].sort(),
+      qoder: [...buckets.qoder].sort(),
+      loomy: [...buckets.loomy].sort(),
+    };
+  } catch (e) {
+    // 拿不到模型清单不阻塞页面，用户仍可手输模型名。
+    MR_MODELS = { workbuddy: [], qoder: [], loomy: [] };
+  }
+}
+
+// 混合路由页的本地编辑态（跨重渲染保留）
+let MR_STATE = null;
+
+async function viewModelRoute() {
+  $('#view').innerHTML = `<div class="loading">加载中…</div>`;
+  let routes = [];
+  try {
+    const r = await api('/model-routes');
+    routes = r.routes || [];
+  } catch (e) {
+    $('#view').innerHTML = `<div class="alert err">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  if (!MR_MODELS.qoder.length && !MR_MODELS.loomy.length) await loadProviderModels();
+
+  // 首次进入/外部变更：用后端推导结果初始化编辑态
+  MR_STATE = routes.map(rt => ({
+    name: rt.name,
+    // 显式 steps 优先；否则物化后端推导出的候选（未可用的也保留，便于用户看到全貌）
+    steps: (rt.steps && rt.steps.length)
+      ? rt.steps.map(s => ({ provider: s.provider, model: s.model || '' }))
+      : (rt.candidates || []).map(c => ({ provider: c.provider, model: c.model || '' })),
+    available: (rt.candidates || []).map(c => c.available),
+    reasons: (rt.candidates || []).map(c => c.reason || ''),
+    targets: rt.targets || {},
+    dirty: false,
+  }));
+  renderModelRoute();
+}
+
+function mrModelOptions(provider, selected) {
+  const list = MR_MODELS[provider] || [];
+  // 必须选具体模型：空值只作为未选择时的占位提示，不可当作有效值提交。
+  const opts = [`<option value=""${selected ? '' : ' selected'} disabled>— 请选择模型 —</option>`];
+  if (selected && !list.includes(selected)) {
+    opts.push(`<option value="${esc(selected)}" selected>${esc(selected)}（不在目录）</option>`);
+  }
+  for (const m of list) {
+    opts.push(`<option value="${esc(m)}"${m === selected ? ' selected' : ''}>${esc(m)}</option>`);
+  }
+  return opts.join('');
+}
+
+function stepListLast(ri) {
+  const rt = MR_STATE[ri];
+  return rt ? rt.steps.length - 1 : 0;
+}
+
+function mrStepRow(ri, si, step) {
+  const provOpts = ['workbuddy', 'qoder', 'loomy'].map(p =>
+    `<option value="${p}"${p === step.provider ? ' selected' : ''}>${PROV_LABEL[p]}</option>`).join('');
+  // 用 .field 包裹以复用配置页的深色表单控件样式（直接给 select 加 class 不生效）。
+  return `<tr data-ri="${ri}" data-si="${si}">
+    <td class="num" style="vertical-align:middle">${si + 1}</td>
+    <td><div class="field"><select class="mr-prov" data-ri="${ri}" data-si="${si}">${provOpts}</select></div></td>
+    <td><div class="field"><select class="mr-model" data-ri="${ri}" data-si="${si}">${mrModelOptions(step.provider, step.model)}</select></div></td>
+    <td class="num" style="white-space:nowrap;vertical-align:middle">
+      <button class="btn ghost xs" data-mr="up" data-ri="${ri}" data-si="${si}" ${si === 0 ? 'disabled' : ''} title="上移">↑</button>
+      <button class="btn ghost xs" data-mr="down" data-ri="${ri}" data-si="${si}" ${si === stepListLast(ri) ? 'disabled' : ''} title="下移">↓</button>
+      <button class="btn ghost xs danger" data-mr="del" data-ri="${ri}" data-si="${si}" title="删除这一环">×</button>
+    </td>
+  </tr>`;
+}
+
+function mrCard(rt, ri) {
+  const rows = rt.steps.map((s, si) => mrStepRow(ri, si, s)).join('') ||
+    `<tr><td colspan="4" class="empty">还没有候选，点下面「添加一环」</td></tr>`;
+  const status = rt.dirty
+    ? '<span class="tag warn">未保存</span>'
+    : '<span class="tag ok">已保存</span>';
+  return `<div class="card">
+    <div class="card-head">
+      <h3 class="mono">${esc(rt.name)}</h3>
+      <span class="sub" style="display:flex;align-items:center;gap:8px">
+        ${status}<span>${rt.steps.length} 环</span>
+      </span>
+    </div>
+    <div class="card-body">
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th style="width:44px">#</th><th style="width:150px">上游</th><th>模型名</th><th style="width:130px">操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div class="row-flex" style="margin-top:14px;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn sm primary" data-mr="save" data-ri="${ri}" ${rt.dirty ? '' : 'disabled'}>保存此模型</button>
+        <button class="btn sm" data-mr="add" data-ri="${ri}">+ 添加一环</button>
+        <span style="flex:1"></span>
+        <button class="btn sm ghost danger" data-mr="delmodel" data-ri="${ri}">删除此混合模型</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderModelRoute() {
+  const cards = MR_STATE.map((rt, ri) => mrCard(rt, ri)).join('') ||
+    `<div class="card"><div class="empty">还没有混合模型，点右上角「新增混合模型」创建。</div></div>`;
+
+  $('#view').innerHTML = `
+    <div class="alert info">
+      候选链按顺序逐个尝试，前一环失败/耗尽时自动用下一环。
+      <b>同一上游可以出现多次</b>（例如先试 Qoder 的 Qwen3.8-Flash，兜底再用 Loomy 的 qwen3.8-flash）。
+      保存后需 <b>重启网关</b> 生效。
+    </div>
+    <div class="row-flex" style="margin:12px 0;gap:8px">
+      <button class="btn sm primary" id="mrAdd">+ 新增混合模型</button>
+      <button class="btn sm" id="mrRestart" style="display:none">重启并生效</button>
+      <span class="muted" id="mrMsg" style="font-size:12px;align-self:center"></span>
+    </div>
+    <div class="grid" style="display:grid;gap:16px">${cards}</div>
+  `;
+
+  if (S._mrHandler) document.removeEventListener('click', S._mrHandler);
+  if (S._mrChange) document.removeEventListener('change', S._mrChange);
+  S._mrHandler = mrClick;
+  S._mrChange = mrChange;
+  document.addEventListener('click', mrClick);
+  document.addEventListener('change', mrChange);
+}
+
+function mrChange(ev) {
+  const sel = ev.target.closest('.mr-prov, .mr-model');
+  if (!sel) return;
+  const ri = +sel.dataset.ri, si = +sel.dataset.si;
+  const rt = MR_STATE[ri]; if (!rt) return;
+  if (sel.classList.contains('mr-prov')) {
+    rt.steps[si].provider = sel.value;
+    // 换上游后原模型名失效：自动选该上游第一个模型，避免留下必填空值。
+    rt.steps[si].model = (MR_MODELS[sel.value] || [])[0] || '';
+    rt.dirty = true;
+  } else {
+    rt.steps[si].model = sel.value;
+    rt.dirty = true;
+  }
+  renderModelRoute();
+}
+
+async function mrSave(rt) {
+  const steps = rt.steps.filter(s => s.provider);
+  if (!steps.length) { toast('至少需要一环候选', 'warn'); return; }
+  // 每一环都必须选定具体模型：留空会把裸名原样发给上游，必然失败，
+  // 与其让用户重启后才发现，不如保存前直接拦下。
+  const missing = steps.findIndex(s => !s.model || !s.model.trim());
+  if (missing >= 0) {
+    toast(`第 ${missing + 1} 环还没有选择模型`, 'warn', 6000);
+    return;
+  }
+  const payload = steps.map(s => ({ provider: s.provider, model: s.model.trim() }));
+  try {
+    await api('/config', {
+      method: 'PUT',
+      body: { config: { qoder: { aliases: { [rt.name]: { steps: payload } } } } },
+    });
+    rt.dirty = false;
+    toast(`已保存 ${rt.name} 的候选链，重启后生效`);
+    const rb = $('#mrRestart'); if (rb) rb.style.display = '';
+    const m = $('#mrMsg'); if (m) m.textContent = '配置已保存，点「重启并生效」';
+    renderModelRoute();
+  } catch (e) { toast(e.message, 'err', 7000); }
+}
+
+async function mrDelete(rt) {
+  try {
+    // 用 null 删除该别名（deepMerge 里 null = 删除键）
+    await api('/config', { method: 'PUT', body: { config: { qoder: { aliases: { [rt.name]: null } } } } });
+    MR_STATE = MR_STATE.filter(x => x !== rt);
+    renderModelRoute();
+    toast(`已删除混合模型 ${rt.name}`);
+  } catch (e) { toast(e.message, 'err', 7000); }
+}
+
+function mrClick(ev) {
+  const btn = ev.target.closest('[data-mr]');
+  if (btn) {
+    const act = btn.dataset.mr;
+    const ri = +btn.dataset.ri, si = +btn.dataset.si;
+    const rt = MR_STATE[ri];
+    if (!rt) return;
+    switch (act) {
+      case 'up':
+        if (si > 0) { [rt.steps[si - 1], rt.steps[si]] = [rt.steps[si], rt.steps[si - 1]]; rt.dirty = true; renderModelRoute(); }
+        return;
+      case 'down':
+        if (si < rt.steps.length - 1) { [rt.steps[si + 1], rt.steps[si]] = [rt.steps[si], rt.steps[si + 1]]; rt.dirty = true; renderModelRoute(); }
+        return;
+      case 'del':
+        rt.steps.splice(si, 1); rt.dirty = true; renderModelRoute();
+        return;
+      case 'add':
+        // 默认预选该上游的第一个可用模型，避免留下必填空值；
+        // 用户仍可在下拉里换成别的模型。
+        rt.steps.push({ provider: 'loomy', model: (MR_MODELS.loomy || [])[0] || '' });
+        rt.dirty = true; renderModelRoute();
+        return;
+      case 'save':
+        mrSave(rt);
+        return;
+      case 'delmodel':
+        modal('删除混合模型', `<p>确认删除 <b class="mono">${esc(rt.name)}</b>？<br>
+          <span class="muted">客户端将无法再使用这个裸名。</span></p>`,
+          `<button class="btn primary" id="mrDelYes">确认删除</button>`);
+        $('#mrDelYes').onclick = () => { closeModal(); mrDelete(rt); };
+        return;
+    }
+  }
+  if (ev.target.id === 'mrAdd') {
+    const provOpts = ['loomy', 'qoder', 'workbuddy'].map(p =>
+      `<option value="${p}">${PROV_LABEL[p]}</option>`).join('');
+    modal('新增混合模型', `
+      <div class="field">
+        <label for="mrNewName">模型名</label>
+        <input id="mrNewName" type="text" class="mono" placeholder="例如 my-model" autocomplete="off" spellcheck="false">
+        <span class="hint">客户端将用这个名字请求（无需前缀）。字母、数字、连字符、下划线、点号最稳妥。</span>
+      </div>
+      <div class="field" style="margin-top:14px">
+        <label for="mrNewFirst">首个候选上游</label>
+        <select id="mrNewFirst">${provOpts}</select>
+      </div>
+      <div class="field" style="margin-top:14px">
+        <label for="mrNewModel">首个候选模型 <span style="color:var(--err)">*</span></label>
+        <select id="mrNewModel"></select>
+        <span class="hint">必选。每一环都必须指定具体模型，不能留空。</span>
+      </div>`,
+      `<button class="btn primary" id="mrNewOk">创建</button>`);
+
+    // 上游切换时刷新模型下拉（各上游可选模型不同）
+    const syncModels = () => {
+      $('#mrNewModel').innerHTML = mrModelOptions($('#mrNewFirst').value, '');
+    };
+    syncModels();
+    $('#mrNewFirst').onchange = syncModels;
+
+    const doCreate = () => {
+      const raw = ($('#mrNewName').value || '').trim();
+      const provider = $('#mrNewFirst').value;
+      const model = ($('#mrNewModel').value || '').trim();
+      if (!raw) { toast('请输入模型名', 'warn'); return; }
+      if (!model) { toast('请选择首个候选模型', 'warn'); return; }
+      if (MR_STATE.some(x => x.name === raw)) { toast('该模型名已存在', 'warn'); return; }
+      MR_STATE.push({
+        name: raw,
+        steps: [{ provider, model }],
+        targets: {}, dirty: true,
+      });
+      closeModal();
+      renderModelRoute();
+      toast(`已添加 ${raw}，点「保存此模型」后重启生效`);
+    };
+    $('#mrNewOk').onclick = doCreate;
+    $('#mrNewName').onkeydown = (e) => { if (e.key === 'Enter') doCreate(); };
+    setTimeout(() => $('#mrNewName').focus(), 30);
+    return;
+  }
+  if (ev.target.id === 'mrRestart') {
+    ev.target.disabled = true; ev.target.textContent = '重启中…';
+    doRestart();
+    return;
+  }
 }
 
 /* ── 用量统计页 ─────────────────────────────────────── */

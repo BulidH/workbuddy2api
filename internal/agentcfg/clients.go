@@ -82,6 +82,12 @@ func buildClients() map[string]*Client {
 		// Claude Code 自己会拼 /v1，给它裸根地址。
 		env["ANTHROPIC_BASE_URL"] = regexp.MustCompile(`/v1/?$`).ReplaceAllString(ctx.BaseURL, "")
 		env["ANTHROPIC_AUTH_TOKEN"] = ctx.APIKey
+		// 首字节超时：Loomy 侧推理模型首字节波动很大（实测 12s+，偶尔更久），
+		// Claude Code 默认约 60s 且部分版本更短，会在网关仍在等待上游时主动断开，
+		// 表现为 context canceled + 503。这里统一抬到 600s，与网关上游超时对齐。
+		env["API_TIMEOUT_MS"] = 600000
+		// 关闭非必要流量，避免首字节窗口内额外往返。
+		env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = 1
 		if ctx.Model != "" {
 			for _, name := range []string{
 				"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",

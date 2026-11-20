@@ -154,6 +154,41 @@ type Deps struct {
 	// Agents 智能体一键配置（可选；nil 时相关接口返回 501）。
 	// 只读写本机客户端配置与 state 目录，密钥不落网关 state。
 	Agents *agentcfg.Service
+
+	// ModelRoutes 返回各混合模型（aliases）当前的调度预览：每个裸名对应
+	// 各上游的实际模型名、当前候选顺序，以及各上游当前是否可用。
+	// nil 时「混合路由」页显示未接线。只读，不触发任何上游请求。
+	ModelRoutes func() ([]ModelRouteView, error)
+}
+
+// ModelRouteView 单个混合模型的路由视图（面板「混合路由」页）。
+type ModelRouteView struct {
+	Name string `json:"name"` // 对外裸名，如 deepseek-flash
+
+	// Targets 各上游实际模型名（空 = 该上游未配置别名，按裸名直发）。
+	Targets map[string]string `json:"targets"`
+
+	// Order 用户在 aliases.<name>.order 里显式配置的顺序（空 = 沿用全局 priority）。
+	Order []string `json:"order"`
+
+	// Steps 用户显式配置的候选链（空 = 未配置，按 Order/全局 priority 推导）。
+	Steps []qoder.ModelStep `json:"steps,omitempty"`
+
+	// Candidates 本轮实际候选顺序（已按 order / 全局 priority 排好）。
+	Candidates []ModelRouteCandidate `json:"candidates"`
+}
+
+// ModelRouteCandidate 一个候选上游及其当前可用性。
+type ModelRouteCandidate struct {
+	Provider string `json:"provider"`
+	// ConfiguredOrder 显式配置里的位次（-1 = 未显式配置，按全局优先级排在后面）。
+	ConfiguredOrder int `json:"configured_order"`
+	// Available 该上游当前是否可承接该模型（账号池可服务 + 目录认识该模型名）。
+	Available bool `json:"available"`
+	// Reason 不可用原因（available=false 时有值）。
+	Reason string `json:"reason,omitempty"`
+	// Model 实际会发往该上游的模型名。
+	Model string `json:"model,omitempty"`
 }
 
 // CheckinOutcome 面板侧的单账号签到回执（刻意与 scheduler.CheckinOutcome 解耦，
@@ -207,6 +242,7 @@ func New(deps Deps) *Panel {
 	p.mux.HandleFunc("GET /panel/api/models", p.handleModels)
 	p.mux.HandleFunc("GET /panel/api/logs", p.handleLogs)
 	p.mux.HandleFunc("GET /panel/api/usage", p.handleUsage)
+	p.mux.HandleFunc("GET /panel/api/model-routes", p.handleModelRoutes)
 
 	// ── 写操作 ────────────────────────────────────────────
 	p.mux.HandleFunc("PUT /panel/api/config", p.handleConfigPut)
