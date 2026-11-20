@@ -28,6 +28,14 @@ type Config struct {
 	Version         string
 	RequestPurpose  string
 	Timeout         time.Duration
+	// HeaderTimeout 聊天请求的「响应头等待上限」：只约束到收到响应头为止，
+	// 不限制后续流式输出的时长。
+	//
+	// 为什么需要：Loomy 首字节波动极大（实测中位 52s、最大 82s），而 WorkBuddy
+	// 只要 3s 左右。不设上限时网关会一直等，把慢上游的代价全转嫁给客户端；
+	// 设上限后超时即放弃当前环节，由路由链换下一个（省钱的 Loomy 快时照用）。
+	// <=0 = 不限制（保持旧行为）。
+	HeaderTimeout time.Duration
 }
 
 // Identity 账号的设备身份（账号服务请求信封字段 + 推广设备号）。
@@ -124,6 +132,11 @@ func New(cfg Config) *Client {
 		cfg.Timeout = 600 * time.Second
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// 响应头等待上限：只影响「等到响应头」这一段，不影响流式输出。
+	// 0 = 不限制（旧行为），由上游自然耗时决定。
+	if cfg.HeaderTimeout > 0 {
+		tr.ResponseHeaderTimeout = cfg.HeaderTimeout
+	}
 	return &Client{
 		cfg:      cfg,
 		apiHTTP:  &http.Client{Timeout: 60 * time.Second, Transport: tr},
@@ -370,6 +383,13 @@ func (c *Client) modelHeaders(session string) map[string]string {
 	}
 }
 
+// ErrHeaderTimeout 首字节（响应头）等待超时。
+//
+// 与普通传输层错误的区别：上游仍健康、账号也没问题，只是这个模型此刻排队太慢。
+// 调用方应据此**跳到下一个路由环节**（换上游/换模型），而不是继续换同上游的号——
+// 实测同上游所有账号一样慢（Loomy 排队限速是上游行为，与账号无关）。
+var ErrHeaderTimeout = errors.New("loomy: response header timeout")
+
 // ChatStreamContext 发起聊天请求，返回 OpenAI SSE 流。
 // 上游本身就是 OpenAI 兼容 SSE，只做两件事：强制 stream:true（便于本地聚合）与
 // 把 usage.points_consumed 同步为 usage.credit（网关成本账本只认 credit）。
@@ -412,6 +432,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 
 	resp, err := c.chatHTTP.Do(httpReq)
 	if err != nil {
+		// 首字节超时（ResponseHeaderTimeout）：上游健康但此刻排队太慢。
+		// 返回哨兵错误让上层直接跳到下一个路由环节，而不是继续换同上游的号
+		// （实测同上游所有账号一样慢，换号纯属浪费时间）。
+		if isTimeoutErr(err) {
+			log.Printf("WARN: [loomy] chat_stream uid=%s: header timeout after %s, fall through to next route step",
+				logfmt.UID8(a.UID), c.cfg.HeaderTimeout)
+			return nil, 0, nil, ErrHeaderTimeout
+		}
 		// 与 upstream 客户端同口径：传输层错误只换号、不罚账号，但必须留痕，
 		// 否则账号被跳过/冷却时面板与日志双双无据可查。
 		log.Printf("ERR: [loomy] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
@@ -761,4 +789,21 @@ func truncate(s string, n int) string {
 func escapeJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return strings.Trim(string(b), `"`)
+}
+
+// isTimeoutErr 判断传输层错误是否为超时（含 ResponseHeaderTimeout）。
+// net/http 在响应头超时时返回 *url.Error，其 Timeout() 为 true；
+// 这里同时兼容 context.DeadlineExceeded 包装的形态。
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var t interface{ Timeout() bool }
+	if errors.As(err, &t) {
+		return t.Timeout()
+	}
+	return false
 }

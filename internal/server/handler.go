@@ -746,11 +746,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.status = http.StatusServiceUnavailable
 		return
 	}
-	tried := map[string]map[string]bool{
-		auth.ProviderWorkBuddy: {},
-		auth.ProviderQoder:     {},
-		auth.ProviderLoomy:     {},
-	}
+	// tried 按「provider#环节序号」分组（见下方 triedKey）。这里不预置 provider 键：
+	// 同一 provider 在候选链里可能重复出现，预置会导致各环节共享同一份已试集合。
+	tried := map[string]map[string]bool{}
 	stepIdx := 0
 	var lastErr error
 
@@ -871,10 +869,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			stepIdx++
 			continue
 		}
-		triedThis, ok := tried[provider]
+		// 已试账号按「环节」隔离，而不是按 provider。
+		//
+		// 为什么：同一个上游可能在候选链里出现多次（Loomy 的多个模型互相兜底）。
+		// 若按 provider 共享 tried，第一环失败用掉全部 Loomy 号后，第二环就无号可选、
+		// 直接跳过——那「同上游多模型兜底」就形同虚设。按环节隔离后，每个环节都能
+		// 用满该上游的全部账号，代价只是同一账号可能被不同模型各试一次（这正是想要的）。
+		triedKey := fmt.Sprintf("%s#%d", provider, stepIdx)
+		triedThis, ok := tried[triedKey]
 		if !ok {
 			triedThis = map[string]bool{}
-			tried[provider] = triedThis
+			tried[triedKey] = triedThis
 		}
 
 		// 选号：粘性号优先（仅当绑定号属于当前 Provider），否则普通轮换。
@@ -1014,6 +1019,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = 499 // 非标准但通用：客户端关闭请求
 				return
 			}
+			// 首字节超时（Loomy 排队限速）：上游健康、账号也没问题，换号无意义
+			// ——实测同上游所有账号一样慢。直接跳到路由链下一环（换上游/换模型）。
+			if errors.Is(terr, loomy.ErrHeaderTimeout) {
+				st.providers = append(st.providers, "timeout")
+				stepIdx++
+				continue
+			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
@@ -1038,7 +1050,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
-				delete(tried[provider], acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				delete(triedThis, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 				continue

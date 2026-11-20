@@ -223,6 +223,12 @@ type Config struct {
 
 		Version        string `json:"version"`         // loomy-version 头，默认 0.9.38
 		TimeoutSeconds int    `json:"timeout_seconds"` // 聊天流总时长上限，默认 600
+		// HeaderTimeoutSeconds 首字节（响应头）等待上限，默认 25 秒。
+		//
+		// Loomy 首字节实测中位 52s、最大 82s，而兜底上游 WorkBuddy 只要 3s。
+		// 设上限后超时即放弃这一环、换路由链下一环，避免一个慢上游拖死整次请求。
+		// 0 = 不限制（旧行为）；负值同样视为不限制。
+		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 
 		// ModelBase / AccountBase 上游域名（空 = 官方地址）。
 		ModelBase   string `json:"model_base"`
@@ -336,6 +342,9 @@ func Default() *Config {
 	c.Loomy.Priority = 2
 	c.Loomy.Version = "0.9.38"
 	c.Loomy.TimeoutSeconds = 600
+	// 首字节上限默认 25s：Loomy 实测中位 52s 明显偏慢，超过这个数基本就是
+	// 卡住而非正常慢；此时换兜底上游比继续等更划算。0/负值 = 不限制。
+	c.Loomy.HeaderTimeoutSeconds = 25
 	c.Loomy.RequestPurpose = "chat.message"
 	c.Loomy.CheckinEnabled = true
 	c.Loomy.KeepaliveEnabled = true
@@ -645,6 +654,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Loomy.TimeoutSeconds <= 0 {
 		c.Loomy.TimeoutSeconds = 600
+	}
+	// 首字节上限：不配（零值）时回落默认 25s；显式负值 = 不限制。
+	if c.Loomy.HeaderTimeoutSeconds == 0 {
+		c.Loomy.HeaderTimeoutSeconds = 25
+	}
+	if c.Loomy.HeaderTimeoutSeconds < 0 {
+		c.Loomy.HeaderTimeoutSeconds = 0
 	}
 	if c.Loomy.RequestPurpose == "" {
 		c.Loomy.RequestPurpose = "chat.message"

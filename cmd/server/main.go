@@ -142,6 +142,7 @@ func main() {
 			Version:         cfg.Loomy.Version,
 			RequestPurpose:  cfg.Loomy.RequestPurpose,
 			Timeout:         time.Duration(cfg.Loomy.TimeoutSeconds) * time.Second,
+			HeaderTimeout:   time.Duration(cfg.Loomy.HeaderTimeoutSeconds) * time.Second,
 		})
 		lops = loomyops.New(loomyops.Config{
 			Pool:            lp,
